@@ -489,6 +489,64 @@ test("does not dismiss the editor while a profile save is in flight", async () =
   }
 });
 
+test("does not let an earlier save timer close a reopened editor during a later save", async () => {
+  const firstUpdate = deferred();
+  const secondUpdate = deferred();
+  let updateCalls = 0;
+  const rendered = await renderDashboard({
+    updateUserProfile() {
+      updateCalls += 1;
+      return updateCalls === 1 ? firstUpdate.promise : secondUpdate.promise;
+    },
+  });
+
+  try {
+    await rendered.openEditor();
+    await waitFor(
+      () => findButton(rendered.container, "Save Profile").disabled === false,
+      "available current username did not enable the first save",
+    );
+    await rendered.submit();
+    await waitFor(() => updateCalls === 1, "first profile save did not start");
+    await act(async () => {
+      firstUpdate.resolve(initialProfile);
+      await firstUpdate.promise;
+    });
+    await waitFor(
+      () => rendered.scheduledTimers.length === 1,
+      "first profile save did not schedule its success close",
+    );
+
+    const firstCloseTimer = rendered.scheduledTimers[0];
+    await act(async () => findButton(rendered.container, "Cancel").click());
+    await rendered.openEditor();
+    await waitFor(
+      () => findButton(rendered.container, "Save Profile").disabled === false,
+      "reopened editor did not receive fresh username availability",
+    );
+    await rendered.submit();
+    await waitFor(
+      () => updateCalls === 2 && findButton(rendered.container, "Saving..."),
+      "second profile save did not start",
+    );
+
+    await act(async () => firstCloseTimer.callback());
+    assert.ok(
+      findButton(rendered.container, "Saving..."),
+      "the first save timer closed the editor while the second save was pending",
+    );
+
+    await act(async () => {
+      secondUpdate.reject(new Error("Second save stopped for test cleanup"));
+      try {
+        await secondUpdate.promise;
+      } catch {}
+    });
+  } finally {
+    await rendered.cleanup();
+  }
+});
+
 test("keeps the editor and persisted profile unchanged when saving fails", async () => {
   const originalStoredProfile = JSON.stringify(initialProfile);
   const rendered = await renderDashboard({
