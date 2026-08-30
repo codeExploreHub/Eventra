@@ -18,7 +18,7 @@ class OperatorDocsTests(unittest.TestCase):
         watcher = rendered["workflow_watcher"]
 
         self.assertIn("wait for every current Gate Stage child to become terminal", lead)
-        self.assertIn("one immutable FailureBundle", lead)
+        self.assertIn("exact returned immutable FailureBundle", lead)
         self.assertIn(
             "must not mention or message an Implementer to request repair", reviewer
         )
@@ -66,12 +66,17 @@ class OperatorDocsTests(unittest.TestCase):
 
         for rendered in (lead, squad, readme):
             self.assertIn(
-                "Core/plan-parent is the sole fan-in and decision authority", rendered
+                "Core/plan-parent is the sole fan-in, canonical FailureBundle producer, and decision authority",
+                rendered,
             )
             self.assertIn(
                 "Delivery Lead is the sole execution actor", rendered
             )
-            self.assertNotIn("Core creates one repair Stage", rendered)
+            self.assertIn(
+                "exact returned `failure_bundle` and digest without reconstruction",
+                rendered,
+            )
+            self.assertNotIn("Lead creates one immutable FailureBundle", rendered)
 
         for engineer in (frontend, backend):
             self.assertIn(
@@ -120,6 +125,10 @@ class OperatorDocsTests(unittest.TestCase):
                 "If round 3 fails, block the parent; do not create another repair child.",
                 rendered,
             )
+
+        for rendered in (" ".join(reviewer.split()), " ".join(qa.split())):
+            self.assertIn("Core/plan-parent is the canonical FailureBundle producer", rendered)
+            self.assertIn("Delivery Lead uses its exact returned bundle and digest", rendered)
 
         self.assertIn(
             "Eventra provision dry-run is read-only; a later `--apply` is a separate explicit authorization with fresh authoritative preflight and revalidation.",

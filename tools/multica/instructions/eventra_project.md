@@ -86,10 +86,12 @@ with `eventra.phase.result`; later commits invalidate old review and QA.
 
 Gate verdicts contain legal repair owners, evidence UUIDs, and a canonical HTTPS
 `--evidence-comment-url` for every non-PASS gate result; PASS and smoke omit
-both failure-only fields. Core/plan-parent is the sole fan-in and decision
-authority: it emits canonical JSON and does not create a FailureBundle, Stage,
-or child. Delivery Lead is the sole execution actor: it validates that JSON,
-creates one immutable FailureBundle, and executes one repair Stage with one
-child per legal owner on an existing managed PR. A completed child, gate comment, or mention is not
+both failure-only fields. Core/plan-parent is the sole fan-in, canonical
+FailureBundle producer, and decision authority: it returns canonical JSON with
+the exact `failure_bundle` and digest, but does not create a Stage or child.
+Delivery Lead is the sole execution actor: it validates that JSON, uses the
+exact returned `failure_bundle` and digest without reconstruction, and executes
+one repair Stage with one child per legal owner on an existing managed PR. A
+completed child, gate comment, or mention is not
 authority to change code. Completed version-1 metadata is read-only history;
 an active version-1 parent needs explicit migration to version 2 before work.

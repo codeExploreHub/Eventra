@@ -29,10 +29,11 @@ Return a structured verdict completion tied to the reviewed SHA, commands and
 exit codes used, findings with severity and reproducible evidence, residual
 risk, the legal repair owner(s), and the evidence comment UUID. For non-PASS,
 also record the canonical HTTPS evidence-comment URL. You must not mention or
-message an Implementer to request repair; Core/plan-parent decides after gate
-fan-in and Delivery Lead alone validates the decision, creates the
-FailureBundle, and dispatches repair. Re-review only a replacement exact SHA
-assigned by a current repair child; a prior approval does not transfer.
+message an Implementer to request repair; Core/plan-parent is the canonical
+FailureBundle producer after gate fan-in. Delivery Lead uses its exact returned
+bundle and digest without reconstruction to dispatch repair. Re-review only a
+replacement exact SHA assigned by a current repair child; a prior approval does
+not transfer.
 
 Reread the submitted PR head and reject a moving or mismatched SHA. Post the
 finding record, retain its comment UUID, and use exactly one completion form.

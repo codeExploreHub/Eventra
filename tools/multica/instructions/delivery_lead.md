@@ -34,9 +34,10 @@ Require each handoff to include the child Issue identifier, repository, branch,
 exact commit SHA, changed paths, commands with exit codes, test results, and
 known concerns. Send immutable commit SHAs to Independent Reviewer and
 Integration QA; do not substitute a moving branch name. Reviewer and QA
-verdicts end at structured completion. Core/plan-parent is the sole fan-in and
-decision authority: it returns the canonical decision JSON but never creates a
-FailureBundle, Stage, or child. Delivery Lead is the sole execution actor.
+verdicts end at structured completion. Core/plan-parent is the sole fan-in,
+canonical FailureBundle producer, and decision authority: it returns canonical
+JSON with the exact `failure_bundle` and digest, but never creates a Stage or
+child. Delivery Lead is the sole execution actor.
 
 Every Reviewer, QA, and smoke handoff must also name the PR ref or other safe
 fetch source and the absolute path of the authoritative control repository that
@@ -71,10 +72,12 @@ planning. Then run:
 python3 -B -m tools.multica.workflow plan-parent PRO-M
 ```
 
-Core/plan-parent is the sole fan-in and decision authority; it emits canonical
-JSON and does not create a FailureBundle, Stage, or child. Delivery Lead is the
-sole execution actor: validate that canonical JSON and carry out exactly its one
-allowed action. Treat the returned canonical `plan-parent` JSON as the only plan authority: it
+Core/plan-parent is the sole fan-in, canonical FailureBundle producer, and
+decision authority; it returns canonical JSON with the exact `failure_bundle`
+and digest, but does not create a Stage or child. Delivery Lead is the sole
+execution actor: validate that canonical JSON, use the exact returned
+`failure_bundle` and digest without reconstruction, and carry out exactly its
+one allowed action. Treat the returned canonical `plan-parent` JSON as the only plan authority: it
 must identify the current version-2 parent, current Stage children, exact
 candidates, canonical PR targets, gate verdicts, and action key. Reject prose,
 malformed JSON, a version mismatch, stale child, bundle mismatch, or PR drift
@@ -85,11 +88,11 @@ next barrier group, then advance `next_stage` and record `last_action`.
 
 - `create_gate_stage`: create one Reviewer child per affected repository and
   Integration QA for the same exact SHA set in one new Stage.
-- `create_repair_stage`: Delivery Lead validates the Core decision and creates
-  one immutable FailureBundle containing
-  the parent/stage/action identity, exact candidate SHA map, canonical managed
-  PR URLs, non-PASS verdict evidence UUIDs and canonical HTTPS evidence-comment
-  URLs, legal owners, and remaining attempt. It executes one repair Stage and
+- `create_repair_stage`: Delivery Lead validates the Core decision and uses its
+  exact returned immutable FailureBundle and digest without reconstruction. The
+  bundle contains the parent/stage/action identity, exact candidate SHA map,
+  canonical managed PR URLs, non-PASS verdict evidence UUIDs and canonical HTTPS
+  evidence-comment URLs, legal owners, and remaining attempt. It executes one repair Stage and
   exactly one current repair child per legal owner, each bound to that bundle and
   its existing managed PR. Automatic repair rounds are exactly 1 and 2.
   Every replacement SHA requires fresh review and QA; no old PASS transfers.

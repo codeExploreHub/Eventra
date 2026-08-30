@@ -166,10 +166,12 @@ leaving a child permanently `in_review`.
 
 Version 2 is the active workflow metadata contract. A Gate Stage is a strict
 fan-in: Delivery Lead waits for every current Gate Stage child to become
-terminal, then invokes `plan-parent`. Core/plan-parent is the sole fan-in and
-decision authority; it emits canonical JSON and does not create a FailureBundle,
-Stage, or child. Delivery Lead is the sole execution actor: it validates that
-JSON and executes its one allowed action. The decision revalidates the
+terminal, then invokes `plan-parent`. Core/plan-parent is the sole fan-in,
+canonical FailureBundle producer, and decision authority; it returns canonical
+JSON with the exact `failure_bundle` and digest, but does not create a Stage or
+child. Delivery Lead is the sole execution actor: it validates that JSON and
+uses the exact returned `failure_bundle` and digest without reconstruction to
+execute its one allowed action. The decision revalidates the
 version-2 parent and Stage, exact candidate SHA map, current child identities,
 canonical managed PR URLs, verdict evidence UUIDs, and non-PASS canonical HTTPS
 evidence-comment URLs. Any malformed JSON or bundle, version mismatch, stale
@@ -179,8 +181,9 @@ Reviewer and QA finish only a structured verdict. Every non-PASS completion
 declares the legal repair owner(s), evidence UUID, and canonical HTTPS
 `--evidence-comment-url`; PASS and smoke omit both failure-only fields. They do
 not route a failure to an Implementer. After complete Gate Stage fan-in,
-Delivery Lead creates one immutable FailureBundle and executes one repair Stage
-with exactly one current child per legal owner. A repair child is usable only
+Delivery Lead uses Core's exact returned immutable FailureBundle and digest
+without reconstruction, then executes one repair Stage with exactly one current
+child per legal owner. A repair child is usable only
 while active and only with that valid bundle and an existing managed PR. Gate
 comments, mentions, and completed children are not repair authority. Automatic
 repair rounds are exactly 1 and 2. A member comment may authorize only the exact

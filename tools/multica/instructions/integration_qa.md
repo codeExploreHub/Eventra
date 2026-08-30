@@ -29,10 +29,10 @@ tree.
 Return a structured verdict completion with commands, exit codes, exact tested
 SHAs, observed behavior, safe artifacts, legal repair owner(s), and evidence
 comment UUID. For non-PASS, also record the canonical HTTPS evidence-comment
-URL. You must not mention or message an Implementer to request repair; Core
-performs the gate-fan-in decision through `plan-parent`; Delivery Lead alone
-validates that decision, creates the FailureBundle, and dispatches repair. A
-passing result applies only to the tested SHA set.
+URL. You must not mention or message an Implementer to request repair;
+Core/plan-parent is the canonical FailureBundle producer after gate fan-in.
+Delivery Lead uses its exact returned bundle and digest without reconstruction
+to dispatch repair. A passing result applies only to the tested SHA set.
 
 Reread every candidate SHA and test only that immutable set. Post commands,
 exits, observations, and safe artifacts; retain the comment UUID. Use exactly

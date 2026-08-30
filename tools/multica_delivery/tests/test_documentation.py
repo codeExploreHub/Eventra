@@ -17,8 +17,8 @@ class CoreDocumentationTests(unittest.TestCase):
         )
         for statement in (
             "Version 2 parent metadata requires Stage fan-in before any gate decision.",
-            "Core/plan-parent is the sole fan-in and decision authority; it emits canonical JSON and does not create a FailureBundle, Stage, or child.",
-            "Delivery Lead is the sole execution actor: after validating Core's canonical JSON, it creates one immutable FailureBundle and executes exactly one repair Stage with one current child per owner.",
+            "Core/plan-parent is the sole fan-in, canonical FailureBundle producer, and decision authority; it returns canonical JSON with the exact `failure_bundle` and digest, but does not create a Stage or child.",
+            "Delivery Lead is the sole execution actor: after validating Core's canonical JSON, it uses the exact returned `failure_bundle` and digest without reconstruction, then executes exactly one repair Stage with one current child per owner.",
             "Automatic repair rounds are exactly 1 and 2.",
             "A member comment may authorize only the exact current FailureBundle's exact next round 3, once.",
             "If round 3 fails, block the parent; do not create another repair child.",

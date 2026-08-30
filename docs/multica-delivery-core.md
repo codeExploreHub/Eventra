@@ -135,11 +135,12 @@ authorization with fresh authoritative preflight and revalidation. Eventra
 provision does not accept, bind, or validate a dry-run plan ID or hash. Push,
 tag, release, and deployment require separate authority. Version 2 parent
 metadata requires Stage fan-in before any gate decision. Core/plan-parent is the
-sole fan-in and decision authority; it emits canonical JSON and does not create
-a FailureBundle, Stage, or child. Delivery Lead is the sole execution actor:
-after validating Core's canonical JSON, it creates one immutable FailureBundle
-and executes exactly one repair Stage with one current child per owner. A valid
-FailureBundle binds the version-2 parent and Gate Stage/action identity, exact
+sole fan-in, canonical FailureBundle producer, and decision authority; it
+returns canonical JSON with the exact `failure_bundle` and digest, but does not
+create a Stage or child. Delivery Lead is the sole execution actor: after
+validating Core's canonical JSON, it uses the exact returned `failure_bundle`
+and digest without reconstruction, then executes exactly one repair Stage with
+one current child per owner. A valid FailureBundle binds the version-2 parent and Gate Stage/action identity, exact
 candidate SHA map, current child identities, canonical managed PR URLs,
 non-PASS verdicts, evidence UUIDs, canonical HTTPS evidence-comment URLs, legal
 owners, and remaining repair budget. The Core decision waits for every current

@@ -37,10 +37,12 @@ only rerun an existing stale assignment and never creates another child or PR.
 
 Non-PASS review and QA completions record legal repair owners, evidence UUIDs,
 and a canonical HTTPS `--evidence-comment-url`; PASS and smoke omit both
-failure-only fields. Core/plan-parent is the sole fan-in and decision authority:
-it emits canonical JSON and does not create a FailureBundle, Stage, or child.
-Delivery Lead is the sole execution actor: it validates that JSON, creates one
-immutable FailureBundle, and executes one repair child per legal owner against
-the existing managed PR. A completed child, gate comment, or mention grants no
+failure-only fields. Core/plan-parent is the sole fan-in, canonical
+FailureBundle producer, and decision authority: it returns canonical JSON with
+the exact `failure_bundle` and digest, but does not create a Stage or child.
+Delivery Lead is the sole execution actor: it validates that JSON, uses the
+exact returned `failure_bundle` and digest without reconstruction, and executes
+one repair child per legal owner against the existing managed PR. A completed
+child, gate comment, or mention grants no
 coding authority. Completed version-1 metadata is read-only history; explicit
 migration to version 2 is required for active version-1 work.
