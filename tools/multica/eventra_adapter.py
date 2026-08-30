@@ -83,6 +83,7 @@ def legacy_phase_contract(
     attempt: int,
     evidence_comment: str,
     pr_url: str | None = None,
+    responsible_repositories: tuple[str, ...] = (),
 ) -> PhaseContract:
     """Use the real legacy builder as the independent compatibility oracle."""
 
@@ -104,6 +105,7 @@ def legacy_phase_contract(
                 frontend_sha=candidate_shas.get("frontend"),
                 backend_sha=candidate_shas.get("backend"),
                 pr_url=pr_url,
+                responsible_repositories=responsible_repositories,
             )
         )
     except (TypeError, ValueError):
@@ -120,6 +122,7 @@ def render_phase_contract(
     attempt: int,
     evidence_comment: str,
     pr_url: str | None = None,
+    responsible_repositories: tuple[str, ...] = (),
 ) -> PhaseContract:
     """Independently render one legacy-compatible manifest phase payload."""
 
@@ -136,13 +139,28 @@ def render_phase_contract(
         or result not in _COMPATIBILITY_RESULTS
         or not isinstance(attempt, int)
         or isinstance(attempt, bool)
-        or not 0 <= attempt <= manifest.policy.max_repair_attempts
+        or not 0 <= attempt <= manifest.policy.max_repair_attempts + 1
+        or type(responsible_repositories) is not tuple
+        or any(
+            type(repository) is not str
+            or repository not in candidate_shas
+            for repository in responsible_repositories
+        )
+        or len(set(responsible_repositories)) != len(responsible_repositories)
     ):
         raise ValueError("invalid delivery phase contract")
     try:
-        uuid.UUID(evidence_comment)
+        if str(uuid.UUID(evidence_comment)) != evidence_comment:
+            raise ValueError("invalid delivery phase contract")
     except (AttributeError, TypeError, ValueError):
         raise ValueError("invalid delivery phase contract") from None
+    owners = set(responsible_repositories)
+    if (
+        (result == "pass" and owners)
+        or (phase not in {"review", "qa"} and owners)
+        or (phase in {"review", "qa"} and result != "pass" and not owners)
+    ):
+        raise ValueError("invalid delivery phase contract")
     if phase in {"implementation", "repair"} and (
         len(candidate_shas) != 1 or pr_url is None
     ):
@@ -164,11 +182,14 @@ def render_phase_contract(
 
     namespace = manifest.instance.key
     values = {
-        f"{namespace}.workflow.version": "1",
+        f"{namespace}.workflow.version": "2",
         f"{namespace}.phase.kind": phase,
         f"{namespace}.phase.result": result,
         f"{namespace}.phase.attempt": str(attempt),
         f"{namespace}.phase.evidence_comment": evidence_comment,
+        f"{namespace}.phase.failure_repositories": canonical_json(
+            sorted(responsible_repositories)
+        ),
     }
     for repository, sha in candidate_shas.items():
         values[f"{namespace}.phase.sha.{repository}"] = sha

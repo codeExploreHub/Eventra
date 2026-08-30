@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import io
 import json
 import re
@@ -41,6 +42,7 @@ CONTROLLED_PHASE_KEYS = frozenset(
         "eventra.phase.sha.frontend",
         "eventra.phase.sha.backend",
         "eventra.phase.pr",
+        "eventra.phase.failure_repositories",
     }
 )
 
@@ -54,6 +56,7 @@ class PhaseCompletion:
     frontend_sha: str | None
     backend_sha: str | None
     pr_url: str | None
+    responsible_repositories: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -84,6 +87,8 @@ class PhaseSnapshot:
     status: str
     frontend_sha: str | None
     backend_sha: str | None
+    evidence_comment: str = ""
+    responsible_repositories: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -107,6 +112,8 @@ class ParentSnapshot:
     candidate_backend_sha: str | None
     children: tuple[PhaseSnapshot, ...]
     pull_requests: tuple[PullRequestSnapshot, ...]
+    workflow_version: int = 2
+    parent_status: str = "in_review"
 
 
 @dataclass(frozen=True)
@@ -122,6 +129,7 @@ class ParentDecision:
     ]
     action_key: str | None
     reason: str
+    failure_bundle: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -146,6 +154,7 @@ class WorkflowSnapshot:
     has_later_parent_run: bool
     active_parent_has_no_executable_successor: bool
     children: tuple[ChildRunSnapshot, ...]
+    workflow_version: int = 2
 
     def first_terminal_run_needing_transition(
         self,
@@ -244,10 +253,19 @@ def build_phase_metadata(value: PhaseCompletion) -> dict[str, str]:
         or not isinstance(value.attempt, int)
         or isinstance(value.attempt, bool)
         or value.attempt < 0
+        or type(value.responsible_repositories) is not tuple
+        or any(
+            type(repository) is not str
+            or repository not in {"frontend", "backend"}
+            for repository in value.responsible_repositories
+        )
+        or len(set(value.responsible_repositories))
+        != len(value.responsible_repositories)
     ):
         _invalid_completion()
     try:
-        uuid.UUID(value.evidence_comment)
+        if str(uuid.UUID(value.evidence_comment)) != value.evidence_comment:
+            _invalid_completion()
     except (AttributeError, TypeError, ValueError):
         _invalid_completion()
     if value.frontend_sha is None and value.backend_sha is None:
@@ -267,12 +285,37 @@ def build_phase_metadata(value: PhaseCompletion) -> dict[str, str]:
         ):
             _invalid_completion()
 
+    phase_repositories = {
+        repository
+        for repository, sha in (
+            ("frontend", value.frontend_sha),
+            ("backend", value.backend_sha),
+        )
+        if sha is not None
+    }
+    owners = set(value.responsible_repositories)
+    if (
+        (value.result == "pass" and owners)
+        or (value.kind not in {"review", "qa"} and owners)
+        or (
+            value.kind in {"review", "qa"}
+            and value.result != "pass"
+            and (not owners or not owners <= phase_repositories)
+        )
+    ):
+        _invalid_completion()
+
     result = {
-        "eventra.workflow.version": "1",
+        "eventra.workflow.version": "2",
         "eventra.phase.kind": value.kind,
         "eventra.phase.result": value.result,
         "eventra.phase.attempt": str(value.attempt),
         "eventra.phase.evidence_comment": value.evidence_comment,
+        "eventra.phase.failure_repositories": json.dumps(
+            sorted(value.responsible_repositories),
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
     }
     if value.frontend_sha is not None:
         result["eventra.phase.sha.frontend"] = _validated_sha(value.frontend_sha)
@@ -291,16 +334,22 @@ def _scope(snapshot: ParentSnapshot) -> str:
     }.get(snapshot.classification, "invalid")
 
 
-def _action_key(snapshot: ParentSnapshot, kind: str, attempt: int) -> str:
+def _action_key(
+    snapshot: ParentSnapshot,
+    kind: str,
+    attempt: int,
+    bundle_digest: str | None = None,
+) -> str:
     return ":".join(
         (
-            "1",
+            "2",
             snapshot.identifier,
             kind,
             str(attempt),
             _scope(snapshot),
             snapshot.candidate_frontend_sha or "-",
             snapshot.candidate_backend_sha or "-",
+            *(("bundle", bundle_digest) if bundle_digest is not None else ()),
         )
     )
 
@@ -311,13 +360,22 @@ def _parent_decision(
     reason: str,
     *,
     attempt: int | None = None,
+    failure_bundle: dict[str, object] | None = None,
 ) -> ParentDecision:
     if kind == "noop":
-        return ParentDecision("noop", None, reason)
-    key = _action_key(snapshot, kind, snapshot.attempt if attempt is None else attempt)
+        return ParentDecision("noop", None, reason, failure_bundle)
+    bundle_digest = (
+        None if failure_bundle is None else str(failure_bundle["digest"])
+    )
+    key = _action_key(
+        snapshot,
+        kind,
+        snapshot.attempt if attempt is None else attempt,
+        bundle_digest,
+    )
     if snapshot.last_action == key:
         return ParentDecision("noop", None, "coordinator action already recorded")
-    return ParentDecision(kind, key, reason)
+    return ParentDecision(kind, key, reason, failure_bundle)
 
 
 def _phase_shas_match(snapshot: ParentSnapshot, phases: tuple[PhaseSnapshot, ...]) -> bool:
@@ -431,18 +489,126 @@ def _pull_requests_ready(snapshot: ParentSnapshot) -> bool:
     )
 
 
-def _repair_or_block(snapshot: ParentSnapshot) -> ParentDecision:
+def _candidate_sha_map(snapshot: ParentSnapshot) -> dict[str, str]:
+    return dict(
+        sorted(
+            (
+                (repository, sha)
+                for repository, sha in (
+                    ("frontend", snapshot.candidate_frontend_sha),
+                    ("backend", snapshot.candidate_backend_sha),
+                )
+                if sha is not None
+            )
+        )
+    )
+
+
+def _failure_bundle(
+    snapshot: ParentSnapshot,
+    phases: tuple[PhaseSnapshot, ...],
+) -> dict[str, object]:
+    if not phases or snapshot.workflow_version != 2:
+        raise ValueError("failure bundle requires version 2 gate evidence")
+    stage = phases[0].stage
+    candidates = _candidate_sha_map(snapshot)
+    failures: list[dict[str, object]] = []
+    for phase in phases:
+        if phase.stage != stage or phase.attempt != snapshot.attempt:
+            raise ValueError("failure bundle gate identity is inconsistent")
+        phase_candidates = {
+            repository: sha
+            for repository, sha in (
+                ("frontend", phase.frontend_sha),
+                ("backend", phase.backend_sha),
+            )
+            if sha is not None
+        }
+        owners = phase.responsible_repositories
+        if (
+            phase.kind not in {"review", "qa"}
+            or type(owners) is not tuple
+            or len(set(owners)) != len(owners)
+            or any(repository not in phase_candidates for repository in owners)
+            or not _is_uuid(phase.evidence_comment)
+        ):
+            raise ValueError("failure bundle gate evidence is malformed")
+        if phase.result == "pass":
+            if owners:
+                raise ValueError("passing gate cannot declare failure ownership")
+            continue
+        if phase.result not in {"fail", "blocked"} or not owners:
+            raise ValueError("nonpassing gate requires failure ownership")
+        failures.append(
+            {
+                "candidate_shas": candidates,
+                "child_identifier": phase.issue_key,
+                "evidence_comment_uuid": phase.evidence_comment,
+                "phase": phase.kind,
+                "repair_round": snapshot.attempt,
+                "responsible_repositories": list(sorted(owners)),
+                "result": phase.result,
+                "stage_ordinal": stage,
+                "suite_key": "",
+            }
+        )
+    if not failures:
+        raise ValueError("failure bundle requires nonpassing gate evidence")
+    failures.sort(
+        key=lambda failure: (
+            tuple(failure["responsible_repositories"]),
+            failure["phase"],
+            failure["suite_key"],
+            failure["child_identifier"],
+            failure["evidence_comment_uuid"],
+        )
+    )
+    payload: dict[str, object] = {
+        "candidate_shas": candidates,
+        "failures": failures,
+        "parent_identifier": snapshot.identifier,
+        "repair_round": snapshot.attempt + 1,
+        "source_stage_ordinal": stage,
+        "workflow_version": 2,
+    }
+    payload["digest"] = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return payload
+
+
+def _repair_or_block(
+    snapshot: ParentSnapshot,
+    phases: tuple[PhaseSnapshot, ...] = (),
+) -> ParentDecision:
     if snapshot.attempt >= 2:
         return _parent_decision(
             snapshot,
             "block_parent",
             "automatic attempt limit exhausted",
         )
+    bundle = None
+    if phases:
+        try:
+            bundle = _failure_bundle(snapshot, phases)
+        except ValueError:
+            return _parent_decision(
+                snapshot,
+                "block_parent",
+                "terminal gate failure evidence is malformed",
+            )
     return _parent_decision(
         snapshot,
         "create_repair_stage",
         "current exact-SHA gate set did not pass",
         attempt=snapshot.attempt + 1,
+        failure_bundle=bundle,
     )
 
 
@@ -455,6 +621,20 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
         or snapshot.attempt < 0
         or snapshot.merge_state not in {"not_ready", "ready", "merged", "partial"}
     ):
+        return ParentDecision("block_parent", None, "malformed parent workflow state")
+    if snapshot.workflow_version == 1:
+        if snapshot.parent_status in {"done", "blocked", "cancelled"}:
+            return ParentDecision(
+                "noop",
+                None,
+                "terminal version 1 workflow is read-only",
+            )
+        return ParentDecision(
+            "block_parent",
+            None,
+            "version 1 workflow requires explicit migration",
+        )
+    if snapshot.workflow_version != 2:
         return ParentDecision("block_parent", None, "malformed parent workflow state")
     if snapshot.merge_state == "partial":
         return _parent_decision(
@@ -555,7 +735,7 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
                 "required exact-SHA gate coverage is incomplete",
             )
         if not all(item.result == "pass" for item in latest):
-            return _repair_or_block(snapshot)
+            return _repair_or_block(snapshot, latest)
         if not _pull_requests_ready(snapshot):
             return _parent_decision(
                 snapshot,
@@ -578,6 +758,14 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
 def decide_recovery(snapshot: WorkflowSnapshot) -> RecoveryDecision:
     """Choose at most one safe stalled-work rerun."""
 
+    if snapshot.workflow_version == 1:
+        return RecoveryDecision(
+            "noop",
+            None,
+            "version 1 workflow requires explicit migration",
+        )
+    if snapshot.workflow_version != 2:
+        return RecoveryDecision("noop", None, "state is not auto-recoverable")
     if snapshot.has_human_approval_wait or snapshot.has_malformed_state:
         return RecoveryDecision("noop", None, "state is not auto-recoverable")
     stalled_child = snapshot.first_terminal_run_needing_transition()
@@ -669,6 +857,7 @@ def recover_once(runner: MulticaRunner, snapshot_loader) -> RecoveryResult:
 
 
 def _parent_metadata(value: dict[str, str]) -> dict[str, object]:
+    version = value.get("eventra.workflow.version")
     classification = value.get("eventra.workflow.classification")
     next_stage = value.get("eventra.workflow.next_stage")
     attempt = value.get("eventra.workflow.attempt")
@@ -677,7 +866,7 @@ def _parent_metadata(value: dict[str, str]) -> dict[str, object]:
     frontend_sha = value.get("eventra.workflow.frontend_sha")
     backend_sha = value.get("eventra.workflow.backend_sha")
     if (
-        value.get("eventra.workflow.version") != "1"
+        version not in {"1", "2"}
         or classification not in {"frontend-only", "backend-only", "cross-stack"}
         or not isinstance(next_stage, str)
         or not next_stage.isdigit()
@@ -694,6 +883,7 @@ def _parent_metadata(value: dict[str, str]) -> dict[str, object]:
     ):
         raise RuntimeError("malformed parent workflow metadata")
     return {
+        "workflow_version": int(version),
         "classification": classification,
         "attempt": int(attempt),
         "merge_state": merge_state,
@@ -712,12 +902,40 @@ def _phase_snapshot(
     attempt_text = metadata.get("eventra.phase.attempt", "0")
     frontend_sha = metadata.get("eventra.phase.sha.frontend")
     backend_sha = metadata.get("eventra.phase.sha.backend")
+    version = metadata.get("eventra.workflow.version")
+    evidence_comment = metadata.get("eventra.phase.evidence_comment", "")
+    failure_repositories = metadata.get("eventra.phase.failure_repositories")
+    responsible_repositories: tuple[str, ...] = ()
+    if version == "2":
+        try:
+            decoded_repositories = json.loads(failure_repositories)
+        except (json.JSONDecodeError, TypeError):
+            raise RuntimeError("malformed child phase metadata") from None
+        if (
+            not isinstance(decoded_repositories, list)
+            or any(
+                type(repository) is not str
+                or repository not in {"frontend", "backend"}
+                for repository in decoded_repositories
+            )
+            or len(set(decoded_repositories)) != len(decoded_repositories)
+            or failure_repositories
+            != json.dumps(
+                decoded_repositories,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        ):
+            raise RuntimeError("malformed child phase metadata")
+        responsible_repositories = tuple(decoded_repositories)
     if (
-        (kind != "unknown" and kind not in PHASE_KINDS)
+        version not in {"1", "2"}
+        or (kind != "unknown" and kind not in PHASE_KINDS)
         or (result is not None and result not in PHASE_RESULTS)
         or not attempt_text.isdigit()
         or (frontend_sha is not None and SHA_PATTERN.fullmatch(frontend_sha) is None)
         or (backend_sha is not None and SHA_PATTERN.fullmatch(backend_sha) is None)
+        or (result is not None and not _is_uuid(evidence_comment))
     ):
         raise RuntimeError("malformed child phase metadata")
     completed = _has_phase_completion(metadata)
@@ -730,6 +948,8 @@ def _phase_snapshot(
         status=str(issue["status"]),
         frontend_sha=frontend_sha,
         backend_sha=backend_sha,
+        evidence_comment=evidence_comment,
+        responsible_repositories=responsible_repositories,
     )
 
 
@@ -865,13 +1085,30 @@ def load_parent_snapshot(
         candidate_backend_sha=metadata["backend_sha"],
         children=tuple(phases),
         pull_requests=tuple(pull_requests),
+        workflow_version=int(metadata["workflow_version"]),
+        parent_status=str(parent["status"]),
     )
 
 
 def _has_phase_completion(metadata: dict[str, str]) -> bool:
+    version = metadata.get("eventra.workflow.version")
+    if version not in {"1", "2"}:
+        return False
+    if version == "2":
+        try:
+            repositories = json.loads(
+                metadata.get("eventra.phase.failure_repositories", "")
+            )
+        except (json.JSONDecodeError, TypeError):
+            return False
+        if (
+            not isinstance(repositories, list)
+            or metadata.get("eventra.phase.failure_repositories")
+            != json.dumps(repositories, sort_keys=True, separators=(",", ":"))
+        ):
+            return False
     return (
-        metadata.get("eventra.workflow.version") == "1"
-        and metadata.get("eventra.phase.kind") in PHASE_KINDS
+        metadata.get("eventra.phase.kind") in PHASE_KINDS
         and metadata.get("eventra.phase.result") in PHASE_RESULTS
         and metadata.get("eventra.phase.attempt", "").isdigit()
         and _is_uuid(metadata.get("eventra.phase.evidence_comment"))
@@ -880,10 +1117,9 @@ def _has_phase_completion(metadata: dict[str, str]) -> bool:
 
 def _is_uuid(value: str | None) -> bool:
     try:
-        uuid.UUID(value)
+        return str(uuid.UUID(value)) == value
     except (AttributeError, TypeError, ValueError):
         return False
-    return True
 
 
 def _is_human_wait(issue: dict[str, object]) -> bool:
@@ -908,7 +1144,8 @@ def load_workflow_snapshot(
     parent_metadata = parse_issue_metadata(
         runner.run(["issue", "metadata", "list", parent_key, "--output", "json"])
     )
-    if parent_metadata.get("eventra.workflow.version") != "1":
+    workflow_version = parent_metadata.get("eventra.workflow.version")
+    if workflow_version not in {"1", "2"}:
         raise RuntimeError("unsupported workflow metadata")
     children = parse_issue_children(
         runner.run(["issue", "children", parent_key, "--output", "json"]),
@@ -982,6 +1219,7 @@ def load_workflow_snapshot(
             and not children
         ),
         children=tuple(snapshots),
+        workflow_version=int(workflow_version),
     )
 
 
@@ -1000,7 +1238,7 @@ def _list_workflow_parents(
     project_ids: Sequence[str],
 ) -> list[str]:
     records: dict[str, dict[str, object]] = {}
-    version_filter = _string_metadata_filter("eventra.workflow.version", "1")
+    version_filter = _string_metadata_filter("eventra.workflow.version", "2")
     for project_id in project_ids:
         if not isinstance(project_id, str) or not project_id:
             raise ValueError("invalid watcher project identifier")
@@ -1109,9 +1347,32 @@ def finish_phase(
             return PhaseResult(
                 str(detail["id"]), issue_key, "done", value.kind, value.result, 0
             )
+        legacy_wanted = dict(wanted)
+        legacy_wanted["eventra.workflow.version"] = "1"
+        legacy_wanted.pop("eventra.phase.failure_repositories")
+        if controlled_before == legacy_wanted:
+            return PhaseResult(
+                str(detail["id"]), issue_key, "done", value.kind, value.result, 0
+            )
         raise RuntimeError("terminal phase metadata conflicts with request")
     if detail["status"] in {"blocked", "cancelled"}:
         raise RuntimeError("phase issue is not mutable")
+    if controlled_before.get("eventra.workflow.version") == "1":
+        raise RuntimeError("version 1 workflow requires explicit migration")
+    parent_metadata = parse_issue_metadata(
+        runner.run(
+            [
+                "issue",
+                "metadata",
+                "list",
+                str(detail["parent_issue_id"]),
+                "--output",
+                "json",
+            ]
+        )
+    )
+    if parent_metadata.get("eventra.workflow.version") != "2":
+        raise RuntimeError("version 1 workflow requires explicit migration")
     if any(
         key not in wanted or wanted[key] != item
         for key, item in controlled_before.items()
@@ -1252,6 +1513,12 @@ def build_workflow_parser() -> argparse.ArgumentParser:
     finish.add_argument("--frontend-sha")
     finish.add_argument("--backend-sha")
     finish.add_argument("--pr")
+    finish.add_argument(
+        "--responsible-repository",
+        action="append",
+        choices=("frontend", "backend"),
+        default=[],
+    )
     plan_parent = subparsers.add_parser("plan-parent")
     plan_parent.add_argument("parent")
     finish_parent_parser = subparsers.add_parser("finish-parent")
@@ -1286,8 +1553,18 @@ def print_watch_result(value: WatchResult) -> None:
 
 def print_parent_decision(value: ParentDecision) -> None:
     print(
-        f"decision={value.kind} action={value.action_key or '-'} "
-        f"reason={value.reason}"
+        json.dumps(
+            {
+                "decision": value.kind,
+                "action_key": value.action_key,
+                "reason": value.reason,
+                "failure_bundle": value.failure_bundle,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
     )
 
 
@@ -1303,6 +1580,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             frontend_sha=args.frontend_sha,
             backend_sha=args.backend_sha,
             pr_url=args.pr,
+            responsible_repositories=tuple(args.responsible_repository),
         )
         print_phase_result(finish_phase(runner, args.issue, completion))
     elif args.command == "plan-parent":

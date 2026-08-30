@@ -203,6 +203,7 @@ class EventraAdapterTests(unittest.TestCase):
                     None,
                     "d" * 40,
                     None,
+                    ("backend",),
                 ),
             ),
             (
@@ -246,6 +247,7 @@ class EventraAdapterTests(unittest.TestCase):
                     "attempt": completion.attempt,
                     "evidence_comment": completion.evidence_comment,
                     "pr_url": completion.pr_url,
+                    "responsible_repositories": completion.responsible_repositories,
                 }
                 expected = canonical_json(build_phase_metadata(completion))
                 legacy = legacy_phase_contract(
@@ -262,6 +264,58 @@ class EventraAdapterTests(unittest.TestCase):
                 self.assertEqual(legacy.metadata_json, expected)
                 self.assertEqual(generic.metadata_json, expected)
                 self.assertEqual(json.loads(generic.metadata_json), json.loads(expected))
+
+    def test_version_two_renderers_preserve_failure_ownership(self):
+        manifest = eventra_manifest(Path("/Users/didi/Eventra-workspace"))
+        try:
+            completion = LegacyPhaseCompletion(
+                kind="review",
+                result="fail",
+                attempt=3,
+                evidence_comment="00000000-0000-4000-8000-000000000031",
+                frontend_sha=None,
+                backend_sha="b" * 40,
+                pr_url=None,
+                responsible_repositories=("backend",),
+            )
+        except TypeError as error:
+            self.fail(f"Eventra compatibility rejected version 2 ownership: {error}")
+        arguments = {
+            "result": "fail",
+            "attempt": 3,
+            "evidence_comment": "00000000-0000-4000-8000-000000000031",
+            "responsible_repositories": ("backend",),
+        }
+
+        expected = canonical_json(
+            {
+                "eventra.phase.attempt": "3",
+                "eventra.phase.evidence_comment": "00000000-0000-4000-8000-000000000031",
+                "eventra.phase.failure_repositories": '["backend"]',
+                "eventra.phase.kind": "review",
+                "eventra.phase.result": "fail",
+                "eventra.phase.sha.backend": "b" * 40,
+                "eventra.workflow.version": "2",
+            }
+        )
+        self.assertEqual(build_phase_metadata(completion), json.loads(expected))
+        self.assertEqual(
+            legacy_phase_contract(
+                {"backend": "b" * 40},
+                "review",
+                **arguments,
+            ).metadata_json,
+            expected,
+        )
+        self.assertEqual(
+            render_phase_contract(
+                manifest,
+                {"backend": "b" * 40},
+                "review",
+                **arguments,
+            ).metadata_json,
+            expected,
+        )
 
     def test_compatibility_renderer_rejects_generic_only_phase_names(self):
         manifest = eventra_manifest(Path("/Users/didi/Eventra-workspace"))

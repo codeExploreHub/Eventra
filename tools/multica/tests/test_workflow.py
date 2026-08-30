@@ -2,6 +2,7 @@
 
 import copy
 import io
+import json
 import unittest
 from contextlib import redirect_stdout
 
@@ -62,6 +63,7 @@ class FakeWorkflowRunner:
     def __init__(self):
         self.issue = raw_issue()
         self.metadata = {}
+        self.parent_metadata = {"eventra.workflow.version": "2"}
         self.calls = []
         self.fail_metadata_key = None
         self.corrupt_metadata_key = None
@@ -98,6 +100,10 @@ class FakeWorkflowRunner:
                 key, item = self.inject_metadata_after_sets
                 value[key] = item
             return value
+        if call == (
+            "issue", "metadata", "list", PARENT_ID, "--output", "json"
+        ):
+            return copy.deepcopy(self.parent_metadata)
         if call[:3] == ("issue", "metadata", "set"):
             self.assert_metadata_set_grammar(call)
             key = call[5]
@@ -140,15 +146,79 @@ def implementation_completion(**overrides):
 
 
 class PhaseCompletionTests(unittest.TestCase):
+    def _review_completion(self, **overrides):
+        values = {
+            "kind": "review",
+            "result": "fail",
+            "attempt": 3,
+            "evidence_comment": "00000000-0000-4000-8000-000000000031",
+            "frontend_sha": None,
+            "backend_sha": "b" * 40,
+            "pr_url": None,
+            "responsible_repositories": ("backend",),
+        }
+        values.update(overrides)
+        try:
+            return PhaseCompletion(**values)
+        except TypeError as error:
+            self.fail(f"PhaseCompletion rejected the version 2 contract: {error}")
+
+    def test_build_metadata_uses_version_two_failure_ownership(self):
+        metadata = build_phase_metadata(self._review_completion())
+
+        self.assertEqual(metadata["eventra.workflow.version"], "2")
+        self.assertEqual(
+            metadata["eventra.phase.failure_repositories"],
+            '["backend"]',
+        )
+
+    def test_failure_ownership_is_exact_and_gate_scoped(self):
+        cases = (
+            ("PASS with owners", {"result": "pass"}),
+            ("non-PASS without owners", {"responsible_repositories": ()}),
+            ("owner outside phase SHA scope", {"responsible_repositories": ("frontend",)}),
+            ("duplicate owner", {"responsible_repositories": ("backend", "backend")}),
+            ("implementation owner", {"kind": "implementation"}),
+        )
+        for label, overrides in cases:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, "invalid phase completion"):
+                    build_phase_metadata(self._review_completion(**overrides))
+
+    def test_nonterminal_version_one_phase_requires_explicit_migration(self):
+        runner = FakeWorkflowRunner()
+        runner.metadata = {"eventra.workflow.version": "1"}
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "version 1 workflow requires explicit migration",
+        ):
+            finish_phase(runner, "PRO-36", self._review_completion())
+
+        self.assertEqual(runner.mutation_count, 0)
+
+    def test_version_one_parent_prevents_a_new_child_completion(self):
+        runner = FakeWorkflowRunner()
+        runner.parent_metadata = {"eventra.workflow.version": "1"}
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "version 1 workflow requires explicit migration",
+        ):
+            finish_phase(runner, "PRO-36", implementation_completion())
+
+        self.assertEqual(runner.mutation_count, 0)
+
     def test_build_metadata_uses_exact_string_contract(self):
         self.assertEqual(
             build_phase_metadata(implementation_completion()),
             {
-                "eventra.workflow.version": "1",
+                "eventra.workflow.version": "2",
                 "eventra.phase.kind": "implementation",
                 "eventra.phase.result": "pass",
                 "eventra.phase.attempt": "0",
                 "eventra.phase.evidence_comment": COMMENT_ID,
+                "eventra.phase.failure_repositories": "[]",
                 "eventra.phase.sha.frontend": FRONTEND_SHA,
                 "eventra.phase.pr": FRONTEND_PR,
             },
@@ -208,7 +278,7 @@ class PhaseCompletionTests(unittest.TestCase):
         self.assertEqual(result.status, "done")
         self.assertEqual(result.kind, "implementation")
         self.assertEqual(result.result, "pass")
-        self.assertEqual(result.mutation_count, 8)
+        self.assertEqual(result.mutation_count, 9)
         self.assertEqual(runner.calls[-2][0:3], ("issue", "status", "PRO-36"))
         self.assertEqual(
             runner.metadata["eventra.phase.result"],
@@ -226,6 +296,20 @@ class PhaseCompletionTests(unittest.TestCase):
         self.assertEqual(result.mutation_count, 0)
         self.assertFalse(any(call[:3] == ("issue", "metadata", "set") for call in runner.calls))
         self.assertFalse(any(call[:2] == ("issue", "status") for call in runner.calls))
+
+    def test_completed_version_one_phase_remains_inspectable(self):
+        runner = FakeWorkflowRunner()
+        legacy = build_phase_metadata(implementation_completion())
+        legacy["eventra.workflow.version"] = "1"
+        legacy.pop("eventra.phase.failure_repositories")
+        runner.issue["status"] = "done"
+        runner.metadata.update(legacy)
+
+        result = finish_phase(runner, "PRO-36", implementation_completion())
+
+        self.assertEqual(result.mutation_count, 0)
+        self.assertEqual(result.status, "done")
+        self.assertFalse(any(call[:3] == ("issue", "metadata", "set") for call in runner.calls))
 
     def test_terminal_conflicting_metadata_fails_closed(self):
         runner = FakeWorkflowRunner()
@@ -310,10 +394,29 @@ class PhaseCompletionTests(unittest.TestCase):
             print_phase_result(result)
         self.assertEqual(
             output.getvalue(),
-            "issue=PRO-36 status=done kind=implementation result=pass mutations=8\n",
+            "issue=PRO-36 status=done kind=implementation result=pass mutations=9\n",
         )
         self.assertNotIn(FRONTEND_SHA, output.getvalue())
         self.assertNotIn(FRONTEND_PR, output.getvalue())
+
+    def test_parser_accepts_repeatable_responsible_repository_flags(self):
+        parser = build_workflow_parser()
+        argv = [
+            "finish-phase", "PRO-99",
+            "--kind", "review",
+            "--result", "fail",
+            "--attempt", "3",
+            "--backend-sha", "b" * 40,
+            "--evidence-comment", "00000000-0000-4000-8000-000000000031",
+            "--responsible-repository", "backend",
+            "--responsible-repository", "frontend",
+        ]
+        try:
+            args = parser.parse_args(argv)
+        except SystemExit as error:
+            self.fail(f"version 2 ownership flags were rejected: {error}")
+
+        self.assertEqual(args.responsible_repository, ["backend", "frontend"])
 
 
 def phase(
@@ -324,6 +427,8 @@ def phase(
     attempt=0,
     frontend_sha=FRONTEND_SHA,
     backend_sha=None,
+    evidence_comment="",
+    responsible_repositories=(),
 ):
     return PhaseSnapshot(
         issue_key=issue_key,
@@ -334,6 +439,8 @@ def phase(
         status="done",
         frontend_sha=frontend_sha,
         backend_sha=backend_sha,
+        evidence_comment=evidence_comment,
+        responsible_repositories=responsible_repositories,
     )
 
 
@@ -367,13 +474,97 @@ def parent_snapshot(**overrides):
 
 
 class ParentDecisionTests(unittest.TestCase):
+    def _version_two_backend_gate(self, issue_key, kind, *, status="done"):
+        values = {
+            "issue_key": issue_key,
+            "stage": 2,
+            "kind": kind,
+            "result": "fail",
+            "attempt": 0,
+            "status": status,
+            "frontend_sha": None,
+            "backend_sha": "b" * 40,
+            "evidence_comment": (
+                "00000000-0000-4000-8000-000000000041"
+                if kind == "review"
+                else "00000000-0000-4000-8000-000000000042"
+            ),
+            "responsible_repositories": ("backend",),
+        }
+        try:
+            return PhaseSnapshot(**values)
+        except TypeError as error:
+            self.fail(f"PhaseSnapshot rejected version 2 evidence: {error}")
+
+    def _pro_65_snapshot(self, *, review_status="done", qa_status="done"):
+        backend_sha = "b" * 40
+        return parent_snapshot(
+            identifier="PRO-65",
+            classification="backend-only",
+            candidate_frontend_sha=None,
+            candidate_backend_sha=backend_sha,
+            children=(
+                self._version_two_backend_gate("PRO-66", "review", status=review_status),
+                self._version_two_backend_gate("PRO-67", "qa", status=qa_status),
+            ),
+            pull_requests=(
+                PullRequestSnapshot(
+                    repository="backend",
+                    url="https://github.com/codeExploreHub/Eventra-Backend/pull/7",
+                    head_sha=backend_sha,
+                    state="open",
+                    mergeable=True,
+                    checks_pass=True,
+                ),
+            ),
+        )
+
+    def test_pro_65_waits_for_active_gate_sibling_without_a_bundle(self):
+        decision = decide_parent_action(
+            self._pro_65_snapshot(review_status="in_review")
+        )
+
+        self.assertEqual(decision.kind, "noop")
+        self.assertIsNone(decision.failure_bundle)
+
+    def test_pro_65_final_gate_builds_one_complete_failure_bundle(self):
+        decision = decide_parent_action(self._pro_65_snapshot())
+
+        self.assertEqual(decision.kind, "create_repair_stage")
+        self.assertIsNotNone(decision.failure_bundle)
+        self.assertEqual(
+            [failure["phase"] for failure in decision.failure_bundle["failures"]],
+            ["qa", "review"],
+        )
+        self.assertEqual(
+            {
+                failure["evidence_comment_uuid"]
+                for failure in decision.failure_bundle["failures"]
+            },
+            {
+                "00000000-0000-4000-8000-000000000041",
+                "00000000-0000-4000-8000-000000000042",
+            },
+        )
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            print_parent_decision(decision)
+        rendered = output.getvalue().strip()
+        payload = json.loads(rendered)
+        self.assertEqual(
+            set(payload),
+            {"decision", "action_key", "reason", "failure_bundle"},
+        )
+        self.assertEqual(rendered, json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
     def test_finished_implementation_creates_one_exact_sha_gate_stage(self):
         decision = decide_parent_action(parent_snapshot())
         self.assertEqual(
             decision,
             ParentDecision(
                 "create_gate_stage",
-                f"1:PRO-35:create_gate_stage:0:frontend:{FRONTEND_SHA}:-",
+                f"2:PRO-35:create_gate_stage:0:frontend:{FRONTEND_SHA}:-",
                 "implementation evidence is ready for exact-SHA gates",
             ),
         )
@@ -408,8 +599,20 @@ class ParentDecisionTests(unittest.TestCase):
     def test_gate_failure_routes_bounded_repair_and_never_merge(self):
         children = (
             phase("PRO-36", 1, "implementation"),
-            phase("PRO-37", 2, "review", result="fail"),
-            phase("PRO-38", 2, "qa"),
+            phase(
+                "PRO-37",
+                2,
+                "review",
+                result="fail",
+                evidence_comment="00000000-0000-4000-8000-000000000037",
+                responsible_repositories=("frontend",),
+            ),
+            phase(
+                "PRO-38",
+                2,
+                "qa",
+                evidence_comment="00000000-0000-4000-8000-000000000038",
+            ),
         )
         decision = decide_parent_action(parent_snapshot(children=children))
         self.assertEqual(decision.kind, "create_repair_stage")
@@ -762,6 +965,15 @@ def stalled_workflow(**overrides):
 
 
 class RecoveryDecisionTests(unittest.TestCase):
+    def test_version_one_workflow_requires_migration_without_recovery(self):
+        decision = decide_recovery(stalled_workflow(workflow_version=1))
+
+        self.assertEqual(decision.kind, "noop")
+        self.assertEqual(
+            decision.reason,
+            "version 1 workflow requires explicit migration",
+        )
+
     def test_completed_child_run_left_in_review_recovers_oldest_child(self):
         newer = ChildRunSnapshot(
             issue_id="01a00000-0000-7000-8000-000000000020",
@@ -957,7 +1169,7 @@ class FakeWatchRunner:
         )
         self.child = raw_issue()
         self.metadata = {
-            "PRO-35": {"eventra.workflow.version": "1"},
+            "PRO-35": {"eventra.workflow.version": "2"},
             "PRO-36": {},
         }
         self.runs = {
@@ -1032,7 +1244,7 @@ class FakeWatchRunner:
 
     def _assert_list_flags(self, flags):
         expected = {
-            "--metadata": '"eventra.workflow.version=""1"""',
+            "--metadata": '"eventra.workflow.version=""2"""',
             "--limit": "50",
             "--offset": "0",
             "--output": "json",
@@ -1047,6 +1259,16 @@ class FakeWatchRunner:
 
 
 class WatchWorkflowTests(unittest.TestCase):
+    def test_version_one_watcher_state_never_mutates(self):
+        runner = FakeWatchRunner()
+        runner.metadata["PRO-35"] = {"eventra.workflow.version": "1"}
+
+        result = watch_projects(runner, runner.PROJECTS, apply=True)
+
+        self.assertEqual(result.applied, 0)
+        self.assertEqual(result.decision, "noop")
+        self.assertFalse(any(call[:2] == ("issue", "rerun") for call in runner.calls))
+
     def test_string_metadata_filter_is_json_string_inside_one_csv_field(self):
         self.assertEqual(
             _string_metadata_filter("eventra.workflow.version", "1"),
@@ -1107,7 +1329,7 @@ class FakeParentRunner(FakeWatchRunner):
     def __init__(self):
         super().__init__()
         self.metadata["PRO-35"] = {
-            "eventra.workflow.version": "1",
+            "eventra.workflow.version": "2",
             "eventra.workflow.classification": "frontend-only",
             "eventra.workflow.next_stage": "2",
             "eventra.workflow.attempt": "0",
@@ -1156,6 +1378,44 @@ class FakeGitHubRunner:
 
 
 class ParentSnapshotReadTests(unittest.TestCase):
+    def test_completed_version_one_parent_is_readable_but_not_plannable(self):
+        runner = FakeParentRunner()
+        runner.parent["status"] = "done"
+        runner.metadata["PRO-35"]["eventra.workflow.version"] = "1"
+        legacy = dict(runner.metadata["PRO-36"])
+        legacy["eventra.workflow.version"] = "1"
+        legacy.pop("eventra.phase.failure_repositories")
+        runner.metadata["PRO-36"] = legacy
+
+        decision = decide_parent_action(
+            load_parent_snapshot(runner, FakeGitHubRunner(), "PRO-35")
+        )
+
+        self.assertEqual(decision.kind, "noop")
+        self.assertEqual(
+            decision.reason,
+            "terminal version 1 workflow is read-only",
+        )
+        self.assertFalse(any(call[:2] == ("issue", "status") for call in runner.calls))
+
+    def test_nonterminal_version_one_parent_requires_explicit_migration(self):
+        runner = FakeParentRunner()
+        runner.metadata["PRO-35"]["eventra.workflow.version"] = "1"
+        legacy = dict(runner.metadata["PRO-36"])
+        legacy["eventra.workflow.version"] = "1"
+        legacy.pop("eventra.phase.failure_repositories")
+        runner.metadata["PRO-36"] = legacy
+
+        decision = decide_parent_action(
+            load_parent_snapshot(runner, FakeGitHubRunner(), "PRO-35")
+        )
+
+        self.assertEqual(decision.kind, "block_parent")
+        self.assertEqual(
+            decision.reason,
+            "version 1 workflow requires explicit migration",
+        )
+
     def test_load_parent_snapshot_reads_exact_metadata_and_current_pr_state(self):
         runner = FakeParentRunner()
         github = FakeGitHubRunner()
@@ -1175,7 +1435,12 @@ class ParentSnapshotReadTests(unittest.TestCase):
         output = io.StringIO()
         with redirect_stdout(output):
             print_parent_decision(decision)
-        self.assertIn("decision=create_gate_stage", output.getvalue())
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["decision"], "create_gate_stage")
+        self.assertEqual(
+            set(payload),
+            {"decision", "action_key", "reason", "failure_bundle"},
+        )
         self.assertNotIn(FRONTEND_PR, output.getvalue())
 
     def test_malformed_parent_metadata_fails_closed_without_github_read(self):
