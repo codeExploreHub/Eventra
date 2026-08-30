@@ -85,9 +85,11 @@ Implementation PRs use `Closes PRO-N` for their implementation child and
 with `eventra.phase.result`; later commits invalidate old review and QA.
 
 Gate verdicts contain legal repair owners, evidence UUIDs, and a canonical HTTPS
-`--evidence-comment-url` for every non-PASS result. Only Core may fan in the
-current Gate Stage, validate canonical `plan-parent` JSON, create one immutable
-FailureBundle, and dispatch one repair Stage with one child per legal owner on
-an existing managed PR. A completed child, gate comment, or mention is not
+`--evidence-comment-url` for every non-PASS gate result; PASS and smoke omit
+both failure-only fields. Core/plan-parent is the sole fan-in and decision
+authority: it emits canonical JSON and does not create a FailureBundle, Stage,
+or child. Delivery Lead is the sole execution actor: it validates that JSON,
+creates one immutable FailureBundle, and executes one repair Stage with one
+child per legal owner on an existing managed PR. A completed child, gate comment, or mention is not
 authority to change code. Completed version-1 metadata is read-only history;
 an active version-1 parent needs explicit migration to version 2 before work.

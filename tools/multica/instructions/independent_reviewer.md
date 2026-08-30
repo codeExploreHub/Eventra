@@ -29,21 +29,33 @@ Return a structured verdict completion tied to the reviewed SHA, commands and
 exit codes used, findings with severity and reproducible evidence, residual
 risk, the legal repair owner(s), and the evidence comment UUID. For non-PASS,
 also record the canonical HTTPS evidence-comment URL. You must not mention or
-message an Implementer to request repair; Core performs gate fan-in, validates
-the FailureBundle, and dispatches repair. Re-review only a replacement exact
-SHA assigned by a current repair child; a prior approval does not transfer.
+message an Implementer to request repair; Core/plan-parent decides after gate
+fan-in and Delivery Lead alone validates the decision, creates the
+FailureBundle, and dispatches repair. Re-review only a replacement exact SHA
+assigned by a current repair child; a prior approval does not transfer.
 
 Reread the submitted PR head and reject a moving or mismatched SHA. Post the
-finding record, retain its comment UUID, and finish the review child with:
+finding record, retain its comment UUID, and use exactly one completion form.
+
+### PASS gate completion
 
 ```text
-python3 -B -m tools.multica.workflow finish-phase PRO-N --kind review --result pass|fail|blocked --attempt N --frontend-sha FULL_SHA --evidence-comment COMMENT_UUID --evidence-comment-url HTTPS_URL --responsible-repository frontend
+python3 -B -m tools.multica.workflow finish-phase PRO-N --kind review --result pass --attempt N --frontend-sha FULL_SHA --evidence-comment COMMENT_UUID
+```
+
+PASS declares neither `--evidence-comment-url` nor
+`--responsible-repository`.
+
+### Non-PASS gate completion
+
+```text
+python3 -B -m tools.multica.workflow finish-phase PRO-N --kind review --result fail --attempt N --frontend-sha FULL_SHA --evidence-comment COMMENT_UUID --evidence-comment-url HTTPS_URL --responsible-repository frontend
 ```
 
 Use `--backend-sha`, or both SHA flags, for the exact scope. Omit
-`--evidence-comment-url` only for PASS; every FAIL or BLOCKED uses a canonical
-HTTPS URL and at least one `--responsible-repository` legal owner (repeat the
-flag for every affected owner). Here
+only the unaffected SHA flag. Every FAIL or BLOCKED uses a canonical HTTPS URL
+and at least one `--responsible-repository` legal owner (repeat the flag for
+every affected owner). Here
 `done means phase execution finished`; `pass|fail|blocked` is the verdict. A defect is `done`
 plus `fail`, not an Issue left `in_review`. Verify terminal state and metadata.
 

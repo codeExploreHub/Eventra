@@ -21,10 +21,12 @@ The provisioner requires a Multica `runtime_id` and `daemon_id`:
 python3 -m tools.multica.provision --runtime-id RUNTIME_ID --daemon-id DAEMON_ID
 ```
 
-That command is a dry run by default. Its returned plan is the exact-plan
-boundary: review the current plan and its identity before using `--apply`; apply
-accepts only that matching approved plan and is not a license to invent or
-extend a reconciliation:
+That command is a dry run by default. Eventra provision dry-run is read-only; a
+later `--apply` is a separate explicit authorization with fresh authoritative
+preflight and revalidation. Eventra provision does not accept, bind, or validate
+a dry-run plan ID or hash. The reusable package's exact-plan hash boundary is a
+separate Task 8 concern. Review dry-run output before authorizing apply; neither
+operation licenses an invented or extended reconciliation:
 
 ```bash
 python3 -m tools.multica.provision --runtime-id RUNTIME_ID --daemon-id DAEMON_ID --apply
@@ -164,23 +166,27 @@ leaving a child permanently `in_review`.
 
 Version 2 is the active workflow metadata contract. A Gate Stage is a strict
 fan-in: Delivery Lead waits for every current Gate Stage child to become
-terminal, then Core alone validates the canonical `plan-parent` JSON. That
-decision revalidates the version-2 parent and Stage, exact candidate SHA map,
-current child identities, canonical managed PR URLs, verdict evidence UUIDs,
-and non-PASS canonical HTTPS evidence-comment URLs. Any malformed JSON or
-bundle, version mismatch, stale child, or PR drift is a human-visible block.
+terminal, then invokes `plan-parent`. Core/plan-parent is the sole fan-in and
+decision authority; it emits canonical JSON and does not create a FailureBundle,
+Stage, or child. Delivery Lead is the sole execution actor: it validates that
+JSON and executes its one allowed action. The decision revalidates the
+version-2 parent and Stage, exact candidate SHA map, current child identities,
+canonical managed PR URLs, verdict evidence UUIDs, and non-PASS canonical HTTPS
+evidence-comment URLs. Any malformed JSON or bundle, version mismatch, stale
+child, or PR drift is a human-visible block.
 
 Reviewer and QA finish only a structured verdict. Every non-PASS completion
 declares the legal repair owner(s), evidence UUID, and canonical HTTPS
-`--evidence-comment-url`; they do not route a failure to an Implementer. Core
-creates one immutable FailureBundle and, only after complete Gate Stage fan-in,
-dispatches one repair Stage with exactly one current child per legal owner. A
-repair child is usable only while active and only with that valid bundle and an
-existing managed PR. Gate comments, mentions, and completed children are not
-repair authority. The automatic budget is two complete repair attempts; after
-exhaustion, only a human authorization bound to that immutable bundle can permit
-more repair work. The Watcher can recover at most one existing current
-assignment and cannot create a FailureBundle or dispatch repair.
+`--evidence-comment-url`; PASS and smoke omit both failure-only fields. They do
+not route a failure to an Implementer. After complete Gate Stage fan-in,
+Delivery Lead creates one immutable FailureBundle and executes one repair Stage
+with exactly one current child per legal owner. A repair child is usable only
+while active and only with that valid bundle and an existing managed PR. Gate
+comments, mentions, and completed children are not repair authority. Automatic
+repair rounds are exactly 1 and 2. A member comment may authorize only the exact
+current FailureBundle's exact next round 3, once. If round 3 fails, block the
+parent; do not create another repair child. The Watcher can recover at most one
+existing current assignment and cannot create a FailureBundle or dispatch repair.
 
 Completed version-1 metadata is read-only history. An active version-1 parent
 must be explicitly migrated to version 2 before any new Stage, gate, repair, or

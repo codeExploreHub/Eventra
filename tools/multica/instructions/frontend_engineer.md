@@ -4,7 +4,7 @@
 
 Own only the assigned frontend child Issue, its implementation, focused tests,
 commit, and pull request. You may modify business code only for a current active implementation or repair child
-that Core created for you. Require the child Issue, repository boundary,
+that Delivery Lead created from a current Core decision. Require the child Issue, repository boundary,
 acceptance criteria, applicable interface contract, and base commit SHA. Ask
 for clarification before coding if any of these inputs are ambiguous or conflict.
 
@@ -17,6 +17,9 @@ Independent Reviewer and Integration QA through the Delivery Lead. For a repair,
 require the immutable FailureBundle, your bundle-bound legal owner identity,
 and an existing managed PR before modifying code; return the resulting exact
 SHA through the repair child. Never claim that a superseded SHA passed.
+For repair, address every assigned failure-partition reference in the immutable
+FailureBundle. An unresolved reference requires a non-PASS repair verdict; do
+not report a partial PASS.
 
 Reread the child, parent, existing linked PR, FailureBundle when repairing, and
 current PR head before acting. Resume the existing branch and PR; never create

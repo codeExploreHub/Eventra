@@ -17,11 +17,15 @@ class CoreDocumentationTests(unittest.TestCase):
         )
         for statement in (
             "Version 2 parent metadata requires Stage fan-in before any gate decision.",
-            "Core is the sole authority that validates a canonical `plan-parent` JSON result, creates one immutable FailureBundle, and dispatches one repair Stage with one current child per owner.",
-            "A bundle-bound human authorization is required only after automatic repair exhaustion.",
+            "Core/plan-parent is the sole fan-in and decision authority; it emits canonical JSON and does not create a FailureBundle, Stage, or child.",
+            "Delivery Lead is the sole execution actor: after validating Core's canonical JSON, it creates one immutable FailureBundle and executes exactly one repair Stage with one current child per owner.",
+            "Automatic repair rounds are exactly 1 and 2.",
+            "A member comment may authorize only the exact current FailureBundle's exact next round 3, once.",
+            "If round 3 fails, block the parent; do not create another repair child.",
             "The Watcher cannot create a FailureBundle or dispatch repair.",
             "Malformed bundles, version mismatch, and PR drift are human-visible blocks.",
-            "Dry-run output is an exact plan boundary; apply accepts only that matching approved plan.",
+            "Eventra provision dry-run is read-only; a later `--apply` is a separate explicit authorization with fresh authoritative preflight and revalidation.",
+            "Eventra provision does not accept, bind, or validate a dry-run plan ID or hash.",
             "Push, tag, release, and deployment require separate authority.",
         ):
             with self.subTest(statement=statement):

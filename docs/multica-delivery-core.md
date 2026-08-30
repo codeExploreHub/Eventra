@@ -130,18 +130,24 @@ the planned Multica resource reconciliation. That approval does not authorize
 GitHub repository creation, commit, push, business-code changes, pull-request
 merge, or deployment.
 
-Dry-run output is an exact plan boundary; apply accepts only that matching
-approved plan. Push, tag, release, and deployment require separate authority.
-Version 2 parent metadata requires Stage fan-in before any gate decision. Core
-is the sole authority that validates a canonical `plan-parent` JSON result,
-creates one immutable FailureBundle, and dispatches one repair Stage with one
-current child per owner. A valid FailureBundle binds the version-2 parent and
-Gate Stage/action identity, exact candidate SHA map, current child identities,
-canonical managed PR URLs, non-PASS verdicts, evidence UUIDs, canonical HTTPS
-evidence-comment URLs, legal owners, and remaining repair budget. The decision
-waits for every current Gate Stage child to become terminal; it neither trusts a
-partial Stage nor accepts prose in place of canonical JSON. A bundle-bound
-human authorization is required only after automatic repair exhaustion.
+Eventra provision dry-run is read-only; a later `--apply` is a separate explicit
+authorization with fresh authoritative preflight and revalidation. Eventra
+provision does not accept, bind, or validate a dry-run plan ID or hash. Push,
+tag, release, and deployment require separate authority. Version 2 parent
+metadata requires Stage fan-in before any gate decision. Core/plan-parent is the
+sole fan-in and decision authority; it emits canonical JSON and does not create
+a FailureBundle, Stage, or child. Delivery Lead is the sole execution actor:
+after validating Core's canonical JSON, it creates one immutable FailureBundle
+and executes exactly one repair Stage with one current child per owner. A valid
+FailureBundle binds the version-2 parent and Gate Stage/action identity, exact
+candidate SHA map, current child identities, canonical managed PR URLs,
+non-PASS verdicts, evidence UUIDs, canonical HTTPS evidence-comment URLs, legal
+owners, and remaining repair budget. The Core decision waits for every current
+Gate Stage child to become terminal; it neither trusts a partial Stage nor
+accepts prose in place of canonical JSON. Automatic repair rounds are exactly 1
+and 2. A member comment may authorize only the exact current FailureBundle's
+exact next round 3, once. If round 3 fails, block the parent; do not create
+another repair child.
 
 In a development instance, development/local quality gates may authorize
 automatic merge. Before merging, the current Core proves exact-SHA

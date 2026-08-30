@@ -54,6 +54,82 @@ class OperatorDocsTests(unittest.TestCase):
                 with self.subTest(contract=name, phrase=phrase):
                     self.assertNotIn(phrase, rendered[name])
 
+    def test_version_two_contracts_keep_core_decision_and_lead_execution_separate(self):
+        instructions = Path("tools/multica/instructions")
+        lead = " ".join((instructions / "delivery_lead.md").read_text().split())
+        reviewer = (instructions / "independent_reviewer.md").read_text()
+        qa = (instructions / "integration_qa.md").read_text()
+        frontend = " ".join((instructions / "frontend_engineer.md").read_text().split())
+        backend = " ".join((instructions / "backend_engineer.md").read_text().split())
+        squad = " ".join((instructions / "squad.md").read_text().split())
+        readme = " ".join(Path("tools/multica/README.md").read_text().split())
+
+        for rendered in (lead, squad, readme):
+            self.assertIn(
+                "Core/plan-parent is the sole fan-in and decision authority", rendered
+            )
+            self.assertIn(
+                "Delivery Lead is the sole execution actor", rendered
+            )
+            self.assertNotIn("Core creates one repair Stage", rendered)
+
+        for engineer in (frontend, backend):
+            self.assertIn(
+                "address every assigned failure-partition reference", engineer
+            )
+            self.assertIn(
+                "unresolved reference requires a non-PASS repair verdict", engineer
+            )
+
+        self.assertIn("### PASS gate completion", reviewer)
+        self.assertIn("### Non-PASS gate completion", reviewer)
+        self.assertIn("### PASS gate completion", qa)
+        self.assertIn("### Non-PASS gate completion", qa)
+        self.assertIn("### Smoke completion", qa)
+        for rendered in (reviewer, qa):
+            pass_form = rendered.split("### PASS gate completion", 1)[1].split(
+                "### Non-PASS gate completion", 1
+            )[0]
+            pass_command = next(
+                line for line in pass_form.splitlines() if line.startswith("python3 ")
+            )
+            self.assertNotIn("--evidence-comment-url", pass_command)
+            self.assertNotIn("--responsible-repository", pass_command)
+            nonpass_form = rendered.split("### Non-PASS gate completion", 1)[1]
+            nonpass_command = next(
+                line for line in nonpass_form.splitlines() if line.startswith("python3 ")
+            )
+            self.assertIn("--evidence-comment-url HTTPS_URL", nonpass_command)
+            self.assertIn("--responsible-repository", nonpass_command)
+
+        smoke = qa.split("### Smoke completion", 1)[1].split("## Forbidden", 1)[0]
+        smoke_command = next(
+            line for line in smoke.splitlines() if line.startswith("python3 ")
+        )
+        self.assertNotIn("--evidence-comment-url", smoke_command)
+        self.assertNotIn("--responsible-repository", smoke_command)
+        self.assertIn("Smoke is not a gate phase", smoke)
+
+        for rendered in (lead, squad, readme):
+            self.assertIn("Automatic repair rounds are exactly 1 and 2.", rendered)
+            self.assertIn(
+                "member comment may authorize only the exact current FailureBundle's exact next round 3, once.",
+                rendered,
+            )
+            self.assertIn(
+                "If round 3 fails, block the parent; do not create another repair child.",
+                rendered,
+            )
+
+        self.assertIn(
+            "Eventra provision dry-run is read-only; a later `--apply` is a separate explicit authorization with fresh authoritative preflight and revalidation.",
+            readme,
+        )
+        self.assertIn(
+            "Eventra provision does not accept, bind, or validate a dry-run plan ID or hash.",
+            readme,
+        )
+
     def test_every_execution_role_uses_terminal_phase_helper(self):
         instructions = Path("tools/multica/instructions")
         for name in (
@@ -77,7 +153,7 @@ class OperatorDocsTests(unittest.TestCase):
             "--stage",
             "eventra.workflow.next_stage",
             "eventra.workflow.last_action",
-            "two complete repair attempts",
+            "Automatic repair rounds are exactly 1 and 2.",
             "Closes PRO-N",
             "Related to PRO-M",
             "production deployment is always human-triggered",

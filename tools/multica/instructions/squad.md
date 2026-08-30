@@ -35,10 +35,12 @@ the Independent Reviewer reviews the exact SHA set, Integration QA verifies the
 same exact SHA set, then the Delivery Lead evaluates gates and merges. Every
 handoff states child Issue, repository, branch, exact SHA, changed paths,
 commands with exit codes, evidence, and concerns. Reviewer and QA terminate at
-a structured verdict completion. Core alone fans in every current Gate Stage,
-validates the canonical plan-parent JSON and one immutable FailureBundle, then
-creates one repair Stage with one bundle-bound child per legal owner and its
-existing managed PR. No role routes a gate failure directly to an Implementer.
+a structured verdict completion. Core/plan-parent is the sole fan-in and
+decision authority: it emits canonical JSON and does not create a FailureBundle,
+Stage, or child. Delivery Lead is the sole execution actor: after validating
+that canonical JSON, it creates one immutable FailureBundle and executes one
+repair Stage with one bundle-bound child per legal owner and its existing
+managed PR. No role routes a gate failure directly to an Implementer.
 
 All children use version-2 ordered native Multica Stages: implementation,
 exact-SHA review/QA, bounded repair plus fresh gates, then post-merge smoke.
@@ -51,12 +53,13 @@ Delivery Lead.
 
 Delivery Lead calls `tools.multica.workflow plan-parent`; execution roles call
 `tools.multica.workflow finish-phase`. Stage ordinals and action keys are
-monotonic and idempotent. At most two complete repair attempts are automatic;
-after exhaustion only a human authorization bound to the immutable FailureBundle
-may permit another repair. The scheduled Watcher may rerun one stale existing
-current assignment; it cannot create a FailureBundle or dispatch repair, invent
-work, waive a gate, merge, or deploy. Version mismatch, malformed bundle, and
-PR drift block visibly for human resolution.
+monotonic and idempotent. Automatic repair rounds are exactly 1 and 2. A member
+comment may authorize only the exact current FailureBundle's exact next round 3,
+once. If round 3 fails, block the parent; do not create another repair child.
+The scheduled Watcher may rerun one stale existing current assignment; it cannot
+create a FailureBundle or dispatch repair, invent work, waive a gate, merge, or
+deploy. Version mismatch, malformed bundle, and PR drift block visibly for
+human resolution.
 
 After an automatic merge and post-merge smoke PASS, approved unattended local
 development calls `tools.multica.workflow finish-parent` and moves the parent

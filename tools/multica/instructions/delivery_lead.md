@@ -34,8 +34,9 @@ Require each handoff to include the child Issue identifier, repository, branch,
 exact commit SHA, changed paths, commands with exit codes, test results, and
 known concerns. Send immutable commit SHAs to Independent Reviewer and
 Integration QA; do not substitute a moving branch name. Reviewer and QA
-verdicts end at structured completion: Core is the only fan-in authority and
-the only authority that may turn a failed gate into a repair assignment.
+verdicts end at structured completion. Core/plan-parent is the sole fan-in and
+decision authority: it returns the canonical decision JSON but never creates a
+FailureBundle, Stage, or child. Delivery Lead is the sole execution actor.
 
 Every Reviewer, QA, and smoke handoff must also name the PR ref or other safe
 fetch source and the absolute path of the authoritative control repository that
@@ -70,7 +71,10 @@ planning. Then run:
 python3 -B -m tools.multica.workflow plan-parent PRO-M
 ```
 
-Treat the returned canonical `plan-parent` JSON as the only plan authority: it
+Core/plan-parent is the sole fan-in and decision authority; it emits canonical
+JSON and does not create a FailureBundle, Stage, or child. Delivery Lead is the
+sole execution actor: validate that canonical JSON and carry out exactly its one
+allowed action. Treat the returned canonical `plan-parent` JSON as the only plan authority: it
 must identify the current version-2 parent, current Stage children, exact
 candidates, canonical PR targets, gate verdicts, and action key. Reject prose,
 malformed JSON, a version mismatch, stale child, bundle mismatch, or PR drift
@@ -81,16 +85,17 @@ next barrier group, then advance `next_stage` and record `last_action`.
 
 - `create_gate_stage`: create one Reviewer child per affected repository and
   Integration QA for the same exact SHA set in one new Stage.
-- `create_repair_stage`: Core validates one immutable FailureBundle containing
+- `create_repair_stage`: Delivery Lead validates the Core decision and creates
+  one immutable FailureBundle containing
   the parent/stage/action identity, exact candidate SHA map, canonical managed
   PR URLs, non-PASS verdict evidence UUIDs and canonical HTTPS evidence-comment
-  URLs, legal owners, and remaining attempt. It creates one repair Stage and
+  URLs, legal owners, and remaining attempt. It executes one repair Stage and
   exactly one current repair child per legal owner, each bound to that bundle and
-  its existing managed PR. Allow at most two complete repair attempts
-  automatically.
+  its existing managed PR. Automatic repair rounds are exactly 1 and 2.
   Every replacement SHA requires fresh review and QA; no old PASS transfers.
-  After automatic exhaustion, create no child until a bundle-bound human
-  authorization names that immutable bundle and the permitted owner(s).
+  A member comment may authorize only the exact current FailureBundle's exact
+  next round 3, once. If round 3 fails, block the parent; do not create another
+  repair child.
 - `merge`: verify current heads, exact-SHA review and QA PASS, required local
   and repository checks, and mergeability, then automatically merge the
   personal-fork PRs. PR bodies use `Closes PRO-N` and `Related to PRO-M`.
@@ -113,5 +118,6 @@ invent missing requirements, expose secrets, or trigger production deployment.
 Do not treat a partial cross-repository merge as completion; stop and escalate
 with the merged SHA, unmerged repository, failed gate, and recovery options.
 Do not mention or message an Implementer to request repair, create an ad hoc
-repair child, or accept a gate comment, completed child, or PR mention as repair
-authority. Push, tag, release, and deployment require separate authorization.
+repair child outside the Core decision, or accept a gate comment, completed
+child, or PR mention as repair authority. Push, tag, release, and deployment
+require separate authorization.
