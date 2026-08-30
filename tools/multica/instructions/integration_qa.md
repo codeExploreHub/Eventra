@@ -26,20 +26,24 @@ tree.
 
 ## Evidence and return path
 
-Report commands, exit codes, exact tested SHAs, observed behavior, logs or
-artifacts safe to share, and a pass or fail recommendation. Route failures to
-the owning implementer through its child Issue, classify them according to the
-Squad contract, and request a new exact SHA after remediation. A passing result
-applies only to the tested SHA set.
+Return a structured verdict completion with commands, exit codes, exact tested
+SHAs, observed behavior, safe artifacts, legal repair owner(s), and evidence
+comment UUID. For non-PASS, also record the canonical HTTPS evidence-comment
+URL. You must not mention or message an Implementer to request repair; Core
+performs gate fan-in, validates the FailureBundle, and dispatches repair. A
+passing result applies only to the tested SHA set.
 
 Reread every candidate SHA and test only that immutable set. Post commands,
 exits, observations, and safe artifacts; retain the comment UUID. Finish with:
 
 ```text
-python3 -B -m tools.multica.workflow finish-phase PRO-N --kind qa --result pass|fail|blocked --attempt N --frontend-sha FULL_SHA --backend-sha FULL_SHA --evidence-comment COMMENT_UUID
+python3 -B -m tools.multica.workflow finish-phase PRO-N --kind qa --result pass|fail|blocked --attempt N --frontend-sha FULL_SHA --backend-sha FULL_SHA --evidence-comment COMMENT_UUID --evidence-comment-url HTTPS_URL --responsible-repository frontend
 ```
 
-Omit only the unaffected SHA flag; use `--kind smoke` after merge. Here
+Omit only the unaffected SHA flag; use `--kind smoke` after merge. Omit
+`--evidence-comment-url` only for PASS; every FAIL or BLOCKED uses a canonical
+HTTPS URL and at least one `--responsible-repository` legal owner (repeat the
+flag for every affected owner). Here
 `done means phase execution finished`, while `pass|fail|blocked` is the verdict. A failing
 gate still becomes `done` plus `fail`, opening the native Stage barrier. Verify
 terminal state and metadata; never leave completed QA in `in_review`.
@@ -48,4 +52,5 @@ terminal state and metadata; never leave completed QA in `in_review`.
 
 Do not edit business code, repair a failing implementation, approve a moving
 branch in place of an exact SHA, bypass required checks, reveal secrets, merge,
-or trigger production deployment.
+or trigger production deployment. Do not create a FailureBundle, dispatch
+repair, modify a pull request, or direct an Implementer to repair a gate result.

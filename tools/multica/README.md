@@ -21,8 +21,10 @@ The provisioner requires a Multica `runtime_id` and `daemon_id`:
 python3 -m tools.multica.provision --runtime-id RUNTIME_ID --daemon-id DAEMON_ID
 ```
 
-That command is a dry run by default. Review its planned reconciliation before
-using `--apply` to create or update Multica state:
+That command is a dry run by default. Its returned plan is the exact-plan
+boundary: review the current plan and its identity before using `--apply`; apply
+accepts only that matching approved plan and is not a license to invent or
+extend a reconciliation:
 
 ```bash
 python3 -m tools.multica.provision --runtime-id RUNTIME_ID --daemon-id DAEMON_ID --apply
@@ -160,6 +162,31 @@ parent. Phase `done` means execution finished, while metadata records
 `pass|fail|blocked`. FAIL and BLOCKED therefore wake the parent instead of
 leaving a child permanently `in_review`.
 
+Version 2 is the active workflow metadata contract. A Gate Stage is a strict
+fan-in: Delivery Lead waits for every current Gate Stage child to become
+terminal, then Core alone validates the canonical `plan-parent` JSON. That
+decision revalidates the version-2 parent and Stage, exact candidate SHA map,
+current child identities, canonical managed PR URLs, verdict evidence UUIDs,
+and non-PASS canonical HTTPS evidence-comment URLs. Any malformed JSON or
+bundle, version mismatch, stale child, or PR drift is a human-visible block.
+
+Reviewer and QA finish only a structured verdict. Every non-PASS completion
+declares the legal repair owner(s), evidence UUID, and canonical HTTPS
+`--evidence-comment-url`; they do not route a failure to an Implementer. Core
+creates one immutable FailureBundle and, only after complete Gate Stage fan-in,
+dispatches one repair Stage with exactly one current child per legal owner. A
+repair child is usable only while active and only with that valid bundle and an
+existing managed PR. Gate comments, mentions, and completed children are not
+repair authority. The automatic budget is two complete repair attempts; after
+exhaustion, only a human authorization bound to that immutable bundle can permit
+more repair work. The Watcher can recover at most one existing current
+assignment and cannot create a FailureBundle or dispatch repair.
+
+Completed version-1 metadata is read-only history. An active version-1 parent
+must be explicitly migrated to version 2 before any new Stage, gate, repair, or
+merge action. Historical inspection example only: read a completed version-1
+parent and its recorded evidence without rerunning it or creating a child.
+
 When planning returns `complete_parent`, Delivery Lead runs
 `python3 -B -m tools.multica.workflow finish-parent PRO-M`. The helper reads the
 authoritative merged-smoke state twice, refuses human-approval or changing
@@ -177,7 +204,7 @@ Watcher** Agent. It is not a member of `Eventra Local Delivery`, runs with
 concurrency 1 (`--max-concurrent-tasks 1`), and does not receive backend
 environment values; only Backend Engineer and Integration QA receive that
 custom environment. The Agent uses the Multica 0.4.34-compatible CSV-safe
-string filter for `eventra.workflow.version=1`: the JSON string is encoded as
+string filter for `eventra.workflow.version=2`: the JSON string is encoded as
 one quoted CSV field with doubled internal quotes before it is passed through
 argv. This preserves the server-side string comparison while retaining the
 two-Project scope and bounded recovery behavior.
@@ -240,3 +267,8 @@ and merge in API-compatible order; a partial merge stops and escalates. After
 merge, record merged local smoke evidence. Local services may be started for
 that smoke test, but production deployment remains human-triggered and is never
 automatic.
+
+Provisioning or workflow approval never authorizes a Git push, tag, release,
+or deployment. Those remain separately authorized actions; development/local
+merge keeps its existing automatic-gate policy, while production merge and
+deployment remain manual/forbidden.

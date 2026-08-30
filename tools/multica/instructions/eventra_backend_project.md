@@ -28,9 +28,17 @@ must never appear in Issues, logs, commands, files, or commits. Automatic merge
 is allowed only after all quality gates pass. Local merged smoke checks may run
 automatically; production deployment is always human-triggered.
 
-Backend children use workflow contract version `1` and the ordered Stage of
+Backend children use workflow contract version `2` and the ordered Stage of
 their frontend-Project parent. Finish implementation, repair, review, QA, and
 smoke through `tools.multica.workflow finish-phase`; a `pass|fail|blocked`
 verdict is separate from terminal `done`. PR bodies use `Closes PRO-N` for the
 backend child and `Related to PRO-M` for its parent. The scheduled Watcher may
 only rerun an existing stale assignment and never creates another child or PR.
+
+Non-PASS review and QA completions record legal repair owners, evidence UUIDs,
+and a canonical HTTPS `--evidence-comment-url`. Core alone validates canonical
+`plan-parent` JSON, fans in the whole current Gate Stage, creates one immutable
+FailureBundle, and dispatches one repair child per legal owner against the
+existing managed PR. A completed child, gate comment, or mention grants no
+coding authority. Completed version-1 metadata is read-only history; explicit
+migration to version 2 is required for active version-1 work.

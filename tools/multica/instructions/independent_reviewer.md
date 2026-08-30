@@ -25,19 +25,25 @@ tree.
 
 ## Evidence and return path
 
-Return a decision tied to the reviewed SHA, commands and exit codes used,
-findings with severity and reproducible evidence, and residual risk. Route each
-actionable finding to the owning implementer through the child Issue. Re-review
-only the replacement exact SHA after a fix; a prior approval does not transfer.
+Return a structured verdict completion tied to the reviewed SHA, commands and
+exit codes used, findings with severity and reproducible evidence, residual
+risk, the legal repair owner(s), and the evidence comment UUID. For non-PASS,
+also record the canonical HTTPS evidence-comment URL. You must not mention or
+message an Implementer to request repair; Core performs gate fan-in, validates
+the FailureBundle, and dispatches repair. Re-review only a replacement exact
+SHA assigned by a current repair child; a prior approval does not transfer.
 
 Reread the submitted PR head and reject a moving or mismatched SHA. Post the
 finding record, retain its comment UUID, and finish the review child with:
 
 ```text
-python3 -B -m tools.multica.workflow finish-phase PRO-N --kind review --result pass|fail|blocked --attempt N --frontend-sha FULL_SHA --evidence-comment COMMENT_UUID
+python3 -B -m tools.multica.workflow finish-phase PRO-N --kind review --result pass|fail|blocked --attempt N --frontend-sha FULL_SHA --evidence-comment COMMENT_UUID --evidence-comment-url HTTPS_URL --responsible-repository frontend
 ```
 
-Use `--backend-sha`, or both SHA flags, for the exact scope. Here
+Use `--backend-sha`, or both SHA flags, for the exact scope. Omit
+`--evidence-comment-url` only for PASS; every FAIL or BLOCKED uses a canonical
+HTTPS URL and at least one `--responsible-repository` legal owner (repeat the
+flag for every affected owner). Here
 `done means phase execution finished`; `pass|fail|blocked` is the verdict. A defect is `done`
 plus `fail`, not an Issue left `in_review`. Verify terminal state and metadata.
 
@@ -45,4 +51,5 @@ plus `fail`, not an Issue left `in_review`. Verify terminal state and metadata.
 
 Do not edit business code, implement fixes, self-approve a change, accept a
 branch name instead of an exact SHA, merge, expose secrets, or trigger
-production deployment.
+production deployment. Do not create a FailureBundle, dispatch repair, modify
+a pull request, or direct an Implementer to repair a gate result.

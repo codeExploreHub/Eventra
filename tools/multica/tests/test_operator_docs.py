@@ -4,6 +4,56 @@ from pathlib import Path
 
 
 class OperatorDocsTests(unittest.TestCase):
+    def test_authority_contracts_route_gate_results_only_through_delivery_lead(self):
+        instructions = Path("tools/multica/instructions")
+        rendered = {
+            path.stem: " ".join(path.read_text().split())
+            for path in instructions.glob("*.md")
+        }
+        lead = rendered["delivery_lead"]
+        reviewer = rendered["independent_reviewer"]
+        qa = rendered["integration_qa"]
+        frontend = rendered["frontend_engineer"]
+        backend = rendered["backend_engineer"]
+        watcher = rendered["workflow_watcher"]
+
+        self.assertIn("wait for every current Gate Stage child to become terminal", lead)
+        self.assertIn("one immutable FailureBundle", lead)
+        self.assertIn(
+            "must not mention or message an Implementer to request repair", reviewer
+        )
+        self.assertIn(
+            "must not mention or message an Implementer to request repair", qa
+        )
+        self.assertIn(
+            "modify business code only for a current active implementation or repair child",
+            frontend,
+        )
+        self.assertIn(
+            "modify business code only for a current active implementation or repair child",
+            backend,
+        )
+        self.assertIn("cannot create a FailureBundle or dispatch repair", watcher)
+
+        forbidden = (
+            "Route failures to the owning implementer",
+            "Fix returned findings in a new commit",
+        )
+        for name in (
+            "delivery_lead",
+            "independent_reviewer",
+            "integration_qa",
+            "frontend_engineer",
+            "backend_engineer",
+            "squad",
+            "workflow_watcher",
+            "eventra_project",
+            "eventra_backend_project",
+        ):
+            for phrase in forbidden:
+                with self.subTest(contract=name, phrase=phrase):
+                    self.assertNotIn(phrase, rendered[name])
+
     def test_every_execution_role_uses_terminal_phase_helper(self):
         instructions = Path("tools/multica/instructions")
         for name in (

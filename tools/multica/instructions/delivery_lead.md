@@ -33,9 +33,9 @@ work when scope, ownership, acceptance criteria, or merge authority is unclear.
 Require each handoff to include the child Issue identifier, repository, branch,
 exact commit SHA, changed paths, commands with exit codes, test results, and
 known concerns. Send immutable commit SHAs to Independent Reviewer and
-Integration QA; do not substitute a moving branch name. Return findings to the
-owning implementer through the child Issue and keep the parent Issue in
-progress until the corrected SHA has passed every required gate.
+Integration QA; do not substitute a moving branch name. Reviewer and QA
+verdicts end at structured completion: Core is the only fan-in authority and
+the only authority that may turn a failed gate into a repair assignment.
 
 Every Reviewer, QA, and smoke handoff must also name the PR ref or other safe
 fetch source and the absolute path of the authoritative control repository that
@@ -47,7 +47,7 @@ repository.
 ## Executable Stage protocol
 
 On the first run, classify `frontend-only`, `backend-only`, or `cross-stack`.
-Write parent metadata as explicit strings: workflow version `1`,
+Write parent metadata as explicit strings: workflow version `2`,
 classification, `eventra.workflow.next_stage=1`, attempt `0`, base candidate
 SHAs, merge state `not_ready`, and `eventra.workflow.last_action`. Move the
 parent to `in_progress`. Create every implementation child together in Stage 1
@@ -59,25 +59,38 @@ valid argv is `["multica", "issue", "create", "--parent", "PRO-35",
 
 Multica wakes you only after every child in a Stage reaches `done`. Here `done`
 means phase execution finished; it is never PASS without a complete
-`eventra.phase.result=pass|fail|blocked` envelope. Reread the parent, children,
-evidence comments, current PR heads, checks, and runs after every wakeup.
-Validate the completed phase envelopes and copy their exact replacement SHAs
-and attempt to the parent candidate metadata before planning. Then run:
+`eventra.phase.result=pass|fail|blocked` envelope. For a Gate Stage, wait for
+every current Gate Stage child to become terminal before reading any verdict.
+Reread the parent, children, evidence comments, current PR heads, checks, and
+runs after every wakeup. Validate the completed phase envelopes and copy their
+exact replacement SHAs and attempt to the parent candidate metadata before
+planning. Then run:
 
 ```text
 python3 -B -m tools.multica.workflow plan-parent PRO-M
 ```
 
-Before carrying out its one decision, reread again. Use the current
-`eventra.workflow.next_stage`; never reuse a Stage number. Deduplicate using
-`eventra.workflow.last_action`. Create and verify the full next barrier group,
-then advance `next_stage` and record `last_action`.
+Treat the returned canonical `plan-parent` JSON as the only plan authority: it
+must identify the current version-2 parent, current Stage children, exact
+candidates, canonical PR targets, gate verdicts, and action key. Reject prose,
+malformed JSON, a version mismatch, stale child, bundle mismatch, or PR drift
+as a human-visible block. Before carrying out its one decision, reread again.
+Use the current `eventra.workflow.next_stage`; never reuse a Stage number.
+Deduplicate using `eventra.workflow.last_action`. Create and verify the full
+next barrier group, then advance `next_stage` and record `last_action`.
 
 - `create_gate_stage`: create one Reviewer child per affected repository and
   Integration QA for the same exact SHA set in one new Stage.
-- `create_repair_stage`: route findings to the existing owning PR. Allow at
-  most two complete repair attempts. Every replacement SHA requires fresh
-  review and QA; no old PASS transfers.
+- `create_repair_stage`: Core validates one immutable FailureBundle containing
+  the parent/stage/action identity, exact candidate SHA map, canonical managed
+  PR URLs, non-PASS verdict evidence UUIDs and canonical HTTPS evidence-comment
+  URLs, legal owners, and remaining attempt. It creates one repair Stage and
+  exactly one current repair child per legal owner, each bound to that bundle and
+  its existing managed PR. Allow at most two complete repair attempts
+  automatically.
+  Every replacement SHA requires fresh review and QA; no old PASS transfers.
+  After automatic exhaustion, create no child until a bundle-bound human
+  authorization names that immutable bundle and the permitted owner(s).
 - `merge`: verify current heads, exact-SHA review and QA PASS, required local
   and repository checks, and mergeability, then automatically merge the
   personal-fork PRs. PR bodies use `Closes PRO-N` and `Related to PRO-M`.
@@ -99,3 +112,6 @@ Do not edit business code, bypass review or QA, merge on a status claim alone,
 invent missing requirements, expose secrets, or trigger production deployment.
 Do not treat a partial cross-repository merge as completion; stop and escalate
 with the merged SHA, unmerged repository, failed gate, and recovery options.
+Do not mention or message an Implementer to request repair, create an ad hoc
+repair child, or accept a gate comment, completed child, or PR mention as repair
+authority. Push, tag, release, and deployment require separate authorization.

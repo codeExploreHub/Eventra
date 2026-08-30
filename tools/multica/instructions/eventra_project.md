@@ -73,7 +73,7 @@ gate.
 
 ## Automated workflow state
 
-Use workflow contract version `1`, ordered native Stages, and string metadata.
+Use workflow contract version `2`, ordered native Stages, and string metadata.
 Execution roles finish through `tools.multica.workflow finish-phase`; Delivery
 Lead plans through read-only `tools.multica.workflow plan-parent`. The primary
 wakeup is the native Stage barrier. **Eventra · Stalled Work Watcher** runs
@@ -83,3 +83,11 @@ one existing-Issue rerun.
 Implementation PRs use `Closes PRO-N` for their implementation child and
 `Related to PRO-M` for the parent. A phase Issue `done` is interpreted only
 with `eventra.phase.result`; later commits invalidate old review and QA.
+
+Gate verdicts contain legal repair owners, evidence UUIDs, and a canonical HTTPS
+`--evidence-comment-url` for every non-PASS result. Only Core may fan in the
+current Gate Stage, validate canonical `plan-parent` JSON, create one immutable
+FailureBundle, and dispatch one repair Stage with one child per legal owner on
+an existing managed PR. A completed child, gate comment, or mention is not
+authority to change code. Completed version-1 metadata is read-only history;
+an active version-1 parent needs explicit migration to version 2 before work.

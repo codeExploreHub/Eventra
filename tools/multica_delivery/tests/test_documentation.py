@@ -8,6 +8,27 @@ CORE_DOC = ROOT / "docs" / "multica-delivery-core.md"
 
 
 class CoreDocumentationTests(unittest.TestCase):
+    def test_documents_version_two_gate_fan_in_and_repair_authority(self):
+        authority = self.normalized_section(
+            "Effect, merge, deployment, and Watcher policy"
+        )
+        migration = self.normalized_section(
+            "Eventra compatibility and migration boundary"
+        )
+        for statement in (
+            "Version 2 parent metadata requires Stage fan-in before any gate decision.",
+            "Core is the sole authority that validates a canonical `plan-parent` JSON result, creates one immutable FailureBundle, and dispatches one repair Stage with one current child per owner.",
+            "A bundle-bound human authorization is required only after automatic repair exhaustion.",
+            "The Watcher cannot create a FailureBundle or dispatch repair.",
+            "Malformed bundles, version mismatch, and PR drift are human-visible blocks.",
+            "Dry-run output is an exact plan boundary; apply accepts only that matching approved plan.",
+            "Push, tag, release, and deployment require separate authority.",
+        ):
+            with self.subTest(statement=statement):
+                self.assertIn(statement, authority)
+        self.assertIn("Completed version 1 metadata is read-only history.", migration)
+        self.assertIn("Active version 1 work requires an explicit migration to version 2", migration)
+
     @classmethod
     def setUpClass(cls):
         cls.text = CORE_DOC.read_text(encoding="utf-8")

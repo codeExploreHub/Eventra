@@ -130,6 +130,19 @@ the planned Multica resource reconciliation. That approval does not authorize
 GitHub repository creation, commit, push, business-code changes, pull-request
 merge, or deployment.
 
+Dry-run output is an exact plan boundary; apply accepts only that matching
+approved plan. Push, tag, release, and deployment require separate authority.
+Version 2 parent metadata requires Stage fan-in before any gate decision. Core
+is the sole authority that validates a canonical `plan-parent` JSON result,
+creates one immutable FailureBundle, and dispatches one repair Stage with one
+current child per owner. A valid FailureBundle binds the version-2 parent and
+Gate Stage/action identity, exact candidate SHA map, current child identities,
+canonical managed PR URLs, non-PASS verdicts, evidence UUIDs, canonical HTTPS
+evidence-comment URLs, legal owners, and remaining repair budget. The decision
+waits for every current Gate Stage child to become terminal; it neither trusts a
+partial Stage nor accepts prose in place of canonical JSON. A bundle-bound
+human authorization is required only after automatic repair exhaustion.
+
 In a development instance, development/local quality gates may authorize
 automatic merge. Before merging, the current Core proves exact-SHA
 implementation PASS evidence, independent review and repository/integration QA
@@ -185,6 +198,12 @@ If every repository is already merged, any pure missing, pending, failed, or
 stale pre-merge-evidence decision is propagated as a zero-mutation human block;
 the recovery path never converts it to a noop or rerun.
 
+The Watcher cannot create a FailureBundle or dispatch repair. It may recover one
+existing current assignment only after its version, Stage, attempt, repository,
+phase, suite, and authoritative creation action match. Malformed bundles,
+version mismatch, and PR drift are human-visible blocks. A gate comment, PR
+mention, or completed child cannot create repair or coding authority.
+
 ## Eventra compatibility and migration boundary
 
 The Eventra compatibility adapter remains operational at
@@ -201,6 +220,12 @@ pilots demonstrate parity. Plan 1 does not migrate live resources, rewrite
 active Issue metadata, create a control repository, push commits, or replace
 the legacy entry points. Those actions require a later migration plan and
 their own approval.
+
+Completed version 1 metadata is read-only history. Active version 1 work
+requires an explicit migration to version 2 before it can create a Stage, fan
+in gate results, dispatch repair, merge, or complete a parent. Historical
+inspection can read a completed version-1 record and its evidence, but cannot
+rerun it or create a child from it.
 
 ## Plan 2 lifecycle names
 
