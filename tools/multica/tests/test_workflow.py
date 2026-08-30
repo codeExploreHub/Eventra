@@ -735,6 +735,7 @@ class ParentDecisionTests(unittest.TestCase):
                     checks_pass=True,
                 ),
             ),
+            next_stage=3,
         )
 
     def test_pro_65_waits_for_active_gate_sibling_without_a_bundle(self):
@@ -798,7 +799,7 @@ class ParentDecisionTests(unittest.TestCase):
             decision.action_key,
             "2:PRO-65:create_repair_stage:1:backend:-:"
             + backend_sha
-            + ":next-stage:1:source-stage:2"
+            + ":next-stage:3:source-stage:2"
             + ":bundle:"
             + expected_digest,
         )
@@ -897,7 +898,9 @@ class ParentDecisionTests(unittest.TestCase):
                 evidence_comment="00000000-0000-4000-8000-000000000038",
             ),
         )
-        decision = decide_parent_action(parent_snapshot(children=children))
+        decision = decide_parent_action(
+            parent_snapshot(children=children, next_stage=3)
+        )
         self.assertEqual(decision.kind, "create_repair_stage")
         self.assertIn(":1:frontend:", decision.action_key)
 
@@ -946,10 +949,30 @@ class ParentDecisionTests(unittest.TestCase):
             phase("PRO-44", 6, "qa", attempt=2),
         )
         decision = decide_parent_action(
-            parent_snapshot(attempt=2, children=children)
+            parent_snapshot(attempt=2, children=children, next_stage=7)
         )
         self.assertEqual(decision.kind, "block_parent")
         self.assertNotIn("repair", decision.reason)
+
+    def test_failed_gate_requires_the_exact_consecutive_next_stage(self):
+        valid = self._pro_65_snapshot()
+        self.assertEqual(decide_parent_action(valid).kind, "create_repair_stage")
+
+        for next_stage in (1, 2, 4, 99):
+            with self.subTest(next_stage=next_stage):
+                decision = decide_parent_action(
+                    replace(valid, next_stage=next_stage)
+                )
+
+                self.assertEqual(decision.kind, "block_parent")
+                self.assertIsNone(decision.action_key)
+                self.assertIsNone(decision.failure_bundle)
+
+        no_source = decide_parent_action(
+            replace(valid, children=(), next_stage=99)
+        )
+        self.assertEqual(no_source.kind, "noop")
+        self.assertIsNone(no_source.action_key)
 
     def test_exact_member_comment_authorizes_only_round_three_and_binds_action(self):
         snapshot = self._round_three_snapshot()
@@ -1826,6 +1849,7 @@ class FakeRepairRunner:
         self.drift_reservation_after_parent_metadata_reads = None
         self.corrupt_created_title = False
         self.suppress_status_run = False
+        self.create_two_active_runs = False
         self._add_done_child(1, "implementation", 0, result="pass", pr=True)
         if attempt >= 1:
             self._add_done_child(3, "repair", 1, result="pass", pr=True)
@@ -2053,6 +2077,10 @@ class FakeRepairRunner:
                             "completed_at": None,
                         }
                     )
+                    if self.create_two_active_runs:
+                        duplicate_run = copy.deepcopy(runs[-1])
+                        duplicate_run["id"] += "-duplicate"
+                        runs.append(duplicate_run)
             self._maybe_lose_ack("status")
             return copy.deepcopy(child)
         if call[:2] == ("issue", "runs"):
@@ -2338,6 +2366,92 @@ class RepairExecutionTests(unittest.TestCase):
         self.assertNotEqual(decision.action_key, changed)
         self.assertNotEqual(decision.action_key, changed_source)
 
+    def test_reservation_parser_binds_consecutive_and_action_stages(self):
+        runner, github, decision = self._planned()
+        snapshot = load_parent_snapshot(runner, github, "PRO-65")
+        reservation = _build_repair_reservation(snapshot, decision)
+
+        malformed = []
+        for next_stage in (5, 6, 8, 99):
+            changed = copy.deepcopy(reservation)
+            changed["next_stage"] = next_stage
+            malformed.append(changed)
+        wrong_source_action = copy.deepcopy(reservation)
+        wrong_source_action["action_key"] = wrong_source_action[
+            "action_key"
+        ].replace(":source-stage:6:", ":source-stage:5:")
+        malformed.append(wrong_source_action)
+        empty_source_action = copy.deepcopy(reservation)
+        empty_source_action["action_key"] = empty_source_action[
+            "action_key"
+        ].replace(":source-stage:6:", ":source-stage::")
+        malformed.append(empty_source_action)
+        wrong_next_action = copy.deepcopy(reservation)
+        wrong_next_action["action_key"] = wrong_next_action[
+            "action_key"
+        ].replace(":next-stage:7:", ":next-stage:99:")
+        malformed.append(wrong_next_action)
+
+        for value in malformed:
+            with self.subTest(
+                next_stage=value["next_stage"],
+                action=value["action_key"],
+            ):
+                encoded = json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                with self.assertRaisesRegex(RuntimeError, "malformed repair reservation"):
+                    workflow_module._decode_repair_reservation(encoded)
+
+    def test_executor_blocks_nonconsecutive_stage_and_a_stale_expected_key(self):
+        runner = FakeRepairRunner()
+        github = FakeRepairGitHubRunner()
+        runner.metadata["PRO-65"]["eventra.workflow.next_stage"] = "99"
+        snapshot = load_parent_snapshot(runner, github, "PRO-65")
+        bundle = _failure_bundle(
+            snapshot,
+            tuple(child for child in snapshot.children if child.stage == 6),
+        )
+        runner.authorize(bundle["digest"])
+        snapshot = load_parent_snapshot(runner, github, "PRO-65")
+        forged_current_key = _action_key(
+            snapshot,
+            "create_repair_stage",
+            3,
+            bundle["digest"],
+            runner.AUTH_UUID,
+            6,
+        )
+        stale_valid_key = _action_key(
+            replace(snapshot, next_stage=7),
+            "create_repair_stage",
+            3,
+            bundle["digest"],
+            runner.AUTH_UUID,
+            6,
+        )
+
+        stale = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=stale_valid_key,
+        )
+        current = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=forged_current_key,
+        )
+
+        self.assertEqual(stale.next_action, "block")
+        self.assertEqual(current.next_action, "block")
+        self.assertEqual(runner.mutation_calls, [])
+
     def test_replay_requires_complete_exact_authoritative_child_identity(self):
         cases = {
             "workflow v1": lambda issue, metadata: metadata.__setitem__(
@@ -2472,6 +2586,44 @@ class RepairExecutionTests(unittest.TestCase):
         )
         self.assertEqual(replay.next_action, "noop")
         self.assertEqual(len(runner.runs[child["identifier"]]), 1)
+
+    def test_retry_blocks_two_active_runs_and_retains_the_reservation(self):
+        runner, github, decision = self._planned()
+        runner.create_two_active_runs = True
+
+        first = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(first.next_action, "block")
+        self.assertIn("exactly one active agent run", first.reason)
+        self.assertEqual(first.mutation_count, runner.committed_mutations)
+        self.assertIn(
+            "eventra.workflow.repair_reservation",
+            runner.metadata["PRO-65"],
+        )
+        child = next(item for item in runner.children if item["stage"] == 7)
+        self.assertEqual(len(runner.runs[child["identifier"]]), 2)
+        committed_before_retry = runner.committed_mutations
+
+        retry = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(retry.next_action, "block")
+        self.assertIn("exactly one active agent run", retry.reason)
+        self.assertEqual(retry.mutation_count, 0)
+        self.assertEqual(runner.committed_mutations, committed_before_retry)
+        self.assertIn(
+            "eventra.workflow.repair_reservation",
+            runner.metadata["PRO-65"],
+        )
 
     def test_replay_blocks_a_post_commit_pull_request_head_drift(self):
         runner, github, decision = self._planned()

@@ -454,6 +454,38 @@ def _action_key(
     )
 
 
+def _repair_action_stage_identity(value: str) -> tuple[int, int]:
+    parts = value.split(":") if type(value) is str else []
+    if (
+        len(parts) not in {13, 15}
+        or parts[0] != "2"
+        or ISSUE_KEY_PATTERN.fullmatch(parts[1]) is None
+        or parts[2] != "create_repair_stage"
+        or parts[3] not in {"1", "2", "3"}
+        or parts[4] not in {"frontend", "backend", "cross-stack"}
+        or any(
+            candidate != "-" and SHA_PATTERN.fullmatch(candidate) is None
+            for candidate in parts[5:7]
+        )
+        or parts[7] != "next-stage"
+        or not parts[8].isdigit()
+        or str(int(parts[8])) != parts[8]
+        or int(parts[8]) < 1
+        or parts[9] != "source-stage"
+        or not parts[10].isdigit()
+        or str(int(parts[10])) != parts[10]
+        or int(parts[10]) < 1
+        or parts[11] != "bundle"
+        or re.fullmatch(r"[0-9a-f]{64}", parts[12]) is None
+        or (
+            len(parts) == 15
+            and (parts[13] != "authorization" or not _is_uuid(parts[14]))
+        )
+    ):
+        raise RuntimeError("malformed repair action identity")
+    return int(parts[8]), int(parts[10])
+
+
 def _parent_decision(
     snapshot: ParentSnapshot,
     kind: str,
@@ -743,21 +775,33 @@ def _repair_or_block(
     snapshot: ParentSnapshot,
     phases: tuple[PhaseSnapshot, ...] = (),
 ) -> ParentDecision:
-    bundle = None
-    if phases:
-        try:
-            bundle = _failure_bundle(snapshot, phases)
-        except ValueError:
-            return _parent_decision(
-                snapshot,
-                "block_parent",
-                "terminal gate failure evidence is malformed",
-            )
     if snapshot.attempt > 2:
         return _parent_decision(
             snapshot,
             "block_parent",
             "member-authorized repair round is already consumed",
+        )
+    if not phases:
+        return ParentDecision(
+            "block_parent",
+            None,
+            "repair requires one exact source gate Stage",
+        )
+    source_stages = {phase.stage for phase in phases}
+    if len(source_stages) != 1 or snapshot.next_stage != next(iter(source_stages)) + 1:
+        return ParentDecision(
+            "block_parent",
+            None,
+            "next Stage must immediately follow the source gate Stage",
+        )
+    bundle = None
+    try:
+        bundle = _failure_bundle(snapshot, phases)
+    except ValueError:
+        return _parent_decision(
+            snapshot,
+            "block_parent",
+            "terminal gate failure evidence is malformed",
         )
     authorizing_comment_uuid = None
     if snapshot.attempt == 2:
@@ -1170,12 +1214,26 @@ def _decode_repair_reservation(value: str) -> dict[str, object]:
     ):
         raise RuntimeError("malformed repair reservation")
     digest = bundle.get("digest")
+    source_stage = bundle.get("source_stage_ordinal")
     if (
         type(digest) is not str
         or re.fullmatch(r"[0-9a-f]{64}", digest) is None
         or bundle.get("parent_identifier") != parent_identifier
         or bundle.get("repair_round") != repair_round
-        or type(bundle.get("source_stage_ordinal")) is not int
+        or type(source_stage) is not int
+        or source_stage < 1
+    ):
+        raise RuntimeError("malformed repair reservation")
+    try:
+        action_next_stage, action_source_stage = _repair_action_stage_identity(
+            action_key
+        )
+    except RuntimeError:
+        raise RuntimeError("malformed repair reservation") from None
+    if (
+        next_stage != source_stage + 1
+        or action_next_stage != next_stage
+        or action_source_stage != source_stage
     ):
         raise RuntimeError("malformed repair reservation")
     digest_payload = dict(bundle)
@@ -1664,6 +1722,9 @@ def _validate_repair_reservation(
     bundle = reservation["failure_bundle"]
     if not isinstance(bundle, dict):
         raise RuntimeError("malformed repair reservation")
+    source_stage = bundle.get("source_stage_ordinal")
+    if type(source_stage) is not int or next_stage != source_stage + 1:
+        raise RuntimeError("repair reservation Stage identity conflicts")
     if (
         snapshot.attempt not in {source_attempt, repair_round}
         or snapshot.next_stage not in {next_stage, next_stage + 1}
@@ -1673,7 +1734,6 @@ def _validate_repair_reservation(
         not in {prior_consumed, authorization_uuid}
     ):
         raise RuntimeError("parent state conflicts with repair reservation")
-    source_stage = bundle.get("source_stage_ordinal")
     source_phases = tuple(
         item for item in snapshot.children if item.stage == source_stage
     )
@@ -2126,10 +2186,16 @@ def _promote_repair_child_observed(
         item for item in before_runs if item["status"] in ACTIVE_RUN_STATUSES
     ]
     if detail["status"] != "backlog":
-        if detail["status"] in {"todo", "in_progress", "in_review"} and not active_before:
-            raise RuntimeError("promoted repair child has no active agent run")
-        if detail["status"] == "done" and child.result is None:
-            raise RuntimeError("completed repair child has no exact completion")
+        if detail["status"] in {"todo", "in_progress", "in_review"}:
+            if len(active_before) != 1:
+                raise RuntimeError(
+                    "promoted repair child must have exactly one active agent run"
+                )
+        elif detail["status"] == "done":
+            if child.result is None or active_before:
+                raise RuntimeError("completed repair child state conflicts")
+        else:
+            raise RuntimeError("promoted repair child status conflicts")
         return
     if active_before:
         raise RuntimeError("backlog repair child unexpectedly has an active run")
@@ -2150,13 +2216,21 @@ def _promote_repair_child_observed(
         for item in after_runs
         if item["id"] not in before_ids and item["status"] in ACTIVE_RUN_STATUSES
     ]
+    active_after = [
+        item for item in after_runs if item["status"] in ACTIVE_RUN_STATUSES
+    ]
     if verified["status"] != "backlog" or any(
         item["id"] not in before_ids for item in after_runs
     ):
         observed_effects[0] += 1
+    if len(active_after) > 1:
+        raise RuntimeError(
+            "promoted repair child must have exactly one active agent run"
+        )
     if (
         verified["status"] not in {"todo", "in_progress", "in_review"}
         or len(new_active) != 1
+        or len(active_after) != 1
     ):
         raise RuntimeError("repair child promotion effect was not observed")
 
@@ -2272,11 +2346,19 @@ def _verified_replayed_repair_children(
     if not matching or len({item.stage for item in matching}) != 1:
         raise RuntimeError("recorded repair action has no exact child set")
     stage = matching[0].stage
+    try:
+        action_next_stage, source_stage = _repair_action_stage_identity(
+            expected_action_key
+        )
+    except RuntimeError:
+        raise RuntimeError("recorded repair action identity conflicts") from None
     rounds = {item.repair_round for item in matching}
     authorizations = {item.authorizing_comment_uuid for item in matching}
     if (
         len(rounds) != 1
         or len(authorizations) != 1
+        or stage != action_next_stage
+        or action_next_stage != source_stage + 1
         or snapshot.attempt != next(iter(rounds))
         or snapshot.next_stage != stage + 1
     ):
@@ -2291,14 +2373,14 @@ def _verified_replayed_repair_children(
     source_snapshot = replace(
         snapshot,
         attempt=repair_round - 1,
-        next_stage=stage,
+        next_stage=action_next_stage,
         last_action=None,
         authorization_comment_uuid="",
         authorizing_comment=None,
         repair_reservation=None,
     )
     source_phases = tuple(
-        item for item in snapshot.children if item.stage == stage - 1
+        item for item in snapshot.children if item.stage == source_stage
     )
     try:
         bundle = _failure_bundle(source_snapshot, source_phases)
@@ -2321,7 +2403,7 @@ def _verified_replayed_repair_children(
                 "authorizing_comment_uuid": authorization_uuid,
                 "child_specs": _repair_child_specs(source_snapshot, bundle),
                 "failure_bundle": bundle,
-                "next_stage": stage,
+                "next_stage": action_next_stage,
                 "parent_identifier": snapshot.identifier,
                 "previous_last_action": "",
                 "prior_consumed_authorization_uuid": "",
