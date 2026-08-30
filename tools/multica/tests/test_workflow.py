@@ -6,7 +6,9 @@ import json
 import unittest
 from contextlib import redirect_stdout
 from dataclasses import replace
+from unittest.mock import patch
 
+import tools.multica.workflow as workflow_module
 from tools.multica.workflow import (
     AuthorizingComment,
     ChildRunSnapshot,
@@ -18,6 +20,8 @@ from tools.multica.workflow import (
     RecoveryDecision,
     WorkflowSnapshot,
     WatchResult,
+    _action_key,
+    _build_repair_reservation,
     _failure_bundle,
     _repair_child_specs,
     _string_metadata_filter,
@@ -58,6 +62,8 @@ def raw_issue(**overrides):
         "assignee_type": "agent",
         "project_id": PROJECT_ID,
         "updated_at": "2026-08-25T08:50:06Z",
+        "title": "Existing issue",
+        "description": "Existing issue description",
     }
     value.update(overrides)
     return value
@@ -792,6 +798,7 @@ class ParentDecisionTests(unittest.TestCase):
             decision.action_key,
             "2:PRO-65:create_repair_stage:1:backend:-:"
             + backend_sha
+            + ":next-stage:1:source-stage:2"
             + ":bundle:"
             + expected_digest,
         )
@@ -833,7 +840,10 @@ class ParentDecisionTests(unittest.TestCase):
             decision,
             ParentDecision(
                 "create_gate_stage",
-                f"2:PRO-35:create_gate_stage:0:frontend:{FRONTEND_SHA}:-",
+                (
+                    f"2:PRO-35:create_gate_stage:0:frontend:{FRONTEND_SHA}:-"
+                    ":next-stage:1"
+                ),
                 "implementation evidence is ready for exact-SHA gates",
             ),
         )
@@ -1807,9 +1817,15 @@ class FakeRepairRunner:
         }
         self.comments = []
         self.calls = []
+        self.runs = {}
         self.next_child_number = 80
         self.fail_once_parent_key = None
         self.fail_once_create = False
+        self.lost_ack_once = set()
+        self.committed_mutations = 0
+        self.drift_reservation_after_parent_metadata_reads = None
+        self.corrupt_created_title = False
+        self.suppress_status_run = False
         self._add_done_child(1, "implementation", 0, result="pass", pr=True)
         if attempt >= 1:
             self._add_done_child(3, "repair", 1, result="pass", pr=True)
@@ -1920,6 +1936,12 @@ class FakeRepairRunner:
             )
         return {"stages": stages, "total": len(self.children), "unstaged": []}
 
+    def _maybe_lose_ack(self, *tokens):
+        match = next((token for token in tokens if token in self.lost_ack_once), None)
+        if match is not None:
+            self.lost_ack_once.remove(match)
+            raise RuntimeError("injected lost acknowledgement")
+
     @staticmethod
     def _flag(args, name):
         return args[args.index(name) + 1]
@@ -1939,7 +1961,28 @@ class FakeRepairRunner:
         if call == ("issue", "children", "PRO-65", "--output", "json"):
             return self._children_payload()
         if call[:3] == ("issue", "metadata", "list"):
-            return copy.deepcopy(self.metadata[call[3]])
+            value = copy.deepcopy(self.metadata[call[3]])
+            if (
+                call[3] == "PRO-65"
+                and self.drift_reservation_after_parent_metadata_reads is not None
+            ):
+                self.drift_reservation_after_parent_metadata_reads -= 1
+                if self.drift_reservation_after_parent_metadata_reads == 0:
+                    reservation = json.loads(
+                        self.metadata["PRO-65"][
+                            "eventra.workflow.repair_reservation"
+                        ]
+                    )
+                    reservation["previous_last_action"] = "concurrent-drift"
+                    self.metadata["PRO-65"][
+                        "eventra.workflow.repair_reservation"
+                    ] = json.dumps(
+                        reservation,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    self.drift_reservation_after_parent_metadata_reads = None
+            return value
         if call[:4] == ("issue", "comment", "list", "PRO-65"):
             return copy.deepcopy(self.comments)
         if call[:2] == ("issue", "create"):
@@ -1954,9 +1997,17 @@ class FakeRepairRunner:
                 stage=int(self._flag(args, "--stage")),
                 status=self._flag(args, "--status"),
                 project_id=self._flag(args, "--project"),
+                assignee_id=self._flag(args, "--assignee-id"),
+                title=self._flag(args, "--title"),
+                description=self._flag(args, "--description"),
             )
+            if self.corrupt_created_title:
+                child["title"] = "server-side conflicting title"
             self.children.append(child)
             self.metadata[identifier] = {}
+            self.runs[identifier] = []
+            self.committed_mutations += 1
+            self._maybe_lose_ack("create")
             return copy.deepcopy(child)
         if call[:3] == ("issue", "metadata", "set"):
             identifier = call[3]
@@ -1965,19 +2016,47 @@ class FakeRepairRunner:
             if identifier == "PRO-65" and key == self.fail_once_parent_key:
                 self.fail_once_parent_key = None
                 raise RuntimeError("injected parent metadata failure")
-            self.metadata[identifier][key] = value
+            if self.metadata[identifier].get(key) != value:
+                self.metadata[identifier][key] = value
+                self.committed_mutations += 1
+            self._maybe_lose_ack(
+                f"set:{identifier}:{key}",
+                f"set-child:{key}" if identifier != "PRO-65" else "",
+            )
             return {"ok": True}
         if call[:3] == ("issue", "metadata", "delete"):
             identifier = call[3]
             key = self._flag(args, "--key")
-            self.metadata[identifier].pop(key, None)
+            if key in self.metadata[identifier]:
+                self.metadata[identifier].pop(key)
+                self.committed_mutations += 1
+            self._maybe_lose_ack(f"delete:{identifier}:{key}")
             return {"ok": True}
         if call[:2] == ("issue", "status"):
             identifier = call[2]
             status = call[3]
             child = next(child for child in self.children if child["identifier"] == identifier)
-            child["status"] = status
+            if child["status"] != status:
+                child["status"] = status
+                self.committed_mutations += 1
+            if "--no-start" not in call and not self.suppress_status_run:
+                runs = self.runs.setdefault(identifier, [])
+                if not any(run["status"] in {"queued", "dispatched", "running"} for run in runs):
+                    runs.append(
+                        {
+                            "id": f"run-{identifier}-{len(runs) + 1}",
+                            "issue_id": child["id"],
+                            "status": "queued",
+                            "created_at": "2026-08-25T09:00:00Z",
+                            "dispatched_at": None,
+                            "started_at": None,
+                            "completed_at": None,
+                        }
+                    )
+            self._maybe_lose_ack("status")
             return copy.deepcopy(child)
+        if call[:2] == ("issue", "runs"):
+            return copy.deepcopy(self.runs.get(call[2], []))
         raise AssertionError(f"unsupported argv: {call!r}")
 
 
@@ -2217,6 +2296,244 @@ class RepairExecutionTests(unittest.TestCase):
         )
         self.assertEqual(drift.next_action, "block")
         self.assertEqual(runner.mutation_calls, [])
+
+    def test_inner_reread_blocks_reservation_drift_before_child_creation(self):
+        runner, github, decision = self._planned()
+        # Return the persisted reservation to the outer caller, then change the
+        # authoritative value before the child-creation reread.
+        runner.drift_reservation_after_parent_metadata_reads = 2
+
+        result = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(result.next_action, "block")
+        self.assertFalse(any(call[:2] == ("issue", "create") for call in runner.calls))
+
+    def test_action_identity_binds_the_exact_source_and_next_stage(self):
+        runner, github, decision = self._planned()
+        snapshot = load_parent_snapshot(runner, github, "PRO-65")
+        bundle = decision.failure_bundle
+        self.assertIsNotNone(bundle)
+
+        changed = _action_key(
+            replace(snapshot, next_stage=snapshot.next_stage + 1),
+            "create_repair_stage",
+            3,
+            bundle["digest"],
+            FakeRepairRunner.AUTH_UUID,
+        )
+        changed_source = _action_key(
+            snapshot,
+            "create_repair_stage",
+            3,
+            bundle["digest"],
+            FakeRepairRunner.AUTH_UUID,
+            5,
+        )
+
+        self.assertNotEqual(decision.action_key, changed)
+        self.assertNotEqual(decision.action_key, changed_source)
+
+    def test_replay_requires_complete_exact_authoritative_child_identity(self):
+        cases = {
+            "workflow v1": lambda issue, metadata: metadata.__setitem__(
+                "eventra.workflow.version", "1"
+            ),
+            "missing phase PR": lambda issue, metadata: metadata.pop(
+                "eventra.phase.pr"
+            ),
+            "changed bundle digest": lambda issue, metadata: metadata.__setitem__(
+                "eventra.repair.failure_bundle_digest", "f" * 64
+            ),
+            "changed title": lambda issue, metadata: issue.__setitem__(
+                "title", "forged repair handoff"
+            ),
+            "malformed title": lambda issue, metadata: issue.__setitem__(
+                "title", None
+            ),
+            "changed description": lambda issue, metadata: issue.__setitem__(
+                "description", "forged repair handoff"
+            ),
+            "extra provenance": lambda issue, metadata: metadata.__setitem__(
+                "eventra.repair.unbound", "forged"
+            ),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                runner, github, decision = self._planned()
+                completed = execute_parent_repair(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+                self.assertEqual(completed.next_action, "repair")
+                child = next(item for item in runner.children if item["stage"] == 7)
+                mutate(child, runner.metadata[child["identifier"]])
+                before = len(runner.mutation_calls)
+
+                replay = execute_parent_repair(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+
+                self.assertEqual(replay.next_action, "block")
+                self.assertEqual(len(runner.mutation_calls), before)
+
+    def test_handoff_is_complete_partitioned_deterministic_and_redacted(self):
+        runner = FakeRepairRunner()
+        qa = next(
+            child
+            for child in runner.children
+            if child["stage"] == 6
+            and runner.metadata[child["identifier"]]["eventra.phase.kind"] == "qa"
+        )
+        qa_metadata = runner.metadata[qa["identifier"]]
+        qa_metadata["eventra.phase.result"] = "blocked"
+        qa_metadata["eventra.phase.failure_repositories"] = '["backend"]'
+        qa_metadata["eventra.phase.evidence_comment_url"] = (
+            f"https://multica.example/comments/{runner.QA_UUID}"
+        )
+        github = FakeRepairGitHubRunner()
+        snapshot = load_parent_snapshot(runner, github, "PRO-65")
+        bundle = _failure_bundle(
+            snapshot,
+            tuple(child for child in snapshot.children if child.stage == 6),
+        )
+        runner.authorize(bundle["digest"])
+        snapshot = load_parent_snapshot(runner, github, "PRO-65")
+        decision = decide_parent_action(snapshot)
+        reservation = _build_repair_reservation(snapshot, decision)
+        spec = reservation["child_specs"][0]
+
+        rendered = workflow_module._render_repair_handoff(reservation, spec)
+
+        self.assertIn(f"Parent: PRO-65", rendered)
+        self.assertIn(f"Action: {decision.action_key}", rendered)
+        self.assertIn(f"Failure bundle: {bundle['digest']}", rendered)
+        self.assertIn("Source stage: 6", rendered)
+        self.assertIn("Next stage: 7", rendered)
+        self.assertIn("Repair round: 3", rendered)
+        self.assertIn(f"backend: {runner.BACKEND_SHA}", rendered)
+        self.assertIn(f"Managed PR: {runner.BACKEND_PR}", rendered)
+        self.assertIn(runner.REVIEW_UUID, rendered)
+        self.assertIn(runner.QA_UUID, rendered)
+        self.assertLess(rendered.index("review |"), rendered.index("qa |"))
+        self.assertNotIn(runner.comments[0]["content"], rendered)
+        self.assertLessEqual(
+            len(rendered.encode("utf-8")),
+            workflow_module.MAX_REPAIR_DESCRIPTION_BYTES,
+        )
+        self.assertLessEqual(
+            len(json.dumps(reservation, sort_keys=True, separators=(",", ":")).encode("utf-8")),
+            workflow_module.MAX_REPAIR_RESERVATION_BYTES,
+        )
+
+        incomplete = copy.deepcopy(spec)
+        incomplete["evidence_uuids"] = incomplete["evidence_uuids"][:-1]
+        with self.assertRaisesRegex(RuntimeError, "partition"):
+            workflow_module._render_repair_handoff(reservation, incomplete)
+
+        with patch.object(workflow_module, "MAX_REPAIR_DESCRIPTION_BYTES", 1):
+            with self.assertRaisesRegex(RuntimeError, "description limit"):
+                workflow_module._render_repair_handoff(reservation, spec)
+        with patch.object(workflow_module, "MAX_REPAIR_RESERVATION_BYTES", 1):
+            with self.assertRaisesRegex(RuntimeError, "metadata limit"):
+                _build_repair_reservation(snapshot, decision)
+
+    def test_promotion_starts_exactly_one_active_agent_run(self):
+        runner, github, decision = self._planned()
+
+        result = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+        child = next(item for item in runner.children if item["stage"] == 7)
+        status_call = next(call for call in runner.calls if call[:2] == ("issue", "status"))
+
+        self.assertEqual(result.next_action, "repair")
+        self.assertNotIn("--no-start", status_call)
+        self.assertEqual(len(runner.runs[child["identifier"]]), 1)
+        self.assertEqual(runner.runs[child["identifier"]][0]["status"], "queued")
+
+        replay = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+        self.assertEqual(replay.next_action, "noop")
+        self.assertEqual(len(runner.runs[child["identifier"]]), 1)
+
+    def test_replay_blocks_a_post_commit_pull_request_head_drift(self):
+        runner, github, decision = self._planned()
+        completed = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+        self.assertEqual(completed.next_action, "repair")
+        github.head_sha = "e" * 40
+
+        replay = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(replay.next_action, "block")
+
+    def test_lost_acknowledgements_reconcile_and_report_observed_effects(self):
+        cases = (
+            "set:PRO-65:eventra.workflow.repair_reservation",
+            "create",
+            "set-child:eventra.repair.creation_action",
+            "set:PRO-65:eventra.workflow.attempt",
+            "status",
+            "delete:PRO-65:eventra.workflow.repair_reservation",
+        )
+        for lost_ack in cases:
+            with self.subTest(lost_ack=lost_ack):
+                runner, github, decision = self._planned()
+                runner.lost_ack_once.add(lost_ack)
+
+                result = execute_parent_repair(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+
+                self.assertEqual(result.next_action, "repair")
+                self.assertEqual(result.mutation_count, runner.committed_mutations)
+                self.assertGreater(result.mutation_count, 0)
+
+    def test_blocked_partial_effects_are_still_reported_truthfully(self):
+        for fault in ("corrupt_created_title", "suppress_status_run"):
+            with self.subTest(fault=fault):
+                runner, github, decision = self._planned()
+                setattr(runner, fault, True)
+
+                result = execute_parent_repair(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+
+                self.assertEqual(result.next_action, "block")
+                self.assertEqual(result.mutation_count, runner.committed_mutations)
+                self.assertGreater(result.mutation_count, 0)
 
 
 class ParentSnapshotReadTests(unittest.TestCase):

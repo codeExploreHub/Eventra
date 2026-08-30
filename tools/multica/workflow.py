@@ -53,6 +53,9 @@ REPAIR_AUTHORIZATION_KEY = "eventra.workflow.repair_authorization_comment"
 REPAIR_AUTHORIZATION_CONSUMED_KEY = (
     "eventra.workflow.repair_authorization_consumed"
 )
+MAX_REPAIR_RESERVATION_BYTES = 16_384
+MAX_REPAIR_DESCRIPTION_BYTES = 16_384
+MAX_REPAIR_TITLE_BYTES = 255
 REPAIR_ASSIGNEES = {
     "frontend": "Eventra Frontend Engineer",
     "backend": "Eventra Backend Engineer",
@@ -114,6 +117,7 @@ class PhaseSnapshot:
     pr_url: str = ""
     assignee_id: str = ""
     assignee_type: str = "agent"
+    workflow_version: int = 2
 
 
 @dataclass(frozen=True)
@@ -151,6 +155,7 @@ class ParentSnapshot:
     consumed_authorization_uuid: str = ""
     authorizing_comment: AuthorizingComment | None = None
     repair_reservation: dict[str, object] | None = None
+    parent_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -425,6 +430,7 @@ def _action_key(
     attempt: int,
     bundle_digest: str | None = None,
     authorizing_comment_uuid: str | None = None,
+    source_stage: int | None = None,
 ) -> str:
     return ":".join(
         (
@@ -435,6 +441,9 @@ def _action_key(
             _scope(snapshot),
             snapshot.candidate_frontend_sha or "-",
             snapshot.candidate_backend_sha or "-",
+            "next-stage",
+            str(snapshot.next_stage),
+            *(("source-stage", str(source_stage)) if source_stage is not None else ()),
             *(("bundle", bundle_digest) if bundle_digest is not None else ()),
             *(
                 ("authorization", authorizing_comment_uuid)
@@ -465,6 +474,11 @@ def _parent_decision(
         snapshot.attempt if attempt is None else attempt,
         bundle_digest,
         authorizing_comment_uuid,
+        (
+            None
+            if failure_bundle is None
+            else int(failure_bundle["source_stage_ordinal"])
+        ),
     )
     if snapshot.last_action == key:
         return ParentDecision("noop", None, "coordinator action already recorded")
@@ -1098,6 +1112,8 @@ def _canonical_json(value: object) -> str:
 
 
 def _decode_repair_reservation(value: str) -> dict[str, object]:
+    if type(value) is not str or len(value.encode("utf-8")) > MAX_REPAIR_RESERVATION_BYTES:
+        raise RuntimeError("malformed repair reservation")
     try:
         decoded = json.loads(value)
     except (json.JSONDecodeError, TypeError, ValueError):
@@ -1348,6 +1364,7 @@ def _phase_snapshot(
         pr_url=phase_pr_url,
         assignee_id=str(issue["assignee_id"]),
         assignee_type=str(issue["assignee_type"]),
+        workflow_version=int(version),
     )
 
 
@@ -1517,6 +1534,7 @@ def load_parent_snapshot(
         ),
         authorizing_comment=authorizing_comment,
         repair_reservation=metadata["repair_reservation"],
+        parent_id=str(parent["id"]),
     )
 
 
@@ -1621,7 +1639,10 @@ def _build_repair_reservation(
         "repair_round": repair_round,
         "source_attempt": snapshot.attempt,
     }
-    return _decode_repair_reservation(_canonical_json(reservation))
+    encoded = _canonical_json(reservation)
+    if len(encoded.encode("utf-8")) > MAX_REPAIR_RESERVATION_BYTES:
+        raise RuntimeError("repair reservation exceeds the local metadata limit")
+    return _decode_repair_reservation(encoded)
 
 
 def _validate_repair_reservation(
@@ -1659,6 +1680,7 @@ def _validate_repair_reservation(
     source_snapshot = replace(
         snapshot,
         attempt=source_attempt,
+        next_stage=next_stage,
         repair_reservation=None,
     )
     try:
@@ -1673,6 +1695,7 @@ def _validate_repair_reservation(
         repair_round,
         str(bundle["digest"]),
         authorization_uuid or None,
+        int(source_stage),
     )
     if computed_key != expected_action_key:
         raise RuntimeError("reserved repair action identity no longer matches")
@@ -1725,24 +1748,210 @@ def _repair_child_metadata(
     return result
 
 
-def _metadata_set(
+def _metadata_set_observed(
     runner: MulticaRunner,
     issue_key: str,
     key: str,
     value: str,
-) -> None:
-    runner.run(
-        [
-            "issue", "metadata", "set", issue_key,
-            "--key", key,
-            "--value", value,
-            "--type", "string",
-            "--output", "json",
-        ]
+) -> int:
+    before = parse_issue_metadata(
+        runner.run(["issue", "metadata", "list", issue_key, "--output", "json"])
     )
+    if before.get(key) == value:
+        return 0
+    try:
+        runner.run(
+            [
+                "issue", "metadata", "set", issue_key,
+                "--key", key,
+                "--value", value,
+                "--type", "string",
+                "--output", "json",
+            ]
+        )
+    except RuntimeError:
+        pass
+    after = parse_issue_metadata(
+        runner.run(["issue", "metadata", "list", issue_key, "--output", "json"])
+    )
+    if after.get(key) != value:
+        raise RuntimeError("metadata mutation effect was not authoritatively observed")
+    return 1
+
+
+def _metadata_delete_observed(
+    runner: MulticaRunner,
+    issue_key: str,
+    key: str,
+) -> int:
+    before = parse_issue_metadata(
+        runner.run(["issue", "metadata", "list", issue_key, "--output", "json"])
+    )
+    if key not in before:
+        return 0
+    try:
+        runner.run(
+            [
+                "issue", "metadata", "delete", issue_key,
+                "--key", key,
+                "--output", "json",
+            ]
+        )
+    except RuntimeError:
+        pass
+    after = parse_issue_metadata(
+        runner.run(["issue", "metadata", "list", issue_key, "--output", "json"])
+    )
+    if key in after:
+        raise RuntimeError("metadata delete effect was not authoritatively observed")
+    return 1
+
+
+def _repair_child_title(
+    reservation: dict[str, object],
+    spec: dict[str, object],
+) -> str:
+    title = (
+        f"{reservation['parent_identifier']} {spec['repository']} repair round "
+        f"{reservation['repair_round']}"
+    )
+    if len(title.encode("utf-8")) > MAX_REPAIR_TITLE_BYTES:
+        raise RuntimeError("repair child title exceeds the local issue limit")
+    return title
+
+
+def _render_repair_handoff(
+    reservation: dict[str, object],
+    spec: dict[str, object],
+) -> str:
+    """Render one complete deterministic repository failure partition."""
+
+    validated = _decode_repair_reservation(_canonical_json(reservation))
+    matching_specs = [item for item in validated["child_specs"] if item == spec]
+    if len(matching_specs) != 1:
+        raise RuntimeError("repair handoff partition does not match its reservation")
+    repository = str(spec["repository"])
+    bundle = validated["failure_bundle"]
+    failures = bundle.get("failures")
+    candidates = bundle.get("candidate_shas")
+    if not isinstance(failures, list) or not isinstance(candidates, dict):
+        raise RuntimeError("repair handoff partition is malformed")
+    if (
+        bundle.get("workflow_version") != 2
+        or not candidates
+        or set(candidates) - set(REPAIR_ASSIGNEES)
+        or any(
+            type(name) is not str
+            or type(sha) is not str
+            or SHA_PATTERN.fullmatch(sha) is None
+            for name, sha in candidates.items()
+        )
+    ):
+        raise RuntimeError("repair handoff candidate identity is malformed")
+    if candidates.get(repository) != spec["candidate_sha"]:
+        raise RuntimeError("repair handoff rejected candidate is malformed")
+    assigned: list[dict[str, object]] = []
+    expected_failure_keys = {
+        "candidate_shas",
+        "child_identifier",
+        "evidence_comment_url",
+        "evidence_comment_uuid",
+        "phase",
+        "repair_round",
+        "responsible_repositories",
+        "result",
+        "stage_ordinal",
+        "suite_key",
+    }
+    for failure in failures:
+        if not isinstance(failure, dict) or set(failure) != expected_failure_keys:
+            raise RuntimeError("repair handoff failure identity is malformed")
+        owners = failure["responsible_repositories"]
+        if (
+            failure["candidate_shas"] != candidates
+            or failure["phase"] not in {"review", "qa"}
+            or failure["result"] not in {"fail", "blocked"}
+            or type(failure["suite_key"]) is not str
+            or failure["repair_round"] != validated["source_attempt"]
+            or failure["stage_ordinal"] != bundle["source_stage_ordinal"]
+            or type(failure["child_identifier"]) is not str
+            or ISSUE_KEY_PATTERN.fullmatch(failure["child_identifier"]) is None
+            or not _is_uuid(failure["evidence_comment_uuid"])
+            or not _is_canonical_evidence_url(failure["evidence_comment_url"])
+            or not isinstance(owners, list)
+            or any(
+                type(owner) is not str or owner not in REPAIR_ASSIGNEES
+                for owner in owners
+            )
+            or owners != sorted(owners)
+            or len(owners) != len(set(owners))
+            or not owners
+        ):
+            raise RuntimeError("repair handoff failure identity is malformed")
+        if repository in owners:
+            assigned.append(failure)
+    assigned.sort(
+        key=lambda item: (
+            {"review": 0, "qa": 1}[str(item["phase"])],
+            str(item["suite_key"]),
+            str(item["child_identifier"]),
+            str(item["evidence_comment_uuid"]),
+        )
+    )
+    evidence_uuids = [str(item["evidence_comment_uuid"]) for item in assigned]
+    if not assigned or sorted(evidence_uuids) != spec["evidence_uuids"]:
+        raise RuntimeError("repair handoff partition is incomplete")
+    source_children = sorted({str(item["child_identifier"]) for item in assigned})
+    lines = [
+        "# Deterministic repair handoff",
+        f"Parent: {validated['parent_identifier']}",
+        f"Action: {validated['action_key']}",
+        f"Failure bundle: {bundle['digest']}",
+        f"Workflow: {bundle['workflow_version']}",
+        f"Source stage: {bundle['source_stage_ordinal']}",
+        f"Next stage: {validated['next_stage']}",
+        f"Repair round: {validated['repair_round']}",
+        f"Managed PR: {spec['pull_request']}",
+        "Candidate SHAs:",
+        *(f"- {name}: {candidates[name]}" for name in sorted(candidates)),
+        "Rejected candidates:",
+        f"- {repository}: {spec['candidate_sha']}",
+        "Source children:",
+        *(f"- {identifier}" for identifier in source_children),
+        "Assigned failure evidence:",
+    ]
+    for item in assigned:
+        suite = str(item["suite_key"])
+        suffix = "" if not suite else f" | suite={suite}"
+        lines.append(
+            "- "
+            f"{item['phase']} | {item['child_identifier']} | {item['result']} | "
+            f"{item['evidence_comment_uuid']} | {item['evidence_comment_url']}"
+            f"{suffix}"
+        )
+    rendered = "\n".join(lines) + "\n"
+    if len(rendered.encode("utf-8")) > MAX_REPAIR_DESCRIPTION_BYTES:
+        raise RuntimeError("repair handoff exceeds the local issue description limit")
+    return rendered
+
+
+def _repair_issue_detail(
+    runner: MulticaRunner,
+    issue_key: str,
+) -> tuple[dict[str, object], str, str]:
+    raw = runner.run(["issue", "get", issue_key, "--output", "json"])
+    detail = parse_issue_detail(raw, issue_key)
+    if not isinstance(raw, dict):
+        raise RuntimeError("malformed repair child detail")
+    title = raw.get("title")
+    description = raw.get("description")
+    if type(title) is not str or not title or type(description) is not str or not description:
+        raise RuntimeError("malformed repair child detail")
+    return detail, title, description
 
 
 def _repair_children_for_reservation(
+    runner: MulticaRunner,
     snapshot: ParentSnapshot,
     reservation: dict[str, object],
 ) -> dict[str, PhaseSnapshot]:
@@ -1757,35 +1966,44 @@ def _repair_children_for_reservation(
         if spec is None or repository in observed:
             raise RuntimeError("reserved repair stage has conflicting children")
         expected_metadata = _repair_child_metadata(reservation, spec)
-        comparable = {
-            "eventra.workflow.version": "2",
-            "eventra.phase.kind": child.kind,
-            "eventra.phase.attempt": str(child.attempt),
-            "eventra.phase.failure_repositories": _canonical_json(
-                list(child.responsible_repositories)
-            ),
-            "eventra.phase.pr": child.repair_pull_request,
-            "eventra.repair.creation_action": child.creation_action,
-            "eventra.repair.failure_bundle_digest": child.failure_bundle_digest,
-            "eventra.repair.failure_evidence_uuids": _canonical_json(
-                list(child.failure_evidence_uuids)
-            ),
-            "eventra.repair.authorizing_comment_uuid": (
-                child.authorizing_comment_uuid
-            ),
-            "eventra.repair.repository": child.repair_repository,
-            "eventra.repair.pull_request": child.repair_pull_request,
-            "eventra.repair.round": str(child.repair_round),
+        metadata = parse_issue_metadata(
+            runner.run(
+                ["issue", "metadata", "list", child.issue_key, "--output", "json"]
+            )
+        )
+        controlled = {
+            key: value
+            for key, value in metadata.items()
+            if key.startswith("eventra.workflow.")
+            or key.startswith("eventra.phase.")
+            or key.startswith("eventra.repair.")
         }
-        if repository == "frontend":
-            comparable["eventra.phase.sha.frontend"] = child.frontend_sha or ""
-        else:
-            comparable["eventra.phase.sha.backend"] = child.backend_sha or ""
+        exact_metadata = dict(expected_metadata)
+        if child.status == "done":
+            for key in ("eventra.phase.result", "eventra.phase.evidence_comment"):
+                if key not in metadata:
+                    raise RuntimeError("reserved repair child completion is incomplete")
+                exact_metadata[key] = metadata[key]
+        detail, title, description = _repair_issue_detail(runner, child.issue_key)
         if (
-            comparable != expected_metadata
+            controlled != exact_metadata
+            or child.workflow_version != 2
+            or child.kind != "repair"
+            or child.attempt != reservation["repair_round"]
+            or child.pr_url != spec["pull_request"]
+            or child.repair_pull_request != spec["pull_request"]
             or child.project_id != spec["project_id"]
+            or child.assignee_id != spec["assignee_id"]
+            or child.assignee_type != "agent"
             or child.status
             not in {"backlog", "todo", "in_progress", "in_review", "done"}
+            or detail["parent_issue_id"] != snapshot.parent_id
+            or detail["stage"] != stage
+            or detail["project_id"] != spec["project_id"]
+            or detail["assignee_id"] != spec["assignee_id"]
+            or detail["assignee_type"] != "agent"
+            or title != _repair_child_title(reservation, spec)
+            or description != _render_repair_handoff(reservation, spec)
         ):
             raise RuntimeError("reserved repair child provenance conflicts")
         observed[repository] = child
@@ -1797,54 +2015,71 @@ def _create_reserved_repair_children(
     github: GitHubRunner,
     parent_key: str,
     reservation: dict[str, object],
-) -> tuple[ParentSnapshot, int]:
+    observed_effects: list[int],
+) -> ParentSnapshot:
     snapshot = load_parent_snapshot(runner, github, parent_key)
+    if snapshot.repair_reservation != reservation:
+        raise RuntimeError("authoritative repair reservation changed before child creation")
     _validate_repair_reservation(snapshot, reservation, str(reservation["action_key"]))
-    observed = _repair_children_for_reservation(snapshot, reservation)
-    mutations = 0
+    observed = _repair_children_for_reservation(runner, snapshot, reservation)
     for spec in reservation["child_specs"]:
         repository = str(spec["repository"])
         if repository in observed:
             continue
-        raw_created = runner.run(
-            [
-                "issue", "create",
-                "--parent", parent_key,
-                "--stage", str(reservation["next_stage"]),
-                "--project", str(spec["project_id"]),
-                "--assignee-id", str(spec["assignee_id"]),
-                "--status", "backlog",
-                "--title", (
-                    f"{parent_key} {repository} repair round "
-                    f"{reservation['repair_round']}"
-                ),
-                "--description", _canonical_json(
-                    {
-                        "action_key": reservation["action_key"],
-                        "failure_bundle_digest": reservation["failure_bundle"]["digest"],
-                        "repository": repository,
-                    }
-                ),
-                "--output", "json",
-            ]
+        before_children = parse_issue_children(
+            runner.run(["issue", "children", parent_key, "--output", "json"]),
+            snapshot.parent_id,
         )
-        if not isinstance(raw_created, dict) or not isinstance(
-            raw_created.get("identifier"), str
+        before_ids = {str(item["identifier"]) for item in before_children}
+        title = _repair_child_title(reservation, spec)
+        description = _render_repair_handoff(reservation, spec)
+        try:
+            runner.run(
+                [
+                    "issue", "create",
+                    "--parent", parent_key,
+                    "--stage", str(reservation["next_stage"]),
+                    "--project", str(spec["project_id"]),
+                    "--assignee-id", str(spec["assignee_id"]),
+                    "--status", "backlog",
+                    "--title", title,
+                    "--description", description,
+                    "--output", "json",
+                ]
+            )
+        except RuntimeError:
+            pass
+        after_children = parse_issue_children(
+            runner.run(["issue", "children", parent_key, "--output", "json"]),
+            snapshot.parent_id,
+        )
+        created = [
+            item for item in after_children if str(item["identifier"]) not in before_ids
+        ]
+        if len(created) != 1:
+            raise RuntimeError("repair child creation effect is ambiguous")
+        child_key = str(created[0]["identifier"])
+        observed_effects[0] += 1
+        detail, observed_title, observed_description = _repair_issue_detail(
+            runner, child_key
+        )
+        if (
+            detail["parent_issue_id"] != snapshot.parent_id
+            or detail["stage"] != reservation["next_stage"]
+            or detail["project_id"] != spec["project_id"]
+            or detail["assignee_id"] != spec["assignee_id"]
+            or detail["assignee_type"] != "agent"
+            or detail["status"] != "backlog"
+            or observed_title != title
+            or observed_description != description
         ):
-            raise RuntimeError("malformed repair child creation response")
-        created = parse_issue_detail(
-            raw_created,
-            str(raw_created["identifier"]),
-        )
-        # The create response owns the identifier; validate its structural fields below.
-        child_key = str(created["identifier"])
-        mutations += 1
+            raise RuntimeError("repair child creation persistence conflicts")
         for key, value in sorted(_repair_child_metadata(reservation, spec).items()):
-            _metadata_set(runner, child_key, key, value)
-            mutations += 1
-        detail = parse_issue_detail(
-            runner.run(["issue", "get", child_key, "--output", "json"]),
-            child_key,
+            observed_effects[0] += _metadata_set_observed(
+                runner, child_key, key, value
+            )
+        detail, observed_title, observed_description = _repair_issue_detail(
+            runner, child_key
         )
         metadata = parse_issue_metadata(
             runner.run(
@@ -1860,16 +2095,70 @@ def _create_reserved_repair_children(
             or detail["assignee_type"] != "agent"
             or detail["status"] != "backlog"
             or any(metadata.get(key) != value for key, value in expected_metadata.items())
+            or observed_title != title
+            or observed_description != description
         ):
             raise RuntimeError("repair child persistence verification failed")
     fresh = load_parent_snapshot(runner, github, parent_key)
+    if fresh.repair_reservation != reservation:
+        raise RuntimeError("authoritative repair reservation changed after child creation")
     _validate_repair_reservation(fresh, reservation, str(reservation["action_key"]))
-    children = _repair_children_for_reservation(fresh, reservation)
+    children = _repair_children_for_reservation(runner, fresh, reservation)
     if set(children) != {
         str(spec["repository"]) for spec in reservation["child_specs"]
     }:
         raise RuntimeError("repair reservation is missing an owner child")
-    return fresh, mutations
+    return fresh
+
+
+def _promote_repair_child_observed(
+    runner: MulticaRunner,
+    child: PhaseSnapshot,
+    observed_effects: list[int],
+) -> None:
+    detail, _, _ = _repair_issue_detail(runner, child.issue_key)
+    issue_id = str(detail["id"])
+    before_runs = parse_issue_runs(
+        runner.run(["issue", "runs", child.issue_key, "--output", "json"]),
+        issue_id,
+    )
+    active_before = [
+        item for item in before_runs if item["status"] in ACTIVE_RUN_STATUSES
+    ]
+    if detail["status"] != "backlog":
+        if detail["status"] in {"todo", "in_progress", "in_review"} and not active_before:
+            raise RuntimeError("promoted repair child has no active agent run")
+        if detail["status"] == "done" and child.result is None:
+            raise RuntimeError("completed repair child has no exact completion")
+        return
+    if active_before:
+        raise RuntimeError("backlog repair child unexpectedly has an active run")
+    before_ids = {item["id"] for item in before_runs}
+    try:
+        runner.run(
+            ["issue", "status", child.issue_key, "todo", "--output", "json"]
+        )
+    except RuntimeError:
+        pass
+    verified, _, _ = _repair_issue_detail(runner, child.issue_key)
+    after_runs = parse_issue_runs(
+        runner.run(["issue", "runs", child.issue_key, "--output", "json"]),
+        issue_id,
+    )
+    new_active = [
+        item
+        for item in after_runs
+        if item["id"] not in before_ids and item["status"] in ACTIVE_RUN_STATUSES
+    ]
+    if verified["status"] != "backlog" or any(
+        item["id"] not in before_ids for item in after_runs
+    ):
+        observed_effects[0] += 1
+    if (
+        verified["status"] not in {"todo", "in_progress", "in_review"}
+        or len(new_active) != 1
+    ):
+        raise RuntimeError("repair child promotion effect was not observed")
 
 
 def _commit_reserved_repair(
@@ -1877,8 +2166,8 @@ def _commit_reserved_repair(
     github: GitHubRunner,
     parent_key: str,
     reservation: dict[str, object],
-) -> tuple[int, tuple[str, ...]]:
-    mutations = 0
+    observed_effects: list[int],
+) -> tuple[str, ...]:
     action_key = str(reservation["action_key"])
     source_attempt = int(reservation["source_attempt"])
     repair_round = int(reservation["repair_round"])
@@ -1914,22 +2203,20 @@ def _commit_reserved_repair(
         desired[REPAIR_AUTHORIZATION_CONSUMED_KEY] = authorization_uuid
     for key, value in desired.items():
         if raw_metadata.get(key, "") != value:
-            _metadata_set(runner, parent_key, key, value)
-            mutations += 1
+            observed_effects[0] += _metadata_set_observed(
+                runner, parent_key, key, value
+            )
             raw_metadata[key] = value
     if authorization_uuid:
         current_authorization = raw_metadata.get(REPAIR_AUTHORIZATION_KEY)
         if current_authorization not in {None, authorization_uuid}:
             raise RuntimeError("parent authorization changed during commit")
         if current_authorization == authorization_uuid:
-            runner.run(
-                [
-                    "issue", "metadata", "delete", parent_key,
-                    "--key", REPAIR_AUTHORIZATION_KEY,
-                    "--output", "json",
-                ]
+            observed_effects[0] += _metadata_delete_observed(
+                runner,
+                parent_key,
+                REPAIR_AUTHORIZATION_KEY,
             )
-            mutations += 1
 
     committed_metadata = parse_issue_metadata(
         runner.run(["issue", "metadata", "list", parent_key, "--output", "json"])
@@ -1947,7 +2234,7 @@ def _commit_reserved_repair(
 
     fresh = load_parent_snapshot(runner, github, parent_key)
     _validate_repair_reservation(fresh, reservation, action_key)
-    children = _repair_children_for_reservation(fresh, reservation)
+    children = _repair_children_for_reservation(runner, fresh, reservation)
     expected_repositories = {
         str(spec["repository"]) for spec in reservation["child_specs"]
     }
@@ -1955,42 +2242,25 @@ def _commit_reserved_repair(
         raise RuntimeError("repair children changed before promotion")
     for repository in sorted(children):
         child = children[repository]
-        if child.status == "backlog":
-            runner.run(
-                [
-                    "issue", "status", child.issue_key, "todo",
-                    "--no-start", "--output", "json",
-                ]
-            )
-            mutations += 1
-        verified = parse_issue_detail(
-            runner.run(["issue", "get", child.issue_key, "--output", "json"]),
-            child.issue_key,
-        )
-        if verified["status"] not in {
-            "todo", "in_progress", "in_review", "done"
-        }:
-            raise RuntimeError("repair child promotion verification failed")
+        _promote_repair_child_observed(runner, child, observed_effects)
 
-    runner.run(
-        [
-            "issue", "metadata", "delete", parent_key,
-            "--key", REPAIR_RESERVATION_KEY,
-            "--output", "json",
-        ]
+    observed_effects[0] += _metadata_delete_observed(
+        runner,
+        parent_key,
+        REPAIR_RESERVATION_KEY,
     )
-    mutations += 1
     final_metadata = parse_issue_metadata(
         runner.run(["issue", "metadata", "list", parent_key, "--output", "json"])
     )
     if REPAIR_RESERVATION_KEY in final_metadata:
         raise RuntimeError("repair reservation clear verification failed")
-    return mutations, tuple(
+    return tuple(
         children[repository].issue_key for repository in sorted(children)
     )
 
 
 def _verified_replayed_repair_children(
+    runner: MulticaRunner,
     snapshot: ParentSnapshot,
     expected_action_key: str,
 ) -> tuple[str, ...]:
@@ -2002,26 +2272,79 @@ def _verified_replayed_repair_children(
     if not matching or len({item.stage for item in matching}) != 1:
         raise RuntimeError("recorded repair action has no exact child set")
     stage = matching[0].stage
-    stage_children = tuple(item for item in snapshot.children if item.stage == stage)
-    repositories = [item.repair_repository for item in matching]
+    rounds = {item.repair_round for item in matching}
+    authorizations = {item.authorizing_comment_uuid for item in matching}
     if (
-        len(matching) != len(stage_children)
-        or repositories != sorted(repositories)
-        or len(repositories) != len(set(repositories))
-        or any(
-            item.kind != "repair"
-            or item.repair_round != snapshot.attempt
-            or item.failure_bundle_digest == ""
-            or item.status == "backlog"
-            for item in matching
-        )
+        len(rounds) != 1
+        or len(authorizations) != 1
+        or snapshot.attempt != next(iter(rounds))
+        or snapshot.next_stage != stage + 1
     ):
         raise RuntimeError("recorded repair child set conflicts")
-    if snapshot.attempt == 3:
-        authorization_uuids = {item.authorizing_comment_uuid for item in matching}
-        if authorization_uuids != {snapshot.consumed_authorization_uuid}:
+    repair_round = next(iter(rounds))
+    authorization_uuid = next(iter(authorizations))
+    if repair_round == 3:
+        if authorization_uuid != snapshot.consumed_authorization_uuid:
             raise RuntimeError("recorded round-three authorization conflicts")
-    return tuple(item.issue_key for item in matching)
+    elif authorization_uuid:
+        raise RuntimeError("recorded automatic repair carries authorization")
+    source_snapshot = replace(
+        snapshot,
+        attempt=repair_round - 1,
+        next_stage=stage,
+        last_action=None,
+        authorization_comment_uuid="",
+        authorizing_comment=None,
+        repair_reservation=None,
+    )
+    source_phases = tuple(
+        item for item in snapshot.children if item.stage == stage - 1
+    )
+    try:
+        bundle = _failure_bundle(source_snapshot, source_phases)
+    except ValueError:
+        raise RuntimeError("recorded repair bundle cannot be reconstructed") from None
+    computed_key = _action_key(
+        source_snapshot,
+        "create_repair_stage",
+        repair_round,
+        str(bundle["digest"]),
+        authorization_uuid or None,
+        int(bundle["source_stage_ordinal"]),
+    )
+    if computed_key != expected_action_key:
+        raise RuntimeError("recorded repair action identity conflicts")
+    reservation = _decode_repair_reservation(
+        _canonical_json(
+            {
+                "action_key": expected_action_key,
+                "authorizing_comment_uuid": authorization_uuid,
+                "child_specs": _repair_child_specs(source_snapshot, bundle),
+                "failure_bundle": bundle,
+                "next_stage": stage,
+                "parent_identifier": snapshot.identifier,
+                "previous_last_action": "",
+                "prior_consumed_authorization_uuid": "",
+                "repair_round": repair_round,
+                "source_attempt": repair_round - 1,
+            }
+        )
+    )
+    _validate_repair_reservation(snapshot, reservation, expected_action_key)
+    children = _repair_children_for_reservation(runner, snapshot, reservation)
+    expected_repositories = {
+        str(spec["repository"]) for spec in reservation["child_specs"]
+    }
+    if set(children) != expected_repositories:
+        raise RuntimeError("recorded repair action has an incomplete child multiset")
+    for child in children.values():
+        if child.status == "backlog":
+            raise RuntimeError("recorded repair child promotion conflicts")
+        replay_effects = [0]
+        _promote_repair_child_observed(runner, child, replay_effects)
+        if replay_effects[0]:
+            raise RuntimeError("recorded repair child promotion conflicts")
+    return tuple(children[name].issue_key for name in sorted(children))
 
 
 def execute_parent_repair(
@@ -2045,7 +2368,7 @@ def execute_parent_repair(
             expected_action_key if isinstance(expected_action_key, str) else "",
             0,
         )
-    mutations = 0
+    observed_effects = [0]
     try:
         detail = parse_issue_detail(
             runner.run(["issue", "get", parent_key, "--output", "json"]),
@@ -2062,6 +2385,7 @@ def execute_parent_repair(
         reservation = snapshot.repair_reservation
         if reservation is None and snapshot.last_action == expected_action_key:
             children = _verified_replayed_repair_children(
+                runner,
                 snapshot,
                 expected_action_key,
             )
@@ -2087,13 +2411,12 @@ def execute_parent_repair(
                     0,
                 )
             reservation = _build_repair_reservation(snapshot, decision)
-            _metadata_set(
+            observed_effects[0] += _metadata_set_observed(
                 runner,
                 parent_key,
                 REPAIR_RESERVATION_KEY,
                 _canonical_json(reservation),
             )
-            mutations += 1
             persisted = parse_issue_metadata(
                 runner.run(
                     ["issue", "metadata", "list", parent_key, "--output", "json"]
@@ -2102,26 +2425,26 @@ def execute_parent_repair(
             if persisted.get(REPAIR_RESERVATION_KEY) != _canonical_json(reservation):
                 raise RuntimeError("repair reservation persistence failed")
         _validate_repair_reservation(snapshot, reservation, expected_action_key)
-        _, child_mutations = _create_reserved_repair_children(
+        _create_reserved_repair_children(
             runner,
             github,
             parent_key,
             reservation,
+            observed_effects,
         )
-        mutations += child_mutations
-        commit_mutations, child_identifiers = _commit_reserved_repair(
+        child_identifiers = _commit_reserved_repair(
             runner,
             github,
             parent_key,
             reservation,
+            observed_effects,
         )
-        mutations += commit_mutations
         return RepairExecutionResult(
             parent_key,
             "repair",
             "exact reserved repair children were committed and promoted",
             expected_action_key,
-            mutations,
+            observed_effects[0],
             child_identifiers,
         )
     except (RuntimeError, ValueError, KeyError, TypeError) as error:
@@ -2130,7 +2453,7 @@ def execute_parent_repair(
             "block",
             str(error) or "repair execution failed closed",
             expected_action_key,
-            mutations,
+            observed_effects[0],
         )
 
 

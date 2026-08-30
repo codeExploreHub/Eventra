@@ -190,6 +190,12 @@ class OperatorDocsTests(unittest.TestCase):
             self.assertIn("eventra.repair.failure_bundle_digest", rendered)
             self.assertIn("eventra.repair.authorizing_comment_uuid", rendered)
             self.assertIn("not generic CAS or transaction safety", rendered)
+            self.assertIn("deterministic repair handoff", rendered)
+            self.assertIn("starts the assigned agent", rendered)
+            self.assertIn(
+                "`mutation_count` reports authoritatively observed effects",
+                rendered,
+            )
 
         self.assertIn(
             "Do not create repair children manually",

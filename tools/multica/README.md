@@ -195,9 +195,14 @@ backlog, and persists/rereads `eventra.repair.creation_action`,
 `eventra.repair.failure_bundle_digest`, sorted failure evidence UUIDs, exact
 stage/round, existing managed PR, and
 `eventra.repair.authorizing_comment_uuid`. It commits parent attempt,
-`next_stage`, last action, and consumed authorization provenance before
-promoting only the exact children; the reservation is cleared last. Exact
-retries resume or no-op, while conflicts and partial mismatches block visibly.
+`next_stage`, last action, and consumed authorization provenance, then starts
+the assigned agent only for the exact children. Each child receives a
+deterministic repair handoff containing the bound parent/action/bundle, source
+and next Stage, candidate and rejected SHAs, managed PR, source children, and
+assigned canonical evidence. The reservation is cleared last. `mutation_count`
+reports authoritatively observed effects, including committed effects after a
+lost acknowledgement. Exact retries resume or no-op, while conflicts and
+partial mismatches block visibly.
 This Eventra-local adapter is safe only under the provisioned single serialized
 Delivery Lead (`max_concurrent_tasks=1`); it is not generic CAS or transaction
 safety.

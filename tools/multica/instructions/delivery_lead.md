@@ -105,8 +105,12 @@ next barrier group, then advance `next_stage` and record `last_action`.
   backlog, persists and rereads `eventra.repair.creation_action`,
   `eventra.repair.failure_bundle_digest`, sorted evidence UUIDs, the existing
   managed PR, repair round, and `eventra.repair.authorizing_comment_uuid`, then
-  commits the parent, promotes only those exact children, and clears the
-  reservation last. A retry may resume only that exact reservation/action.
+  commits the parent and starts the assigned agent only after rereading each
+  exact deterministic repair handoff (parent/action/bundle, source and next
+  Stage, candidate and rejected SHAs, managed PR, source children, and assigned
+  canonical evidence). It clears the reservation last. `mutation_count` reports
+  authoritatively observed effects, including a committed effect whose command
+  acknowledgement was lost. A retry may resume only that exact reservation/action.
   Conflicts, partial provenance, duplicate owner children, or head drift block
   visibly. This local adapter depends on a single serialized Delivery Lead
   (`max_concurrent_tasks=1`); it is not generic CAS or transaction safety.

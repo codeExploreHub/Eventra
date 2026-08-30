@@ -148,8 +148,13 @@ one child per owner in backlog, persists and rereads
 evidence UUIDs, stage/round, managed PR, and
 `eventra.repair.authorizing_comment_uuid`, commits parent state and consumed
 authorization provenance, promotes only exact bound children, and clears the
-reservation last. Conflicting or partial state blocks visibly; exact retries
-resume or no-op. This Eventra adapter relies on a single serialized Delivery
+reservation last. Promotion starts the assigned agent only after the exact
+deterministic repair handoff has been persisted and reread; that handoff binds
+parent/action/bundle, source and next Stage, candidate and rejected SHAs,
+managed PR, source children, and assigned canonical evidence. `mutation_count`
+reports authoritatively observed effects, including a committed effect after a
+lost acknowledgement. Conflicting or partial state blocks visibly; exact
+retries resume or no-op. This Eventra adapter relies on a single serialized Delivery
 Lead (`max_concurrent_tasks=1`) and is not generic CAS or transaction safety.
 
 For round 3 the only caller-supplied authority locator is an authoritative
