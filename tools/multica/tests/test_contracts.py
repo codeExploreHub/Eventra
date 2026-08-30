@@ -16,6 +16,7 @@ from tools.multica.contracts import (
     parse_runtime_list,
     parse_skill_detail,
     parse_skill_list,
+    github_skill_origin_matches,
     parse_squad_detail,
     parse_squad_list,
     parse_squad_members,
@@ -135,6 +136,83 @@ class MulticaAutopilotContractTests(unittest.TestCase):
 
 
 class MulticaReadContractTests(unittest.TestCase):
+    def test_github_skill_origin_comparison_matches_package_parity_matrix(self):
+        commit = "b36e0829c6d0140e93cfef2ca599b1b07d4a7797"
+        other_commit = "a" * 40
+        main = "https://github.com/obra/superpowers/tree/main/skills/using-superpowers"
+        resolved = f"https://github.com/obra/superpowers/tree/{commit}/skills/using-superpowers"
+
+        def origin(
+            source_url,
+            *,
+            origin_type="github",
+            owner="obra",
+            repo="superpowers",
+            ref="main",
+            path="skills/using-superpowers",
+        ):
+            return {
+                "type": origin_type,
+                "owner": owner,
+                "repo": repo,
+                "ref": ref,
+                "path": path,
+                "source_url": source_url,
+            }
+
+        cases = (
+            ("exact branch", main, origin(main), True),
+            ("resolved commit", main, origin(resolved, ref=commit), True),
+            ("exact pinned commit", resolved, origin(resolved, ref=commit), True),
+            (
+                "different pinned commit",
+                resolved,
+                origin(
+                    f"https://github.com/obra/superpowers/tree/{other_commit}/skills/using-superpowers",
+                    ref=other_commit,
+                ),
+                False,
+            ),
+            (
+                "different branch",
+                main,
+                origin(
+                    "https://github.com/obra/superpowers/tree/other/skills/using-superpowers",
+                    ref="other",
+                ),
+                False,
+            ),
+            ("wrong type", main, origin(main, origin_type="http"), False),
+            ("wrong owner", main, origin(main, owner="attacker"), False),
+            ("wrong repo", main, origin(main, repo="lookalike"), False),
+            ("wrong path", main, origin(main, path="skills/lookalike"), False),
+            ("inconsistent ref", main, origin(main, ref="other"), False),
+            (
+                "generic HTTP",
+                main,
+                origin(
+                    "http://github.com/obra/superpowers/tree/main/skills/using-superpowers"
+                ),
+                False,
+            ),
+            (
+                "uppercase digest",
+                main,
+                origin(
+                    "https://github.com/obra/superpowers/tree/"
+                    f"{commit.upper()}/skills/using-superpowers",
+                    ref=commit.upper(),
+                ),
+                False,
+            ),
+        )
+        for label, desired, observed, expected in cases:
+            with self.subTest(label=label):
+                self.assertIs(
+                    github_skill_origin_matches(desired, observed),
+                    expected,
+                )
+
     def test_valid_fixtures_normalize_only_reconciliation_fields_without_mutation(self):
         cases = (
             (
@@ -144,7 +222,20 @@ class MulticaReadContractTests(unittest.TestCase):
             ("skill-list.json", parse_skill_list, (), [{"id": "skill-synthetic", "name": "synthetic-skill"}]),
             (
                 "skill-get.json", parse_skill_detail, ("skill-synthetic",),
-                {"id": "skill-synthetic", "name": "synthetic-skill", "config": {"origin": {"source_url": "https://example.invalid/synthetic/skill"}}},
+                {
+                    "id": "skill-synthetic",
+                    "name": "synthetic-skill",
+                    "config": {
+                        "origin": {
+                            "type": "github",
+                            "owner": "synthetic-owner",
+                            "repo": "synthetic-repository",
+                            "ref": "synthetic-ref",
+                            "path": "skills/synthetic-skill",
+                            "source_url": "https://example.invalid/synthetic/skill",
+                        }
+                    },
+                },
             ),
             ("agent-list.json", parse_agent_list, (), [{"id": "agent-synthetic", "name": "Synthetic Agent"}]),
             (
@@ -255,6 +346,32 @@ class MulticaReadContractTests(unittest.TestCase):
             with self.subTest(detail=malformed):
                 with self.assertRaisesRegex(RuntimeError, f"malformed {expected}"):
                     parse_skill_detail(malformed, "skill-synthetic")
+
+    def test_skill_detail_preserves_multica_0_4_36_resolved_github_origin(self):
+        commit = "b36e0829c6d0140e93cfef2ca599b1b07d4a7797"
+        source_url = (
+            "https://github.com/obra/superpowers/tree/"
+            f"{commit}/skills/using-superpowers"
+        )
+        detail = {
+            "id": "skill-using-superpowers",
+            "name": "using-superpowers",
+            "config": {
+                "origin": {
+                    "type": "github",
+                    "owner": "obra",
+                    "repo": "superpowers",
+                    "path": "skills/using-superpowers",
+                    "ref": commit,
+                    "source_url": source_url,
+                }
+            },
+        }
+
+        self.assertEqual(
+            parse_skill_detail(detail, "skill-using-superpowers"),
+            detail,
+        )
 
     def test_agent_contracts_reject_duplicate_ids_wrong_targets_and_invalid_required_fields(self):
         listing = fixture("agent-list.json")

@@ -1199,6 +1199,121 @@ class ProvisionerTests(unittest.TestCase):
         self.assertTrue(any(call["command"] == ("skill", "get") and call["positionals"] == [skill_id] for call in self.runner.calls))
         self.assertFalse(any(call["command"] == ("skill", "import") and source.url in call["args"] for call in self.runner.calls))
 
+    def test_resolved_commit_skill_origin_is_reused_without_skill_mutation_or_duplicate(self):
+        commit = "b36e0829c6d0140e93cfef2ca599b1b07d4a7797"
+        skill_ids = {
+            key: self.runner.seed_skill(source.key, source.url)
+            for key, source in self.config.skills.items()
+        }
+        target_id = skill_ids["using-superpowers"]
+        origin = self.runner.skills[target_id]["config"]["origin"]
+        origin["ref"] = commit
+        origin["source_url"] = (
+            "https://github.com/obra/superpowers/tree/"
+            f"{commit}/skills/using-superpowers"
+        )
+
+        first = self.provisioner.reconcile(
+            self.config,
+            apply=True,
+            backend_env=self.backend_env,
+        )
+        self.assertEqual(first.skill_ids["using-superpowers"], target_id)
+        self.assertEqual(
+            [
+                item["id"]
+                for item in self.runner.skills.values()
+                if item["name"] == "using-superpowers"
+            ],
+            [target_id],
+        )
+        self.assertFalse(
+            any(
+                call["command"] == ("skill", "import")
+                for call in self.runner.calls
+            )
+        )
+
+        before = self.runner.mutation_count
+        second = self.provisioner.reconcile(
+            self.config,
+            apply=True,
+            backend_env=None,
+        )
+        self.assertEqual(second.mutation_count, 0)
+        self.assertEqual(self.runner.mutation_count, before)
+
+    def test_skill_origin_requires_consistent_structured_github_identity(self):
+        source = self.config.skills["using-superpowers"]
+        cases = (
+            ("type", "http"),
+            ("owner", "attacker"),
+            ("repo", "lookalike"),
+            ("path", "skills/lookalike"),
+            ("ref", "other-branch"),
+        )
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                runner = FakeRunner()
+                skill_id = runner.seed_skill(source.key, source.url)
+                runner.skills[skill_id]["config"]["origin"][field] = value
+
+                with self.assertRaisesRegex(RuntimeError, "unapproved origin"):
+                    Provisioner(runner).reconcile(
+                        self.config,
+                        apply=False,
+                        backend_env=None,
+                    )
+
+                self.assertEqual(runner.mutation_count, 0)
+
+    def test_skill_origin_rejects_noncanonical_or_different_urls(self):
+        source = self.config.skills["using-superpowers"]
+        upper_commit = "B36E0829C6D0140E93CFEF2CA599B1B07D4A7797"
+        cases = (
+            "http://github.com/obra/superpowers/tree/main/skills/using-superpowers",
+            "https://github.com:443/obra/superpowers/tree/main/skills/using-superpowers",
+            "https://user@github.com/obra/superpowers/tree/main/skills/using-superpowers",
+            "https://github.com/obra/superpowers/tree/main/skills/../using-superpowers",
+            "https://github.com/obra/superpowers/tree/main//skills/using-superpowers",
+            "https://github.com/obra/superpowers/tree/main/skills/using-superpowers?ref=main",
+            "https://github.com/obra/superpowers/tree/main/skills/using-superpowers#fragment",
+            f"https://github.com/obra/superpowers/tree/{upper_commit}/skills/using-superpowers",
+            "https://github.com/obra/superpowers/tree/other/skills/using-superpowers",
+            "https://github.com/attacker/superpowers/tree/main/skills/using-superpowers",
+        )
+        for observed_url in cases:
+            with self.subTest(observed_url=observed_url):
+                runner = FakeRunner()
+                skill_id = runner.seed_skill(source.key, observed_url)
+                with self.assertRaisesRegex(RuntimeError, "unapproved origin"):
+                    Provisioner(runner).reconcile(
+                        self.config,
+                        apply=False,
+                        backend_env=None,
+                    )
+                self.assertEqual(runner.mutation_count, 0)
+
+    def test_configured_skill_origin_must_be_canonical_before_reads(self):
+        source = self.config.skills["using-superpowers"]
+        skills = dict(self.config.skills)
+        skills[source.key] = replace(
+            source,
+            url=(
+                "https://github.com/obra/superpowers/tree/main/"
+                "skills/../using-superpowers"
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "approved public origin"):
+            self.provisioner.reconcile(
+                replace(self.config, skills=skills),
+                apply=False,
+                backend_env=None,
+            )
+
+        self.assertEqual(self.runner.calls, [])
+
     def test_accepts_multica_0_4_31_nested_skill_import_response(self):
         result = self.provisioner.reconcile(
             self.config, apply=True, backend_env=self.backend_env

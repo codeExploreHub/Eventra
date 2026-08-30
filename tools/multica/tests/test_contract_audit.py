@@ -67,7 +67,16 @@ def audit_replies():
             "id": s["skill_id"],
             "name": s["skill_name"],
             "description": s["description"],
-            "config": {"origin": {"source_url": s["skill_url"]}},
+            "config": {
+                "origin": {
+                    "type": "github",
+                    "owner": "synthetic-owner",
+                    "repo": "synthetic-repository",
+                    "ref": "synthetic-ref",
+                    "path": "skills/synthetic-skill",
+                    "source_url": s["skill_url"],
+                }
+            },
         },
         ("agent", "list", "--output", "json"): [
             {"id": s["agent_id"], "name": "Eventra Backend Engineer"}

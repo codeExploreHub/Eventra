@@ -1,6 +1,13 @@
 """Pure, strict parsers for observed Multica CLI read contracts."""
 
+import re
 from typing import Any
+from urllib.parse import urlsplit
+
+
+_GITHUB_COMPONENT = re.compile(r"[A-Za-z0-9._-]+\Z")
+_COMMIT_REF = re.compile(r"[0-9a-f]{40}\Z")
+_CASE_INSENSITIVE_COMMIT_REF = re.compile(r"[0-9A-Fa-f]{40}\Z")
 
 
 def _error(contract: str) -> None:
@@ -80,6 +87,86 @@ def parse_skill_list(value: Any) -> list[dict[str, str]]:
     return _named_records(value, "skill list", "name")
 
 
+def parse_github_skill_url(value: Any) -> dict[str, str]:
+    """Parse one canonical public GitHub tree URL without normalization."""
+
+    if not _string(value):
+        raise ValueError("Skill URL must be a canonical public GitHub tree URL")
+    parsed = urlsplit(value)
+    parts = parsed.path.split("/")
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "github.com"
+        or parsed.query
+        or parsed.fragment
+        or len(parts) < 6
+        or parts[0] != ""
+        or any(
+            not part
+            or part in {".", ".."}
+            or _GITHUB_COMPONENT.fullmatch(part) is None
+            for part in parts[1:]
+        )
+        or parts[3] != "tree"
+    ):
+        raise ValueError("Skill URL must be a canonical public GitHub tree URL")
+    owner, repo, ref = parts[1], parts[2], parts[4]
+    path = "/".join(parts[5:])
+    if (
+        _CASE_INSENSITIVE_COMMIT_REF.fullmatch(ref) is not None
+        and _COMMIT_REF.fullmatch(ref) is None
+    ):
+        raise ValueError("Skill URL must be a canonical public GitHub tree URL")
+    canonical = f"https://github.com/{owner}/{repo}/tree/{ref}/{path}"
+    if value != canonical:
+        raise ValueError("Skill URL must be a canonical public GitHub tree URL")
+    return {
+        "owner": owner,
+        "repo": repo,
+        "ref": ref,
+        "path": path,
+        "source_url": value,
+    }
+
+
+def github_skill_origin_matches(
+    desired_url: Any,
+    observed_origin: Any,
+) -> bool:
+    """Compare a desired GitHub Skill URL with structured Multica evidence."""
+
+    if not isinstance(observed_origin, dict):
+        return False
+    required = ("type", "owner", "repo", "ref", "path", "source_url")
+    if any(not _string(observed_origin.get(field)) for field in required):
+        return False
+    if observed_origin["type"] != "github":
+        return False
+    try:
+        desired = parse_github_skill_url(desired_url)
+        observed = parse_github_skill_url(observed_origin["source_url"])
+    except ValueError:
+        return False
+    if any(
+        observed_origin[field] != observed[field]
+        for field in ("owner", "repo", "ref", "path")
+    ):
+        return False
+    if any(
+        desired[field] != observed[field]
+        for field in ("owner", "repo", "path")
+    ):
+        return False
+    desired_ref = desired["ref"]
+    observed_ref = observed["ref"]
+    if _COMMIT_REF.fullmatch(desired_ref) is not None:
+        return observed_ref == desired_ref
+    return (
+        observed_ref == desired_ref
+        or _COMMIT_REF.fullmatch(observed_ref) is not None
+    )
+
+
 def parse_skill_detail(value: Any, expected_id: str) -> dict[str, Any]:
     contract = "skill detail"
     if not isinstance(value, dict) or not _string(expected_id):
@@ -88,10 +175,21 @@ def parse_skill_detail(value: Any, expected_id: str) -> dict[str, Any]:
     name = value.get("name")
     config = value.get("config")
     origin = config.get("origin") if isinstance(config, dict) else None
-    source_url = origin.get("source_url") if isinstance(origin, dict) else None
-    if record_id != expected_id or not _string(name) or not _string(source_url):
+    origin_fields = ("type", "owner", "repo", "ref", "path", "source_url")
+    if (
+        record_id != expected_id
+        or not _string(name)
+        or not isinstance(origin, dict)
+        or any(not _string(origin.get(field)) for field in origin_fields)
+    ):
         _error(contract)
-    return {"id": record_id, "name": name, "config": {"origin": {"source_url": source_url}}}
+    return {
+        "id": record_id,
+        "name": name,
+        "config": {
+            "origin": {field: origin[field] for field in origin_fields}
+        },
+    }
 
 
 def parse_agent_list(value: Any) -> list[dict[str, str]]:

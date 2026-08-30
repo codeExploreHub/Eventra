@@ -26,6 +26,8 @@ from .contracts import (
     parse_squad_members,
     parse_autopilot_detail,
     parse_autopilot_list,
+    github_skill_origin_matches,
+    parse_github_skill_url,
 )
 from .eventra_adapter import ProjectConfig, build_eventra_config
 
@@ -291,7 +293,10 @@ class Provisioner:
         for key, source in desired_skills.items():
             item = self._exact_record(skill_records, key, "name", "skill")
             detail = None if item is None else self._skill_get(item["id"])
-            if detail is not None and self._skill_origin(detail) != source.url:
+            if detail is not None and not github_skill_origin_matches(
+                source.url,
+                self._skill_origin(detail),
+            ):
                 raise RuntimeError(f"skill {key} has an unapproved origin")
             skill_details[key] = detail
 
@@ -429,6 +434,20 @@ class Provisioner:
                 raise ValueError(
                     f"agent description for {agent.role} exceeds {MAX_AGENT_DESCRIPTION} characters"
                 )
+        for key, source in config.skills.items():
+            try:
+                parsed = parse_github_skill_url(source.url)
+            except (AttributeError, TypeError, ValueError):
+                raise ValueError(
+                    f"skill {key!r} is not an approved public origin"
+                ) from None
+            if (
+                source.key != key
+                or parsed["source_url"] != source.url
+            ):
+                raise ValueError(
+                    f"skill {key!r} is not an approved public origin"
+                )
         if len(config.resources) != 2:
             raise ValueError("configuration must define exactly two resources")
         if config.project_title == config.backend_project_title:
@@ -506,7 +525,10 @@ class Provisioner:
                     ["skill", "import", "--url", source.url, "--on-conflict", "fail", "--output", "json"]
                 )
                 detail = self._skill_by_name(key)
-                if detail["name"] != key or self._skill_origin(detail) != source.url:
+                if detail["name"] != key or not github_skill_origin_matches(
+                    source.url,
+                    self._skill_origin(detail),
+                ):
                     raise RuntimeError(f"skill reconciliation failed for {key}")
             ids[key] = detail["id"]
         return ids
@@ -904,7 +926,7 @@ class Provisioner:
 
     @staticmethod
     def _skill_origin(detail):
-        return detail["config"]["origin"]["source_url"]
+        return detail["config"]["origin"]
 
     def _agent_get(self, agent_id):
         return parse_agent_detail(
