@@ -204,6 +204,7 @@ class EventraAdapterTests(unittest.TestCase):
                     "d" * 40,
                     None,
                     ("backend",),
+                    "https://multica.example/comments/00000000-0000-4000-8000-000000000004",
                 ),
             ),
             (
@@ -248,19 +249,23 @@ class EventraAdapterTests(unittest.TestCase):
                     "evidence_comment": completion.evidence_comment,
                     "pr_url": completion.pr_url,
                     "responsible_repositories": completion.responsible_repositories,
+                    "evidence_comment_url": completion.evidence_comment_url,
                 }
                 expected = canonical_json(build_phase_metadata(completion))
-                legacy = legacy_phase_contract(
-                    candidate_shas,
-                    completion.kind,
-                    **arguments,
-                )
-                generic = render_phase_contract(
-                    manifest,
-                    candidate_shas,
-                    completion.kind,
-                    **arguments,
-                )
+                try:
+                    legacy = legacy_phase_contract(
+                        candidate_shas,
+                        completion.kind,
+                        **arguments,
+                    )
+                    generic = render_phase_contract(
+                        manifest,
+                        candidate_shas,
+                        completion.kind,
+                        **arguments,
+                    )
+                except TypeError as error:
+                    self.fail(f"version 2 evidence URL was rejected: {error}")
                 self.assertEqual(legacy.metadata_json, expected)
                 self.assertEqual(generic.metadata_json, expected)
                 self.assertEqual(json.loads(generic.metadata_json), json.loads(expected))
@@ -277,6 +282,10 @@ class EventraAdapterTests(unittest.TestCase):
                 backend_sha="b" * 40,
                 pr_url=None,
                 responsible_repositories=("backend",),
+                evidence_comment_url=(
+                    "https://multica.example/comments/"
+                    "00000000-0000-4000-8000-000000000031"
+                ),
             )
         except TypeError as error:
             self.fail(f"Eventra compatibility rejected version 2 ownership: {error}")
@@ -285,12 +294,20 @@ class EventraAdapterTests(unittest.TestCase):
             "attempt": 3,
             "evidence_comment": "00000000-0000-4000-8000-000000000031",
             "responsible_repositories": ("backend",),
+            "evidence_comment_url": (
+                "https://multica.example/comments/"
+                "00000000-0000-4000-8000-000000000031"
+            ),
         }
 
         expected = canonical_json(
             {
                 "eventra.phase.attempt": "3",
                 "eventra.phase.evidence_comment": "00000000-0000-4000-8000-000000000031",
+                "eventra.phase.evidence_comment_url": (
+                    "https://multica.example/comments/"
+                    "00000000-0000-4000-8000-000000000031"
+                ),
                 "eventra.phase.failure_repositories": '["backend"]',
                 "eventra.phase.kind": "review",
                 "eventra.phase.result": "fail",
@@ -299,23 +316,22 @@ class EventraAdapterTests(unittest.TestCase):
             }
         )
         self.assertEqual(build_phase_metadata(completion), json.loads(expected))
-        self.assertEqual(
-            legacy_phase_contract(
+        try:
+            legacy = legacy_phase_contract(
                 {"backend": "b" * 40},
                 "review",
                 **arguments,
-            ).metadata_json,
-            expected,
-        )
-        self.assertEqual(
-            render_phase_contract(
+            )
+            generic = render_phase_contract(
                 manifest,
                 {"backend": "b" * 40},
                 "review",
                 **arguments,
-            ).metadata_json,
-            expected,
-        )
+            )
+        except TypeError as error:
+            self.fail(f"version 2 evidence URL was rejected: {error}")
+        self.assertEqual(legacy.metadata_json, expected)
+        self.assertEqual(generic.metadata_json, expected)
 
     def test_compatibility_renderer_rejects_generic_only_phase_names(self):
         manifest = eventra_manifest(Path("/Users/didi/Eventra-workspace"))

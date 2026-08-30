@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 from types import MappingProxyType
 from typing import Mapping
+from urllib.parse import urlsplit
 import uuid
 
 from .blueprint import AgentSpec, TeamBlueprint, build_multi_repo_blueprint
@@ -84,6 +85,7 @@ def legacy_phase_contract(
     evidence_comment: str,
     pr_url: str | None = None,
     responsible_repositories: tuple[str, ...] = (),
+    evidence_comment_url: str | None = None,
 ) -> PhaseContract:
     """Use the real legacy builder as the independent compatibility oracle."""
 
@@ -106,6 +108,7 @@ def legacy_phase_contract(
                 backend_sha=candidate_shas.get("backend"),
                 pr_url=pr_url,
                 responsible_repositories=responsible_repositories,
+                evidence_comment_url=evidence_comment_url,
             )
         )
     except (TypeError, ValueError):
@@ -123,6 +126,7 @@ def render_phase_contract(
     evidence_comment: str,
     pr_url: str | None = None,
     responsible_repositories: tuple[str, ...] = (),
+    evidence_comment_url: str | None = None,
 ) -> PhaseContract:
     """Independently render one legacy-compatible manifest phase payload."""
 
@@ -147,6 +151,7 @@ def render_phase_contract(
             for repository in responsible_repositories
         )
         or len(set(responsible_repositories)) != len(responsible_repositories)
+        or (evidence_comment_url is not None and type(evidence_comment_url) is not str)
     ):
         raise ValueError("invalid delivery phase contract")
     try:
@@ -155,11 +160,26 @@ def render_phase_contract(
     except (AttributeError, TypeError, ValueError):
         raise ValueError("invalid delivery phase contract") from None
     owners = set(responsible_repositories)
-    if (
-        (result == "pass" and owners)
-        or (phase not in {"review", "qa"} and owners)
-        or (phase in {"review", "qa"} and result != "pass" and not owners)
+    needs_evidence_url = phase in {"review", "qa"} and result != "pass"
+    parsed_evidence_url = (
+        None if evidence_comment_url is None else urlsplit(evidence_comment_url)
+    )
+    if needs_evidence_url and (
+        not owners
+        or not owners <= set(candidate_shas)
+        or (len(candidate_shas) == 1 and owners != set(candidate_shas))
+        or evidence_comment_url is None
+        or parsed_evidence_url is None
+        or parsed_evidence_url.scheme != "https"
+        or not parsed_evidence_url.netloc
+        or parsed_evidence_url.username is not None
+        or parsed_evidence_url.password is not None
+        or parsed_evidence_url.query
+        or parsed_evidence_url.fragment
+        or not parsed_evidence_url.path
     ):
+        raise ValueError("invalid delivery phase contract")
+    if not needs_evidence_url and (owners or evidence_comment_url is not None):
         raise ValueError("invalid delivery phase contract")
     if phase in {"implementation", "repair"} and (
         len(candidate_shas) != 1 or pr_url is None
@@ -191,6 +211,8 @@ def render_phase_contract(
             sorted(responsible_repositories)
         ),
     }
+    if evidence_comment_url is not None:
+        values[f"{namespace}.phase.evidence_comment_url"] = evidence_comment_url
     for repository, sha in candidate_shas.items():
         values[f"{namespace}.phase.sha.{repository}"] = sha
     if pr_url is not None:

@@ -5,6 +5,7 @@ import io
 import json
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 
 from tools.multica.workflow import (
     ChildRunSnapshot,
@@ -28,6 +29,7 @@ from tools.multica.workflow import (
     print_parent_decision,
     print_parent_result,
     recover_once,
+    print_watch_result,
     watch_projects,
 )
 
@@ -152,6 +154,10 @@ class PhaseCompletionTests(unittest.TestCase):
             "result": "fail",
             "attempt": 3,
             "evidence_comment": "00000000-0000-4000-8000-000000000031",
+            "evidence_comment_url": (
+                "https://multica.example/comments/"
+                "00000000-0000-4000-8000-000000000031"
+            ),
             "frontend_sha": None,
             "backend_sha": "b" * 40,
             "pr_url": None,
@@ -171,6 +177,29 @@ class PhaseCompletionTests(unittest.TestCase):
             metadata["eventra.phase.failure_repositories"],
             '["backend"]',
         )
+        self.assertEqual(
+            metadata["eventra.phase.evidence_comment_url"],
+            "https://multica.example/comments/00000000-0000-4000-8000-000000000031",
+        )
+
+    def test_nonpassing_gate_requires_one_canonical_evidence_url(self):
+        cases = (
+            ("missing", {"evidence_comment_url": None}),
+            ("HTTP", {"evidence_comment_url": "http://multica.example/comments/31"}),
+            ("query", {"evidence_comment_url": "https://multica.example/comments/31?token=x"}),
+            (
+                "PASS",
+                {"result": "pass", "responsible_repositories": ()},
+            ),
+            (
+                "non-gate",
+                {"kind": "smoke", "responsible_repositories": ()},
+            ),
+        )
+        for label, overrides in cases:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, "invalid phase completion"):
+                    build_phase_metadata(self._review_completion(**overrides))
 
     def test_failure_ownership_is_exact_and_gate_scoped(self):
         cases = (
@@ -229,6 +258,7 @@ class PhaseCompletionTests(unittest.TestCase):
             {"kind": "unknown"},
             {"result": "unknown"},
             {"attempt": -1},
+            {"attempt": 4},
             {"attempt": True},
             {"evidence_comment": "not-a-uuid"},
             {"frontend_sha": "abc"},
@@ -408,6 +438,8 @@ class PhaseCompletionTests(unittest.TestCase):
             "--attempt", "3",
             "--backend-sha", "b" * 40,
             "--evidence-comment", "00000000-0000-4000-8000-000000000031",
+            "--evidence-comment-url",
+            "https://multica.example/comments/00000000-0000-4000-8000-000000000031",
             "--responsible-repository", "backend",
             "--responsible-repository", "frontend",
         ]
@@ -417,6 +449,25 @@ class PhaseCompletionTests(unittest.TestCase):
             self.fail(f"version 2 ownership flags were rejected: {error}")
 
         self.assertEqual(args.responsible_repository, ["backend", "frontend"])
+        self.assertEqual(
+            args.evidence_comment_url,
+            "https://multica.example/comments/00000000-0000-4000-8000-000000000031",
+        )
+
+    def test_parser_rejects_attempts_above_the_one_shot_human_round(self):
+        parser = build_workflow_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "finish-phase", "PRO-99",
+                    "--kind", "review",
+                    "--result", "fail",
+                    "--attempt", "4",
+                    "--backend-sha", "b" * 40,
+                    "--evidence-comment", "00000000-0000-4000-8000-000000000031",
+                    "--responsible-repository", "backend",
+                ]
+            )
 
 
 def phase(
@@ -429,6 +480,7 @@ def phase(
     backend_sha=None,
     evidence_comment="",
     responsible_repositories=(),
+    evidence_comment_url=None,
 ):
     return PhaseSnapshot(
         issue_key=issue_key,
@@ -441,6 +493,7 @@ def phase(
         backend_sha=backend_sha,
         evidence_comment=evidence_comment,
         responsible_repositories=responsible_repositories,
+        evidence_comment_url=evidence_comment_url,
     )
 
 
@@ -489,6 +542,13 @@ class ParentDecisionTests(unittest.TestCase):
                 if kind == "review"
                 else "00000000-0000-4000-8000-000000000042"
             ),
+            "evidence_comment_url": (
+                "https://multica.example/comments/"
+                "00000000-0000-4000-8000-000000000041"
+                if kind == "review"
+                else "https://multica.example/comments/"
+                "00000000-0000-4000-8000-000000000042"
+            ),
             "responsible_repositories": ("backend",),
         }
         try:
@@ -531,20 +591,57 @@ class ParentDecisionTests(unittest.TestCase):
         decision = decide_parent_action(self._pro_65_snapshot())
 
         self.assertEqual(decision.kind, "create_repair_stage")
-        self.assertIsNotNone(decision.failure_bundle)
+        expected_digest = "519192e8528dffa2be8651febe876afb00718a6cfb597bde475f252cd2028a53"
+        backend_sha = "b" * 40
         self.assertEqual(
-            [failure["phase"] for failure in decision.failure_bundle["failures"]],
-            ["qa", "review"],
+            decision.failure_bundle,
+            {
+                "candidate_shas": {"backend": backend_sha},
+                "digest": expected_digest,
+                "failures": [
+                    {
+                        "candidate_shas": {"backend": backend_sha},
+                        "child_identifier": "PRO-67",
+                        "evidence_comment_url": (
+                            "https://multica.example/comments/"
+                            "00000000-0000-4000-8000-000000000042"
+                        ),
+                        "evidence_comment_uuid": "00000000-0000-4000-8000-000000000042",
+                        "phase": "qa",
+                        "repair_round": 0,
+                        "responsible_repositories": ["backend"],
+                        "result": "fail",
+                        "stage_ordinal": 2,
+                        "suite_key": "",
+                    },
+                    {
+                        "candidate_shas": {"backend": backend_sha},
+                        "child_identifier": "PRO-66",
+                        "evidence_comment_url": (
+                            "https://multica.example/comments/"
+                            "00000000-0000-4000-8000-000000000041"
+                        ),
+                        "evidence_comment_uuid": "00000000-0000-4000-8000-000000000041",
+                        "phase": "review",
+                        "repair_round": 0,
+                        "responsible_repositories": ["backend"],
+                        "result": "fail",
+                        "stage_ordinal": 2,
+                        "suite_key": "",
+                    },
+                ],
+                "parent_identifier": "PRO-65",
+                "repair_round": 1,
+                "source_stage_ordinal": 2,
+                "workflow_version": 2,
+            },
         )
         self.assertEqual(
-            {
-                failure["evidence_comment_uuid"]
-                for failure in decision.failure_bundle["failures"]
-            },
-            {
-                "00000000-0000-4000-8000-000000000041",
-                "00000000-0000-4000-8000-000000000042",
-            },
+            decision.action_key,
+            "2:PRO-65:create_repair_stage:1:backend:-:"
+            + backend_sha
+            + ":bundle:"
+            + expected_digest,
         )
 
         output = io.StringIO()
@@ -557,6 +654,26 @@ class ParentDecisionTests(unittest.TestCase):
             {"decision", "action_key", "reason", "failure_bundle"},
         )
         self.assertEqual(rendered, json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+    def test_failure_bundle_rejects_a_duplicate_evidence_uuid(self):
+        snapshot = self._pro_65_snapshot()
+        review, qa = snapshot.children
+        duplicated = replace(
+            qa,
+            evidence_comment=review.evidence_comment,
+            evidence_comment_url=review.evidence_comment_url,
+        )
+
+        decision = decide_parent_action(
+            replace(snapshot, children=(review, duplicated))
+        )
+
+        self.assertEqual(decision.kind, "block_parent")
+        self.assertEqual(
+            decision.reason,
+            "terminal gate failure evidence is malformed",
+        )
+        self.assertIsNone(decision.failure_bundle)
 
     def test_finished_implementation_creates_one_exact_sha_gate_stage(self):
         decision = decide_parent_action(parent_snapshot())
@@ -606,6 +723,10 @@ class ParentDecisionTests(unittest.TestCase):
                 result="fail",
                 evidence_comment="00000000-0000-4000-8000-000000000037",
                 responsible_repositories=("frontend",),
+                evidence_comment_url=(
+                    "https://multica.example/comments/"
+                    "00000000-0000-4000-8000-000000000037"
+                ),
             ),
             phase(
                 "PRO-38",
@@ -1194,10 +1315,16 @@ class FakeWatchRunner:
         if call[:2] == ("issue", "list"):
             flags = dict(zip(call[2::2], call[3::2]))
             self._assert_list_flags(flags)
+            parent_version = self.metadata["PRO-35"]["eventra.workflow.version"]
+            expected_filter = {
+                "1": '"eventra.workflow.version=""1"""',
+                "2": '"eventra.workflow.version=""2"""',
+            }[parent_version]
             issues = (
                 [self.parent]
                 if flags["--project"] == PROJECT_ID
                 and flags["--status"] == "in_progress"
+                and flags["--metadata"] == expected_filter
                 else []
             )
             return {
@@ -1244,7 +1371,6 @@ class FakeWatchRunner:
 
     def _assert_list_flags(self, flags):
         expected = {
-            "--metadata": '"eventra.workflow.version=""2"""',
             "--limit": "50",
             "--offset": "0",
             "--output": "json",
@@ -1252,6 +1378,11 @@ class FakeWatchRunner:
         for key, item in expected.items():
             if flags.get(key) != item:
                 raise AssertionError(f"wrong list flag {key}")
+        if flags.get("--metadata") not in {
+            '"eventra.workflow.version=""1"""',
+            '"eventra.workflow.version=""2"""',
+        }:
+            raise AssertionError("wrong list flag --metadata")
         if flags.get("--project") not in self.PROJECTS:
             raise AssertionError("foreign project")
         if flags.get("--status") not in {"in_progress", "in_review"}:
@@ -1265,9 +1396,21 @@ class WatchWorkflowTests(unittest.TestCase):
 
         result = watch_projects(runner, runner.PROJECTS, apply=True)
 
+        self.assertEqual(result.scanned, 1)
         self.assertEqual(result.applied, 0)
         self.assertEqual(result.decision, "noop")
+        self.assertEqual(
+            getattr(result, "reason", None),
+            "version 1 workflow requires explicit migration",
+        )
         self.assertFalse(any(call[:2] == ("issue", "rerun") for call in runner.calls))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            print_watch_result(result)
+        self.assertIn(
+            "version 1 workflow requires explicit migration",
+            output.getvalue(),
+        )
 
     def test_string_metadata_filter_is_json_string_inside_one_csv_field(self):
         self.assertEqual(
@@ -1378,6 +1521,54 @@ class FakeGitHubRunner:
 
 
 class ParentSnapshotReadTests(unittest.TestCase):
+    def test_persisted_version_two_phase_ownership_is_semantically_validated(self):
+        comment_uuid = "00000000-0000-4000-8000-000000000051"
+        evidence_url = f"https://multica.example/comments/{comment_uuid}"
+        base = {
+            "eventra.workflow.version": "2",
+            "eventra.phase.kind": "review",
+            "eventra.phase.result": "fail",
+            "eventra.phase.attempt": "0",
+            "eventra.phase.evidence_comment": comment_uuid,
+            "eventra.phase.evidence_comment_url": evidence_url,
+            "eventra.phase.failure_repositories": '["frontend"]',
+            "eventra.phase.sha.frontend": FRONTEND_SHA,
+        }
+        cases = {
+            "PASS gate with owners": {
+                **base,
+                "eventra.phase.result": "pass",
+                "eventra.phase.evidence_comment_url": None,
+            },
+            "non-PASS gate without owners": {
+                **base,
+                "eventra.phase.failure_repositories": "[]",
+            },
+            "repository gate with a foreign owner": {
+                **base,
+                "eventra.phase.failure_repositories": '["backend"]',
+            },
+            "non-gate with owners": {
+                **base,
+                "eventra.phase.kind": "implementation",
+                "eventra.phase.evidence_comment_url": None,
+            },
+        }
+        for label, metadata in cases.items():
+            with self.subTest(label=label):
+                runner = FakeParentRunner()
+                runner.metadata["PRO-36"] = {
+                    key: value for key, value in metadata.items() if value is not None
+                }
+                github = FakeGitHubRunner()
+
+                with self.assertRaisesRegex(
+                    RuntimeError, "malformed child phase metadata"
+                ):
+                    load_parent_snapshot(runner, github, "PRO-35")
+
+                self.assertEqual(github.calls, [])
+
     def test_completed_version_one_parent_is_readable_but_not_plannable(self):
         runner = FakeParentRunner()
         runner.parent["status"] = "done"

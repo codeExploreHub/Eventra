@@ -13,6 +13,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, Sequence
+from urllib.parse import urlsplit
 
 from .issue_contracts import (
     ACTIVE_RUN_STATUSES,
@@ -39,6 +40,7 @@ CONTROLLED_PHASE_KEYS = frozenset(
         "eventra.phase.result",
         "eventra.phase.attempt",
         "eventra.phase.evidence_comment",
+        "eventra.phase.evidence_comment_url",
         "eventra.phase.sha.frontend",
         "eventra.phase.sha.backend",
         "eventra.phase.pr",
@@ -57,6 +59,7 @@ class PhaseCompletion:
     backend_sha: str | None
     pr_url: str | None
     responsible_repositories: tuple[str, ...] = ()
+    evidence_comment_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +92,7 @@ class PhaseSnapshot:
     backend_sha: str | None
     evidence_comment: str = ""
     responsible_repositories: tuple[str, ...] = ()
+    evidence_comment_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -194,6 +198,7 @@ class WatchResult:
     candidates: int
     applied: int
     decision: str
+    reason: str = ""
 
 
 class GitHubRunner:
@@ -243,6 +248,44 @@ def _validated_pr_url(value: str) -> str:
     return value
 
 
+def _is_canonical_evidence_url(value: object) -> bool:
+    if type(value) is not str:
+        return False
+    parsed = urlsplit(value)
+    return (
+        parsed.scheme == "https"
+        and bool(parsed.netloc)
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+        and bool(parsed.path)
+    )
+
+
+def _valid_phase_ownership(
+    kind: str,
+    result: str | None,
+    phase_repositories: set[str],
+    responsible_repositories: tuple[str, ...],
+    evidence_comment_url: str | None,
+) -> bool:
+    owners = set(responsible_repositories)
+    if kind not in {"review", "qa"}:
+        return not owners and evidence_comment_url is None
+    if result == "pass":
+        return not owners and evidence_comment_url is None
+    if result not in {"fail", "blocked"}:
+        return not owners and evidence_comment_url is None
+    if (
+        not owners
+        or not owners <= phase_repositories
+        or not _is_canonical_evidence_url(evidence_comment_url)
+    ):
+        return False
+    return len(phase_repositories) > 1 or owners == phase_repositories
+
+
 def build_phase_metadata(value: PhaseCompletion) -> dict[str, str]:
     """Validate one phase envelope and build explicitly string-valued metadata."""
 
@@ -252,7 +295,7 @@ def build_phase_metadata(value: PhaseCompletion) -> dict[str, str]:
         or value.result not in PHASE_RESULTS
         or not isinstance(value.attempt, int)
         or isinstance(value.attempt, bool)
-        or value.attempt < 0
+        or not 0 <= value.attempt <= 3
         or type(value.responsible_repositories) is not tuple
         or any(
             type(repository) is not str
@@ -293,15 +336,12 @@ def build_phase_metadata(value: PhaseCompletion) -> dict[str, str]:
         )
         if sha is not None
     }
-    owners = set(value.responsible_repositories)
-    if (
-        (value.result == "pass" and owners)
-        or (value.kind not in {"review", "qa"} and owners)
-        or (
-            value.kind in {"review", "qa"}
-            and value.result != "pass"
-            and (not owners or not owners <= phase_repositories)
-        )
+    if not _valid_phase_ownership(
+        value.kind,
+        value.result,
+        phase_repositories,
+        value.responsible_repositories,
+        value.evidence_comment_url,
     ):
         _invalid_completion()
 
@@ -317,6 +357,8 @@ def build_phase_metadata(value: PhaseCompletion) -> dict[str, str]:
             separators=(",", ":"),
         ),
     }
+    if value.evidence_comment_url is not None:
+        result["eventra.phase.evidence_comment_url"] = value.evidence_comment_url
     if value.frontend_sha is not None:
         result["eventra.phase.sha.frontend"] = _validated_sha(value.frontend_sha)
     if value.backend_sha is not None:
@@ -513,6 +555,7 @@ def _failure_bundle(
     stage = phases[0].stage
     candidates = _candidate_sha_map(snapshot)
     failures: list[dict[str, object]] = []
+    evidence_uuids: set[str] = set()
     for phase in phases:
         if phase.stage != stage or phase.attempt != snapshot.attempt:
             raise ValueError("failure bundle gate identity is inconsistent")
@@ -531,18 +574,30 @@ def _failure_bundle(
             or len(set(owners)) != len(owners)
             or any(repository not in phase_candidates for repository in owners)
             or not _is_uuid(phase.evidence_comment)
+            or phase.evidence_comment in evidence_uuids
+            or not _valid_phase_ownership(
+                phase.kind,
+                phase.result,
+                set(phase_candidates),
+                phase.responsible_repositories,
+                phase.evidence_comment_url,
+            )
         ):
             raise ValueError("failure bundle gate evidence is malformed")
+        evidence_uuids.add(phase.evidence_comment)
         if phase.result == "pass":
             if owners:
                 raise ValueError("passing gate cannot declare failure ownership")
             continue
         if phase.result not in {"fail", "blocked"} or not owners:
             raise ValueError("nonpassing gate requires failure ownership")
+        if not _is_canonical_evidence_url(phase.evidence_comment_url):
+            raise ValueError("nonpassing gate requires canonical evidence URL")
         failures.append(
             {
                 "candidate_shas": candidates,
                 "child_identifier": phase.issue_key,
+                "evidence_comment_url": phase.evidence_comment_url,
                 "evidence_comment_uuid": phase.evidence_comment,
                 "phase": phase.kind,
                 "repair_round": snapshot.attempt,
@@ -904,6 +959,7 @@ def _phase_snapshot(
     backend_sha = metadata.get("eventra.phase.sha.backend")
     version = metadata.get("eventra.workflow.version")
     evidence_comment = metadata.get("eventra.phase.evidence_comment", "")
+    evidence_comment_url = metadata.get("eventra.phase.evidence_comment_url")
     failure_repositories = metadata.get("eventra.phase.failure_repositories")
     responsible_repositories: tuple[str, ...] = ()
     if version == "2":
@@ -925,6 +981,7 @@ def _phase_snapshot(
                 sort_keys=True,
                 separators=(",", ":"),
             )
+            or decoded_repositories != sorted(decoded_repositories)
         ):
             raise RuntimeError("malformed child phase metadata")
         responsible_repositories = tuple(decoded_repositories)
@@ -933,9 +990,26 @@ def _phase_snapshot(
         or (kind != "unknown" and kind not in PHASE_KINDS)
         or (result is not None and result not in PHASE_RESULTS)
         or not attempt_text.isdigit()
+        or (version == "2" and int(attempt_text) > 3)
         or (frontend_sha is not None and SHA_PATTERN.fullmatch(frontend_sha) is None)
         or (backend_sha is not None and SHA_PATTERN.fullmatch(backend_sha) is None)
         or (result is not None and not _is_uuid(evidence_comment))
+    ):
+        raise RuntimeError("malformed child phase metadata")
+    phase_repositories = {
+        repository
+        for repository, sha in (
+            ("frontend", frontend_sha),
+            ("backend", backend_sha),
+        )
+        if sha is not None
+    }
+    if version == "2" and not _valid_phase_ownership(
+        kind,
+        result,
+        phase_repositories,
+        responsible_repositories,
+        evidence_comment_url,
     ):
         raise RuntimeError("malformed child phase metadata")
     completed = _has_phase_completion(metadata)
@@ -950,6 +1024,7 @@ def _phase_snapshot(
         backend_sha=backend_sha,
         evidence_comment=evidence_comment,
         responsible_repositories=responsible_repositories,
+        evidence_comment_url=evidence_comment_url,
     )
 
 
@@ -1103,14 +1178,41 @@ def _has_phase_completion(metadata: dict[str, str]) -> bool:
             return False
         if (
             not isinstance(repositories, list)
+            or any(
+                type(repository) is not str
+                or repository not in {"frontend", "backend"}
+                for repository in repositories
+            )
+            or len(set(repositories)) != len(repositories)
+            or repositories != sorted(repositories)
             or metadata.get("eventra.phase.failure_repositories")
             != json.dumps(repositories, sort_keys=True, separators=(",", ":"))
+        ):
+            return False
+        phase_repositories = {
+            repository
+            for repository, key in (
+                ("frontend", "eventra.phase.sha.frontend"),
+                ("backend", "eventra.phase.sha.backend"),
+            )
+            if key in metadata
+        }
+        if not _valid_phase_ownership(
+            metadata.get("eventra.phase.kind", "unknown"),
+            metadata.get("eventra.phase.result"),
+            phase_repositories,
+            tuple(repositories),
+            metadata.get("eventra.phase.evidence_comment_url"),
         ):
             return False
     return (
         metadata.get("eventra.phase.kind") in PHASE_KINDS
         and metadata.get("eventra.phase.result") in PHASE_RESULTS
         and metadata.get("eventra.phase.attempt", "").isdigit()
+        and (
+            version == "1"
+            or int(metadata["eventra.phase.attempt"]) <= 3
+        )
         and _is_uuid(metadata.get("eventra.phase.evidence_comment"))
     )
 
@@ -1238,46 +1340,49 @@ def _list_workflow_parents(
     project_ids: Sequence[str],
 ) -> list[str]:
     records: dict[str, dict[str, object]] = {}
-    version_filter = _string_metadata_filter("eventra.workflow.version", "2")
     for project_id in project_ids:
         if not isinstance(project_id, str) or not project_id:
             raise ValueError("invalid watcher project identifier")
         for status in ("in_progress", "in_review"):
-            offset = 0
-            while True:
-                page = parse_issue_list(
-                    runner.run(
-                        [
-                            "issue",
-                            "list",
-                            "--project",
-                            project_id,
-                            "--status",
-                            status,
-                            "--metadata",
-                            version_filter,
-                            "--limit",
-                            "50",
-                            "--offset",
-                            str(offset),
-                            "--output",
-                            "json",
-                        ]
-                    ),
-                    project_id,
+            for workflow_version in ("1", "2"):
+                version_filter = _string_metadata_filter(
+                    "eventra.workflow.version", workflow_version
                 )
-                for issue in page["issues"]:
-                    if issue["parent_issue_id"] is not None:
-                        continue
-                    previous = records.get(str(issue["id"]))
-                    if previous is not None and previous != issue:
+                offset = 0
+                while True:
+                    page = parse_issue_list(
+                        runner.run(
+                            [
+                                "issue",
+                                "list",
+                                "--project",
+                                project_id,
+                                "--status",
+                                status,
+                                "--metadata",
+                                version_filter,
+                                "--limit",
+                                "50",
+                                "--offset",
+                                str(offset),
+                                "--output",
+                                "json",
+                            ]
+                        ),
+                        project_id,
+                    )
+                    for issue in page["issues"]:
+                        if issue["parent_issue_id"] is not None:
+                            continue
+                        previous = records.get(str(issue["id"]))
+                        if previous is not None and previous != issue:
+                            raise RuntimeError("malformed watcher issue list")
+                        records[str(issue["id"])] = issue
+                    if not page["has_more"]:
+                        break
+                    if not page["issues"]:
                         raise RuntimeError("malformed watcher issue list")
-                    records[str(issue["id"])] = issue
-                if not page["has_more"]:
-                    break
-                if not page["issues"]:
-                    raise RuntimeError("malformed watcher issue list")
-                offset += len(page["issues"])
+                    offset += len(page["issues"])
     ordered = sorted(
         records.values(),
         key=lambda item: (str(item["updated_at"]), str(item["identifier"])),
@@ -1297,10 +1402,21 @@ def watch_projects(
         raise ValueError("watcher requires two distinct project identifiers")
     parent_keys = _list_workflow_parents(runner, project_ids)
     candidates: list[tuple[str, RecoveryDecision]] = []
+    migrations: list[tuple[str, RecoveryDecision]] = []
     for parent_key in parent_keys:
         decision = decide_recovery(load_workflow_snapshot(runner, parent_key))
-        if decision.kind != "noop":
+        if decision.reason == "version 1 workflow requires explicit migration":
+            migrations.append((parent_key, decision))
+        elif decision.kind != "noop":
             candidates.append((parent_key, decision))
+    if migrations:
+        return WatchResult(
+            len(parent_keys),
+            len(candidates),
+            0,
+            "noop",
+            "version 1 workflow requires explicit migration",
+        )
     if not candidates:
         return WatchResult(len(parent_keys), 0, 0, "noop")
     first_parent, first_decision = candidates[0]
@@ -1350,6 +1466,7 @@ def finish_phase(
         legacy_wanted = dict(wanted)
         legacy_wanted["eventra.workflow.version"] = "1"
         legacy_wanted.pop("eventra.phase.failure_repositories")
+        legacy_wanted.pop("eventra.phase.evidence_comment_url", None)
         if controlled_before == legacy_wanted:
             return PhaseResult(
                 str(detail["id"]), issue_key, "done", value.kind, value.result, 0
@@ -1508,8 +1625,9 @@ def build_workflow_parser() -> argparse.ArgumentParser:
     finish.add_argument("issue")
     finish.add_argument("--kind", required=True, choices=sorted(PHASE_KINDS))
     finish.add_argument("--result", required=True, choices=sorted(PHASE_RESULTS))
-    finish.add_argument("--attempt", required=True, type=int)
+    finish.add_argument("--attempt", required=True, type=int, choices=(0, 1, 2, 3))
     finish.add_argument("--evidence-comment", required=True)
+    finish.add_argument("--evidence-comment-url")
     finish.add_argument("--frontend-sha")
     finish.add_argument("--backend-sha")
     finish.add_argument("--pr")
@@ -1545,9 +1663,15 @@ def print_parent_result(value: ParentCompletionResult) -> None:
 
 
 def print_watch_result(value: WatchResult) -> None:
+    reason = (
+        ""
+        if not value.reason
+        else " reason="
+        + json.dumps(value.reason, ensure_ascii=False, separators=(",", ":"))
+    )
     print(
         f"scanned={value.scanned} candidates={value.candidates} "
-        f"applied={value.applied} decision={value.decision}"
+        f"applied={value.applied} decision={value.decision}{reason}"
     )
 
 
@@ -1581,6 +1705,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             backend_sha=args.backend_sha,
             pr_url=args.pr,
             responsible_repositories=tuple(args.responsible_repository),
+            evidence_comment_url=args.evidence_comment_url,
         )
         print_phase_result(finish_phase(runner, args.issue, completion))
     elif args.command == "plan-parent":
