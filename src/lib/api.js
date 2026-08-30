@@ -1,6 +1,24 @@
 export const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8080";
 
+const LEADING_JAVA_TRIM_CHARACTERS = /^[\u0000-\u0020]+/;
+const TRAILING_JAVA_TRIM_CHARACTERS = /[\u0000-\u0020]+$/;
+const VALID_USERNAME = /^[A-Za-z0-9_]{3,50}$/;
+
+export function normalizeUsernameCandidate(username) {
+  return String(username ?? "")
+    .replace(LEADING_JAVA_TRIM_CHARACTERS, "")
+    .replace(TRAILING_JAVA_TRIM_CHARACTERS, "");
+}
+
+export function getUsernameCandidateKey(username) {
+  return normalizeUsernameCandidate(username).toLowerCase();
+}
+
+export function isUsernameCandidateValid(username) {
+  return VALID_USERNAME.test(normalizeUsernameCandidate(username));
+}
+
 function getAuthHeader() {
   if (typeof window === "undefined") return {};
   const token = localStorage.getItem("eventra_token");
@@ -126,7 +144,7 @@ export async function getUserProfile() {
 }
 
 export async function checkUsernameAvailability(username, options = {}) {
-  const candidate = username.trim();
+  const candidate = getUsernameCandidateKey(username);
   return await fetchAPI(
     `/api/users/username-availability?username=${encodeURIComponent(candidate)}`,
     { signal: options.signal },

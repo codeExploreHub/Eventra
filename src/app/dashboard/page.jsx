@@ -21,7 +21,10 @@ import {
 } from "lucide-react";
 import { 
   checkUsernameAvailability,
+  getUsernameCandidateKey,
   getUserProfile, 
+  isUsernameCandidateValid,
+  normalizeUsernameCandidate,
   updateUserProfile, 
   getMyRegisteredEvents, 
   getHackathons, 
@@ -55,18 +58,20 @@ export default function DashboardPage() {
   const [profileSaveError, setProfileSaveError] = useState("");
   const [isSavingProfile, setIsSavingProfile] = useState(false);
   const [usernameAvailability, setUsernameAvailability] = useState({
-    candidate: "",
+    candidateKey: "",
     status: "idle",
   });
   const profileCloseTimerRef = useRef(null);
   const profileEditorGenerationRef = useRef(0);
 
-  const trimmedUsername = editUsername.trim();
-  const usernameIsLocallyValid =
-    trimmedUsername.length >= 3 && trimmedUsername.length <= 50;
+  const trimmedUsername = normalizeUsernameCandidate(editUsername);
+  const usernameIsLocallyValid = isUsernameCandidateValid(trimmedUsername);
+  const usernameCandidateKey = usernameIsLocallyValid
+    ? getUsernameCandidateKey(trimmedUsername)
+    : "";
   const usernameAvailabilityStatus = !usernameIsLocallyValid
     ? "invalid"
-    : usernameAvailability.candidate === trimmedUsername
+    : usernameAvailability.candidateKey === usernameCandidateKey
       ? usernameAvailability.status
       : "checking";
   const canSaveUsername =
@@ -142,26 +147,25 @@ export default function DashboardPage() {
   useEffect(() => {
     if (!isEditingProfile) return;
 
-    const candidate = editUsername.trim();
-    if (candidate.length < 3 || candidate.length > 50) {
+    if (!usernameCandidateKey) {
       return;
     }
 
     let ignore = false;
     const controller = new AbortController();
 
-    checkUsernameAvailability(candidate, { signal: controller.signal })
+    checkUsernameAvailability(usernameCandidateKey, { signal: controller.signal })
       .then((result) => {
         if (ignore) return;
         setUsernameAvailability({
-          candidate,
+          candidateKey: usernameCandidateKey,
           status: result?.available === true ? "available" : "unavailable",
         });
       })
       .catch((error) => {
         if (ignore || error?.name === "AbortError") return;
         setUsernameAvailability({
-          candidate,
+          candidateKey: usernameCandidateKey,
           error: error?.message || "Unable to check username availability.",
           status: "error",
         });
@@ -171,7 +175,7 @@ export default function DashboardPage() {
       ignore = true;
       controller.abort();
     };
-  }, [editUsername, isEditingProfile]);
+  }, [isEditingProfile, usernameCandidateKey]);
 
   useEffect(() => () => {
     if (profileCloseTimerRef.current !== null) {
@@ -191,7 +195,7 @@ export default function DashboardPage() {
     profileEditorGenerationRef.current += 1;
     setProfileSaveError("");
     setSaveSuccess(false);
-    setUsernameAvailability({ candidate: "", status: "idle" });
+    setUsernameAvailability({ candidateKey: "", status: "idle" });
     setIsEditingProfile(true);
   };
 
@@ -217,15 +221,16 @@ export default function DashboardPage() {
     cancelProfileCloseTimer();
     profileEditorGenerationRef.current += 1;
     const saveGeneration = profileEditorGenerationRef.current;
+    const submittedProfile = {
+      firstName: editFirstName,
+      lastName: editLastName,
+      username: trimmedUsername,
+    };
     setIsSavingProfile(true);
     setProfileSaveError("");
     try {
-      const updated = await updateUserProfile({
-        firstName: editFirstName,
-        lastName: editLastName,
-        username: trimmedUsername
-      });
-      const newProf = { ...profile, ...updated, firstName: editFirstName, lastName: editLastName, username: trimmedUsername };
+      const updated = await updateUserProfile(submittedProfile);
+      const newProf = { ...profile, ...updated, ...submittedProfile };
       setProfile(newProf);
       if (typeof window !== "undefined") {
         localStorage.setItem("eventra_user", JSON.stringify(newProf));
@@ -638,6 +643,7 @@ export default function DashboardPage() {
                 <input
                   type="text"
                   required
+                  disabled={isSavingProfile}
                   value={editFirstName}
                   onChange={(e) => setEditFirstName(e.target.value)}
                   className="w-full px-3.5 py-2 text-sm bg-zinc-50 border border-zinc-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#00b887] text-zinc-900"
@@ -649,6 +655,7 @@ export default function DashboardPage() {
                 <input
                   type="text"
                   required
+                  disabled={isSavingProfile}
                   value={editLastName}
                   onChange={(e) => setEditLastName(e.target.value)}
                   className="w-full px-3.5 py-2 text-sm bg-zinc-50 border border-zinc-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#00b887] text-zinc-900"
@@ -660,10 +667,19 @@ export default function DashboardPage() {
                 <input
                   type="text"
                   required
+                  disabled={isSavingProfile}
                   value={editUsername}
                   onChange={(e) => {
-                    setUsernameAvailability({ candidate: "", status: "idle" });
-                    setEditUsername(e.target.value);
+                    const nextUsername = e.target.value;
+                    const nextCandidateKey = isUsernameCandidateValid(nextUsername)
+                      ? getUsernameCandidateKey(nextUsername)
+                      : "";
+                    setUsernameAvailability((current) =>
+                      current.candidateKey === nextCandidateKey
+                        ? current
+                        : { candidateKey: "", status: "idle" },
+                    );
+                    setEditUsername(nextUsername);
                     setProfileSaveError("");
                   }}
                   className="w-full px-3.5 py-2 text-sm bg-zinc-50 border border-zinc-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#00b887] text-zinc-900"
@@ -676,7 +692,7 @@ export default function DashboardPage() {
                       : "text-red-700"
                 }`} aria-live="polite">
                   {usernameAvailabilityStatus === "invalid" &&
-                    "Username must be 3 to 50 characters after trimming."}
+                    "Username must contain only ASCII letters, numbers, or underscores and be 3 to 50 characters after trimming."}
                   {usernameAvailabilityStatus === "checking" &&
                     "Checking username availability..."}
                   {usernameAvailabilityStatus === "available" &&

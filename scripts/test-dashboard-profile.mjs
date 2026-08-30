@@ -17,7 +17,7 @@ const initialProfile = {
   email: "alex@example.com",
   firstName: "Alex",
   lastName: "Rivera",
-  username: "current-user",
+  username: "current_user",
 };
 
 function deferred() {
@@ -137,9 +137,18 @@ async function renderDashboard(overrides = {}) {
   dom.window.localStorage.setItem("eventra_token", "test-token");
   dom.window.localStorage.setItem("eventra_user", JSON.stringify(initialProfile));
   const { createRoot } = await import("react-dom/client");
+  const productionApi = await loadApi({
+    storage: dom.window.localStorage,
+    async fetchImpl() {
+      throw new Error("Unexpected real API request from dashboard test");
+    },
+  });
 
   const calls = { availability: [], update: [] };
   const api = {
+    getUsernameCandidateKey: productionApi.getUsernameCandidateKey,
+    isUsernameCandidateValid: productionApi.isUsernameCandidateValid,
+    normalizeUsernameCandidate: productionApi.normalizeUsernameCandidate,
     async checkUsernameAvailability(username, options) {
       calls.availability.push({ options, username });
       return { available: true, username };
@@ -208,6 +217,12 @@ async function renderDashboard(overrides = {}) {
     });
   }
 
+  async function attemptUserInput(index, value) {
+    const input = container.querySelectorAll("form input")[index];
+    if (input.disabled) return;
+    await changeInput(index, value);
+  }
+
   async function submit() {
     const form = container.querySelector("form");
     await act(async () => {
@@ -228,6 +243,7 @@ async function renderDashboard(overrides = {}) {
 
   return {
     calls,
+    attemptUserInput,
     changeInput,
     cleanup,
     container,
@@ -238,7 +254,7 @@ async function renderDashboard(overrides = {}) {
   };
 }
 
-test("sends an authenticated, encoded username availability request", async () => {
+test("uses Java String.trim boundaries for an authenticated availability request", async () => {
   let request;
   const storage = {
     getItem(key) {
@@ -253,29 +269,29 @@ test("sends an authenticated, encoded username availability request", async () =
       return {
         ok: true,
         async json() {
-          return { available: true, username: "user/name" };
+          return { available: true, username: "case_user" };
         },
       };
     },
   });
 
-  const result = await api.checkUsernameAvailability("  user/name  ", {
+  const result = await api.checkUsernameAvailability("\u0000\tCase_User \u001f", {
     signal: controller.signal,
   });
 
   assert.equal(
     request.url,
-    "http://localhost:8080/api/users/username-availability?username=user%2Fname",
+    "http://localhost:8080/api/users/username-availability?username=case_user",
   );
   assert.equal(request.options.headers.Authorization, "Bearer signed-jwt");
   assert.equal(request.options.signal, controller.signal);
   assert.deepEqual(
     { available: result.available, username: result.username },
-    { available: true, username: "user/name" },
+    { available: true, username: "case_user" },
   );
 });
 
-test("trims usernames, enforces 3-50 characters, and saves only an available candidate", async () => {
+test("accepts Java-trimmed ASCII usernames at the 3 and 50 character boundaries", async () => {
   const availabilityCalls = [];
   const rendered = await renderDashboard({
     async checkUsernameAvailability(username) {
@@ -287,7 +303,7 @@ test("trims usernames, enforces 3-50 characters, and saves only an available can
   try {
     await rendered.openEditor();
     await waitFor(
-      () => availabilityCalls.includes("current-user"),
+      () => availabilityCalls.includes("current_user"),
       "current username was not checked",
     );
     await waitFor(
@@ -295,27 +311,103 @@ test("trims usernames, enforces 3-50 characters, and saves only an available can
       "available current username did not enable saving",
     );
 
-    await rendered.changeInput(2, " ab ");
-    assert.match(rendered.container.textContent, /3 to 50 characters/);
-    assert.equal(findButton(rendered.container, "Save Profile").disabled, true);
-
-    await rendered.changeInput(2, "x".repeat(51));
-    assert.match(rendered.container.textContent, /3 to 50 characters/);
-    assert.equal(findButton(rendered.container, "Save Profile").disabled, true);
-
-    await rendered.changeInput(2, "  fresh-user  ");
+    await rendered.changeInput(2, "\u0000 A_b \u0020");
     await waitFor(
-      () => availabilityCalls.includes("fresh-user"),
-      "trimmed username was not checked",
+      () => availabilityCalls.includes("a_b"),
+      "three-character Java-trimmed username was not checked",
     );
     await waitFor(
       () => findButton(rendered.container, "Save Profile").disabled === false,
-      "available username did not enable saving",
+      "available three-character username did not enable saving",
+    );
+
+    const maxUsername = "Z".repeat(50);
+    await rendered.changeInput(2, maxUsername);
+    await waitFor(
+      () => availabilityCalls.includes(maxUsername.toLowerCase()),
+      "50-character username was not checked",
+    );
+    await waitFor(
+      () => findButton(rendered.container, "Save Profile").disabled === false,
+      "available 50-character username did not enable saving",
     );
     await rendered.submit();
 
     assert.equal(rendered.calls.update.length, 1);
-    assert.equal(rendered.calls.update[0].username, "fresh-user");
+    assert.equal(rendered.calls.update[0].username, maxUsername);
+  } finally {
+    await rendered.cleanup();
+  }
+});
+
+test("reuses an availability result for ASCII case variants of the same candidate", async () => {
+  const availabilityCalls = [];
+  const rendered = await renderDashboard({
+    async checkUsernameAvailability(username) {
+      availabilityCalls.push(username);
+      return { available: true, username };
+    },
+  });
+
+  try {
+    await rendered.openEditor();
+    await rendered.changeInput(2, "Case_User");
+    await waitFor(
+      () => availabilityCalls.includes("case_user"),
+      "case-insensitive username key was not checked",
+    );
+    await waitFor(
+      () => findButton(rendered.container, "Save Profile").disabled === false,
+      "available mixed-case username did not enable saving",
+    );
+
+    const callCount = availabilityCalls.length;
+    await rendered.changeInput(2, "case_user");
+    assert.equal(availabilityCalls.length, callCount);
+    assert.equal(findButton(rendered.container, "Save Profile").disabled, false);
+  } finally {
+    await rendered.cleanup();
+  }
+});
+
+test("rejects non-ASCII username syntax without requesting availability", async () => {
+  const availabilityCalls = [];
+  const rendered = await renderDashboard({
+    async checkUsernameAvailability(username) {
+      availabilityCalls.push(username);
+      return { available: true, username };
+    },
+  });
+  const invalidCandidates = [
+    "ab",
+    "x".repeat(51),
+    "用户A",
+    "abc!",
+    "abc-def",
+    "abc.def",
+    "abc def",
+    "\u00a0abc\u00a0",
+    "\ufeffabc\ufeff",
+  ];
+
+  try {
+    await rendered.openEditor();
+    await waitFor(
+      () => availabilityCalls.includes("current_user"),
+      "current username was not checked",
+    );
+
+    for (const candidate of invalidCandidates) {
+      const callCount = availabilityCalls.length;
+      await rendered.changeInput(2, candidate);
+      assert.equal(
+        availabilityCalls.length,
+        callCount,
+        `availability was requested for invalid candidate ${JSON.stringify(candidate)}`,
+      );
+      assert.equal(findButton(rendered.container, "Save Profile").disabled, true);
+      assert.match(rendered.container.textContent, /ASCII letters, numbers, or underscores/);
+    }
   } finally {
     await rendered.cleanup();
   }
@@ -325,7 +417,7 @@ test("ignores an older availability response for a newer username", async () => 
   const requests = new Map();
   const rendered = await renderDashboard({
     checkUsernameAvailability(username) {
-      if (username === "current-user") {
+      if (username === "current_user") {
         return Promise.resolve({ available: true, username });
       }
       const request = deferred();
@@ -336,33 +428,33 @@ test("ignores an older availability response for a newer username", async () => 
 
   try {
     await rendered.openEditor();
-    await rendered.changeInput(2, "older-choice");
+    await rendered.changeInput(2, "older_choice");
     await waitFor(
-      () => requests.has("older-choice"),
+      () => requests.has("older_choice"),
       "older availability request did not start",
     );
-    await rendered.changeInput(2, "newer-choice");
+    await rendered.changeInput(2, "newer_choice");
     await waitFor(
-      () => requests.has("newer-choice"),
+      () => requests.has("newer_choice"),
       "newer availability request did not start",
     );
 
     await act(async () => {
-      requests.get("newer-choice").resolve({
+      requests.get("newer_choice").resolve({
         available: false,
-        username: "newer-choice",
+        username: "newer_choice",
       });
-      await requests.get("newer-choice").promise;
+      await requests.get("newer_choice").promise;
     });
     assert.match(rendered.container.textContent, /Username is already in use/);
     assert.equal(findButton(rendered.container, "Save Profile").disabled, true);
 
     await act(async () => {
-      requests.get("older-choice").resolve({
+      requests.get("older_choice").resolve({
         available: true,
-        username: "older-choice",
+        username: "older_choice",
       });
-      await requests.get("older-choice").promise;
+      await requests.get("older_choice").promise;
     });
     assert.match(rendered.container.textContent, /Username is already in use/);
     assert.equal(findButton(rendered.container, "Save Profile").disabled, true);
@@ -377,10 +469,10 @@ test("rechecks a revisited username before allowing it to be saved", async () =>
   const secondChoiceRequest = deferred();
   const rendered = await renderDashboard({
     checkUsernameAvailability(username) {
-      if (username === "current-user") {
+      if (username === "current_user") {
         return Promise.resolve({ available: true, username });
       }
-      if (username === "first-choice") {
+      if (username === "first_choice") {
         firstChoiceRequests += 1;
         return firstChoiceRequests === 1
           ? Promise.resolve({ available: true, username })
@@ -392,14 +484,14 @@ test("rechecks a revisited username before allowing it to be saved", async () =>
 
   try {
     await rendered.openEditor();
-    await rendered.changeInput(2, "first-choice");
+    await rendered.changeInput(2, "first_choice");
     await waitFor(
       () => findButton(rendered.container, "Save Profile").disabled === false,
       "first availability result did not enable saving",
     );
 
-    await rendered.changeInput(2, "second-choice");
-    await rendered.changeInput(2, "first-choice");
+    await rendered.changeInput(2, "second_choice");
+    await rendered.changeInput(2, "first_choice");
     await waitFor(
       () => firstChoiceRequests === 2,
       "revisited username was not checked again",
@@ -407,7 +499,7 @@ test("rechecks a revisited username before allowing it to be saved", async () =>
 
     assert.equal(findButton(rendered.container, "Save Profile").disabled, true);
     await act(async () => {
-      revisitedRequest.resolve({ available: true, username: "first-choice" });
+      revisitedRequest.resolve({ available: true, username: "first_choice" });
       await revisitedRequest.promise;
     });
     assert.equal(findButton(rendered.container, "Save Profile").disabled, false);
@@ -443,7 +535,7 @@ test("requires a fresh availability result after reopening the editor", async ()
 
     assert.equal(findButton(rendered.container, "Save Profile").disabled, true);
     await act(async () => {
-      reopenedRequest.resolve({ available: true, username: "current-user" });
+      reopenedRequest.resolve({ available: true, username: "current_user" });
       await reopenedRequest.promise;
     });
     assert.equal(findButton(rendered.container, "Save Profile").disabled, false);
@@ -452,8 +544,9 @@ test("requires a fresh availability result after reopening the editor", async ()
   }
 });
 
-test("does not dismiss the editor while a profile save is in flight", async () => {
+test("disables all profile inputs while saving and re-enables them after failure", async () => {
   const updateRequest = deferred();
+  const originalStoredProfile = JSON.stringify(initialProfile);
   const rendered = await renderDashboard({
     updateUserProfile() {
       return updateRequest.promise;
@@ -471,6 +564,10 @@ test("does not dismiss the editor while a profile save is in flight", async () =
       () => findButton(rendered.container, "Saving..."),
       "profile save did not start",
     );
+    assert.deepEqual(
+      [...rendered.container.querySelectorAll("form input")].map((input) => input.disabled),
+      [true, true, true],
+    );
     await act(async () => findButton(rendered.container, "Cancel").click());
     await act(async () => {
       updateRequest.reject(new Error("Server rejected the profile update"));
@@ -484,6 +581,15 @@ test("does not dismiss the editor while a profile save is in flight", async () =
     );
 
     assert.ok(findButton(rendered.container, "Save Profile"));
+    assert.deepEqual(
+      [...rendered.container.querySelectorAll("form input")].map((input) => input.disabled),
+      [false, false, false],
+    );
+    assert.match(rendered.container.textContent, /@current_user/);
+    assert.equal(
+      rendered.dom.window.localStorage.getItem("eventra_user"),
+      originalStoredProfile,
+    );
   } finally {
     await rendered.cleanup();
   }
@@ -557,7 +663,7 @@ test("keeps the editor and persisted profile unchanged when saving fails", async
 
   try {
     await rendered.openEditor();
-    await rendered.changeInput(2, "conflict-user");
+    await rendered.changeInput(2, "conflict_user");
     await waitFor(
       () => findButton(rendered.container, "Save Profile").disabled === false,
       "available candidate did not enable saving",
@@ -569,7 +675,7 @@ test("keeps the editor and persisted profile unchanged when saving fails", async
     );
 
     assert.ok(findButton(rendered.container, "Save Profile"));
-    assert.match(rendered.container.textContent, /@current-user/);
+    assert.match(rendered.container.textContent, /@current_user/);
     assert.equal(
       rendered.dom.window.localStorage.getItem("eventra_user"),
       originalStoredProfile,
@@ -583,27 +689,69 @@ test("keeps the editor and persisted profile unchanged when saving fails", async
   }
 });
 
-test("updates the profile, persists it, and closes after a successful save", async () => {
-  const rendered = await renderDashboard();
+test("commits the exact values captured by a successful profile submission", async () => {
+  const updateRequest = deferred();
+  const rendered = await renderDashboard({
+    updateUserProfile(profile) {
+      rendered?.calls.update.push(profile);
+      return updateRequest.promise;
+    },
+  });
 
   try {
     await rendered.openEditor();
-    await rendered.changeInput(2, "fresh-user");
+    await rendered.changeInput(0, "SubmittedFirst");
+    await rendered.changeInput(1, "SubmittedLast");
+    await rendered.changeInput(2, "Submitted_User");
     await waitFor(
       () => findButton(rendered.container, "Save Profile").disabled === false,
       "available candidate did not enable saving",
     );
     await rendered.submit();
     await waitFor(
+      () => findButton(rendered.container, "Saving..."),
+      "profile save did not start",
+    );
+    await rendered.attemptUserInput(0, "NewerFirst");
+    await rendered.attemptUserInput(1, "NewerLast");
+    await rendered.attemptUserInput(2, "Newer_User");
+    assert.deepEqual(
+      [...rendered.container.querySelectorAll("form input")].map((input) => input.value),
+      ["SubmittedFirst", "SubmittedLast", "Submitted_User"],
+    );
+    await act(async () => {
+      updateRequest.resolve({
+        firstName: "ServerFirst",
+        lastName: "ServerLast",
+        username: "Server_User",
+      });
+      await updateRequest.promise;
+    });
+    await waitFor(
       () => rendered.container.textContent.includes("Profile updated successfully!"),
       "save success was not shown",
     );
 
+    assert.equal(rendered.calls.update.length, 1);
+    assert.equal(rendered.calls.update[0].firstName, "SubmittedFirst");
+    assert.equal(rendered.calls.update[0].lastName, "SubmittedLast");
+    assert.equal(rendered.calls.update[0].username, "Submitted_User");
     const storedProfile = JSON.parse(
       rendered.dom.window.localStorage.getItem("eventra_user"),
     );
-    assert.equal(storedProfile.username, "fresh-user");
-    assert.match(rendered.container.textContent, /@fresh-user/);
+    assert.deepEqual(
+      {
+        firstName: storedProfile.firstName,
+        lastName: storedProfile.lastName,
+        username: storedProfile.username,
+      },
+      {
+        firstName: "SubmittedFirst",
+        lastName: "SubmittedLast",
+        username: "Submitted_User",
+      },
+    );
+    assert.match(rendered.container.textContent, /@Submitted_User/);
     assert.equal(rendered.scheduledTimers.length, 1);
     assert.equal(rendered.scheduledTimers[0].delay, 1000);
 
