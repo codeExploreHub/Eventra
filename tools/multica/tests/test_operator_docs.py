@@ -170,6 +170,32 @@ class OperatorDocsTests(unittest.TestCase):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, rendered)
 
+    def test_repair_execution_uses_the_verified_serialized_adapter_only(self):
+        lead = " ".join(
+            Path("tools/multica/instructions/delivery_lead.md").read_text().split()
+        )
+        readme = " ".join(Path("tools/multica/README.md").read_text().split())
+        core = " ".join(Path("docs/multica-delivery-core.md").read_text().split())
+
+        for rendered in (lead, readme, core):
+            self.assertIn(
+                "tools.multica.workflow execute-parent-repair",
+                rendered,
+            )
+            self.assertIn("--expected-action-key", rendered)
+            self.assertIn("authoritative parent-scoped comment UUID", rendered)
+            self.assertIn("single serialized Delivery Lead", rendered)
+            self.assertIn("eventra.workflow.repair_reservation", rendered)
+            self.assertIn("eventra.repair.creation_action", rendered)
+            self.assertIn("eventra.repair.failure_bundle_digest", rendered)
+            self.assertIn("eventra.repair.authorizing_comment_uuid", rendered)
+            self.assertIn("not generic CAS or transaction safety", rendered)
+
+        self.assertIn(
+            "Do not create repair children manually",
+            lead,
+        )
+
     def test_unattended_parent_completion_and_exact_sha_checkout_are_explicit(self):
         instructions = Path("tools/multica/instructions")
         lead = (instructions / "delivery_lead.md").read_text()

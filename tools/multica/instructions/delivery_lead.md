@@ -92,13 +92,33 @@ next barrier group, then advance `next_stage` and record `last_action`.
   exact returned immutable FailureBundle and digest without reconstruction. The
   bundle contains the parent/stage/action identity, exact candidate SHA map,
   canonical managed PR URLs, non-PASS verdict evidence UUIDs and canonical HTTPS
-  evidence-comment URLs, legal owners, and remaining attempt. It executes one repair Stage and
-  exactly one current repair child per legal owner, each bound to that bundle and
-  its existing managed PR. Automatic repair rounds are exactly 1 and 2.
+  evidence-comment URLs, legal owners, and remaining attempt. Do not create
+  repair children manually. Invoke the verified executor with the exact action
+  identity returned by the immediately preceding plan:
+
+  ```text
+  python3 -B -m tools.multica.workflow execute-parent-repair PRO-M --expected-action-key ACTION_KEY
+  ```
+
+  The executor makes a fresh authoritative plan, writes
+  `eventra.workflow.repair_reservation`, parks exactly one owner child in
+  backlog, persists and rereads `eventra.repair.creation_action`,
+  `eventra.repair.failure_bundle_digest`, sorted evidence UUIDs, the existing
+  managed PR, repair round, and `eventra.repair.authorizing_comment_uuid`, then
+  commits the parent, promotes only those exact children, and clears the
+  reservation last. A retry may resume only that exact reservation/action.
+  Conflicts, partial provenance, duplicate owner children, or head drift block
+  visibly. This local adapter depends on a single serialized Delivery Lead
+  (`max_concurrent_tasks=1`); it is not generic CAS or transaction safety.
+  Automatic repair rounds are exactly 1 and 2.
   Every replacement SHA requires fresh review and QA; no old PASS transfers.
-  A member comment may authorize only the exact current FailureBundle's exact
-  next round 3, once. If round 3 fails, block the parent; do not create another
-  repair child.
+  For round 3, store only an authoritative parent-scoped comment UUID on the
+  parent. The executor rereads that parent comment and requires authoritative
+  `author_type=member` plus the exact canonical body containing only the current
+  bundle digest and `granted_round=3`; caller-supplied body or author identity is
+  never authority. A member comment may authorize only the exact current
+  FailureBundle's exact next round 3, once. If round 3 fails, block the parent;
+  do not create another repair child.
 - `merge`: verify current heads, exact-SHA review and QA PASS, required local
   and repository checks, and mergeability, then automatically merge the
   personal-fork PRs. PR bodies use `Closes PRO-N` and `Related to PRO-M`.

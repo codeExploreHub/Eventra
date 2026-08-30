@@ -183,7 +183,30 @@ declares the legal repair owner(s), evidence UUID, and canonical HTTPS
 not route a failure to an Implementer. After complete Gate Stage fan-in,
 Delivery Lead uses Core's exact returned immutable FailureBundle and digest
 without reconstruction, then executes one repair Stage with exactly one current
-child per legal owner. A repair child is usable only
+child per legal owner. The sole operational repair path is:
+
+```text
+python3 -B -m tools.multica.workflow execute-parent-repair PRO-M --expected-action-key ACTION_KEY
+```
+
+Do not create repair children manually. The helper freshly rereads and replans,
+then reserves `eventra.workflow.repair_reservation`, creates owner children in
+backlog, and persists/rereads `eventra.repair.creation_action`,
+`eventra.repair.failure_bundle_digest`, sorted failure evidence UUIDs, exact
+stage/round, existing managed PR, and
+`eventra.repair.authorizing_comment_uuid`. It commits parent attempt,
+`next_stage`, last action, and consumed authorization provenance before
+promoting only the exact children; the reservation is cleared last. Exact
+retries resume or no-op, while conflicts and partial mismatches block visibly.
+This Eventra-local adapter is safe only under the provisioned single serialized
+Delivery Lead (`max_concurrent_tasks=1`); it is not generic CAS or transaction
+safety.
+
+For round 3 the caller supplies only an authoritative parent-scoped comment UUID.
+The helper authoritatively rereads the parent thread and accepts only
+`author_type=member` with an exact canonical body containing the current bundle
+digest and `granted_round=3`; caller-supplied body and author identity are not
+trusted. A repair child is usable only
 while active and only with that valid bundle and an existing managed PR. Gate
 comments, mentions, and completed children are not repair authority. Automatic
 repair rounds are exactly 1 and 2. A member comment may authorize only the exact

@@ -622,6 +622,28 @@ class MulticaRunnerTests(unittest.TestCase):
 
         self.assertEqual(runner.mutation_count, 2)
 
+    @patch("tools.multica.provision.subprocess.run")
+    def test_repair_executor_reads_and_mutations_have_explicit_prefixes(self, run):
+        run.return_value = subprocess.CompletedProcess([], 0, "{}", "")
+        runner = MulticaRunner()
+
+        runner.run(
+            [
+                "issue", "comment", "list", "PRO-65",
+                "--thread", "00000000-0000-4000-8000-000000000061",
+                "--output", "json",
+            ]
+        )
+        for argv in (
+            ["issue", "create", "--parent", "PRO-65", "--output", "json"],
+            ["issue", "metadata", "set", "PRO-65", "--output", "json"],
+            ["issue", "metadata", "delete", "PRO-65", "--output", "json"],
+            ["issue", "status", "PRO-80", "todo", "--output", "json"],
+        ):
+            runner.run(argv)
+
+        self.assertEqual(runner.mutation_count, 4)
+
 
 class ProvisionerTests(unittest.TestCase):
     def setUp(self):
@@ -635,6 +657,19 @@ class ProvisionerTests(unittest.TestCase):
             agent.name, description=agent.description, instructions=agent.instructions_file.read_text(),
             runtime_id=self.config.runtime_id, visibility="workspace", max_concurrent_tasks=1,
         )
+
+    def test_delivery_lead_is_reconciled_to_one_serial_task_slot(self):
+        lead = next(
+            agent for agent in self.config.agents if agent.role == "delivery_lead"
+        )
+
+        self.assertEqual(
+            self.provisioner._desired_agent(self.config, lead)[
+                "max_concurrent_tasks"
+            ],
+            1,
+        )
+
 
     def test_fake_squad_create_includes_the_server_managed_leader_member(self):
         self.runner.run(

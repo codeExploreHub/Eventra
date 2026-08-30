@@ -139,8 +139,24 @@ sole fan-in, canonical FailureBundle producer, and decision authority; it
 returns canonical JSON with the exact `failure_bundle` and digest, but does not
 create a Stage or child. Delivery Lead is the sole execution actor: after
 validating Core's canonical JSON, it uses the exact returned `failure_bundle`
-and digest without reconstruction, then executes exactly one repair Stage with
-one current child per owner. A valid FailureBundle binds the version-2 parent and Gate Stage/action identity, exact
+and digest without reconstruction. The sole operational repair command is
+`python3 -B -m tools.multica.workflow execute-parent-repair PRO-M
+--expected-action-key ACTION_KEY`; do not create repair children manually. It
+freshly rereads and replans, writes `eventra.workflow.repair_reservation`, parks
+one child per owner in backlog, persists and rereads
+`eventra.repair.creation_action`, `eventra.repair.failure_bundle_digest`, sorted
+evidence UUIDs, stage/round, managed PR, and
+`eventra.repair.authorizing_comment_uuid`, commits parent state and consumed
+authorization provenance, promotes only exact bound children, and clears the
+reservation last. Conflicting or partial state blocks visibly; exact retries
+resume or no-op. This Eventra adapter relies on a single serialized Delivery
+Lead (`max_concurrent_tasks=1`) and is not generic CAS or transaction safety.
+
+For round 3 the only caller-supplied authority locator is an authoritative
+parent-scoped comment UUID. The adapter rereads that parent thread and requires
+authoritative `author_type=member` plus an exact canonical body containing only
+the current bundle digest and `granted_round=3`; caller-supplied body and author
+identity are never trusted. A valid FailureBundle binds the version-2 parent and Gate Stage/action identity, exact
 candidate SHA map, current child identities, canonical managed PR URLs,
 non-PASS verdicts, evidence UUIDs, canonical HTTPS evidence-comment URLs, legal
 owners, and remaining repair budget. The Core decision waits for every current

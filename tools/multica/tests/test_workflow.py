@@ -8,6 +8,7 @@ from contextlib import redirect_stdout
 from dataclasses import replace
 
 from tools.multica.workflow import (
+    AuthorizingComment,
     ChildRunSnapshot,
     ParentDecision,
     ParentSnapshot,
@@ -17,11 +18,14 @@ from tools.multica.workflow import (
     RecoveryDecision,
     WorkflowSnapshot,
     WatchResult,
+    _failure_bundle,
+    _repair_child_specs,
     _string_metadata_filter,
     build_phase_metadata,
     build_workflow_parser,
     decide_parent_action,
     decide_recovery,
+    execute_parent_repair,
     finish_parent,
     finish_phase,
     load_parent_snapshot,
@@ -481,6 +485,9 @@ def phase(
     evidence_comment="",
     responsible_repositories=(),
     evidence_comment_url=None,
+    project_id="",
+    pr_url="",
+    assignee_id="",
 ):
     return PhaseSnapshot(
         issue_key=issue_key,
@@ -494,6 +501,9 @@ def phase(
         evidence_comment=evidence_comment,
         responsible_repositories=responsible_repositories,
         evidence_comment_url=evidence_comment_url,
+        project_id=project_id,
+        pr_url=pr_url,
+        assignee_id=assignee_id,
     )
 
 
@@ -527,6 +537,148 @@ def parent_snapshot(**overrides):
 
 
 class ParentDecisionTests(unittest.TestCase):
+    def test_cross_stack_repair_owner_uses_its_managed_pr_project(self):
+        backend_sha = "b" * 40
+        frontend_project = "00000000-0000-4000-8000-000000000040"
+        backend_project = "00000000-0000-4000-8000-000000000041"
+        frontend_owner = "00000000-0000-4000-8000-000000000042"
+        backend_owner = "00000000-0000-4000-8000-000000000043"
+        backend_pr_url = "https://github.com/codeExploreHub/Eventra-Backend/pull/7"
+        review_uuid = "00000000-0000-4000-8000-000000000062"
+        qa_uuid = "00000000-0000-4000-8000-000000000063"
+        children = (
+            phase(
+                "PRO-60", 1, "implementation",
+                project_id=frontend_project,
+                pr_url=FRONTEND_PR,
+                assignee_id=frontend_owner,
+            ),
+            phase(
+                "PRO-61", 1, "implementation",
+                frontend_sha=None,
+                backend_sha=backend_sha,
+                project_id=backend_project,
+                pr_url=backend_pr_url,
+                assignee_id=backend_owner,
+            ),
+            phase(
+                "PRO-62", 2, "review", result="fail",
+                backend_sha=backend_sha,
+                evidence_comment=review_uuid,
+                responsible_repositories=("backend",),
+                evidence_comment_url=f"https://multica.example/comments/{review_uuid}",
+                project_id=frontend_project,
+            ),
+            phase(
+                "PRO-63", 2, "qa",
+                backend_sha=backend_sha,
+                evidence_comment=qa_uuid,
+                project_id=frontend_project,
+            ),
+        )
+        snapshot = parent_snapshot(
+            classification="cross-stack",
+            candidate_backend_sha=backend_sha,
+            children=children,
+            pull_requests=(
+                frontend_pr(),
+                PullRequestSnapshot(
+                    "backend", backend_pr_url, backend_sha,
+                    "open", True, True,
+                ),
+            ),
+        )
+        bundle = _failure_bundle(snapshot, children[-2:])
+
+        specs = _repair_child_specs(snapshot, bundle)
+
+        self.assertEqual(specs[0]["repository"], "backend")
+        self.assertEqual(specs[0]["project_id"], backend_project)
+        self.assertEqual(specs[0]["assignee_id"], backend_owner)
+
+    def _round_three_snapshot(
+        self,
+        *,
+        author_type="member",
+        content=None,
+        authorization_comment_uuid="00000000-0000-4000-8000-000000000061",
+        consumed_authorization_uuid="",
+        pr_head="b" * 40,
+        attempt=2,
+    ):
+        backend_sha = "b" * 40
+        review_uuid = "00000000-0000-4000-8000-000000000062"
+        qa_uuid = "00000000-0000-4000-8000-000000000063"
+        children = (
+            phase(
+                "PRO-66", 1, "implementation", attempt=0,
+                frontend_sha=None, backend_sha=backend_sha,
+            ),
+            phase(
+                "PRO-67", 3, "repair", attempt=1,
+                frontend_sha=None, backend_sha=backend_sha,
+            ),
+            phase(
+                "PRO-68", 5, "repair", attempt=2,
+                frontend_sha=None, backend_sha=backend_sha,
+            ),
+            phase(
+                "PRO-69", 6, "review", result="fail", attempt=2,
+                frontend_sha=None, backend_sha=backend_sha,
+                evidence_comment=review_uuid,
+                responsible_repositories=("backend",),
+                evidence_comment_url=f"https://multica.example/comments/{review_uuid}",
+            ),
+            phase(
+                "PRO-70", 6, "qa", attempt=2,
+                frontend_sha=None, backend_sha=backend_sha,
+                evidence_comment=qa_uuid,
+            ),
+        )
+        base = parent_snapshot(
+            identifier="PRO-65",
+            classification="backend-only",
+            attempt=attempt,
+            candidate_frontend_sha=None,
+            candidate_backend_sha=backend_sha,
+            children=children,
+            pull_requests=(
+                PullRequestSnapshot(
+                    repository="backend",
+                    url="https://github.com/codeExploreHub/Eventra-Backend/pull/7",
+                    head_sha=pr_head,
+                    state="open",
+                    mergeable=True,
+                    checks_pass=True,
+                ),
+            ),
+            next_stage=7,
+            authorization_comment_uuid=authorization_comment_uuid,
+            consumed_authorization_uuid=consumed_authorization_uuid,
+        )
+        bundle = _failure_bundle(base, children[-2:])
+        if content is None:
+            content = json.dumps(
+                {
+                    "bundle_digest": bundle["digest"],
+                    "granted_round": 3,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        return replace(
+            base,
+            authorizing_comment=(
+                None
+                if not authorization_comment_uuid
+                else AuthorizingComment(
+                    authorization_comment_uuid,
+                    author_type,
+                    content or "",
+                )
+            ),
+        )
+
     def _version_two_backend_gate(self, issue_key, kind, *, status="done"):
         values = {
             "issue_key": issue_key,
@@ -788,6 +940,84 @@ class ParentDecisionTests(unittest.TestCase):
         )
         self.assertEqual(decision.kind, "block_parent")
         self.assertNotIn("repair", decision.reason)
+
+    def test_exact_member_comment_authorizes_only_round_three_and_binds_action(self):
+        snapshot = self._round_three_snapshot()
+
+        decision = decide_parent_action(snapshot)
+
+        self.assertEqual(decision.kind, "create_repair_stage")
+        self.assertEqual(decision.failure_bundle["repair_round"], 3)
+        self.assertIn(snapshot.authorization_comment_uuid, decision.action_key)
+
+    def test_round_three_authorization_fails_closed_for_every_identity_mismatch(self):
+        valid = self._round_three_snapshot()
+        digest = decide_parent_action(valid).failure_bundle["digest"]
+        cases = {
+            "missing": replace(
+                valid,
+                authorization_comment_uuid="",
+                authorizing_comment=None,
+            ),
+            "non-member": replace(
+                valid,
+                authorizing_comment=replace(
+                    valid.authorizing_comment,
+                    author_type="agent",
+                ),
+            ),
+            "malformed body": replace(
+                valid,
+                authorizing_comment=replace(valid.authorizing_comment, content="not-json"),
+            ),
+            "wrong digest": replace(
+                valid,
+                authorizing_comment=replace(
+                    valid.authorizing_comment,
+                    content=json.dumps(
+                        {"bundle_digest": "f" * 64, "granted_round": 3},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ),
+            ),
+            "wrong round": replace(
+                valid,
+                authorizing_comment=replace(
+                    valid.authorizing_comment,
+                    content=json.dumps(
+                        {"bundle_digest": digest, "granted_round": 4},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ),
+            ),
+            "consumed": replace(
+                valid,
+                consumed_authorization_uuid=valid.authorization_comment_uuid,
+            ),
+            "different authorization already consumed": replace(
+                valid,
+                consumed_authorization_uuid=(
+                    "00000000-0000-4000-8000-000000000099"
+                ),
+            ),
+        }
+        for label, snapshot in cases.items():
+            with self.subTest(label=label):
+                decision = decide_parent_action(snapshot)
+                self.assertEqual(decision.kind, "block_parent")
+                self.assertIsNone(decision.failure_bundle)
+
+    def test_round_four_and_out_of_band_head_drift_fail_closed(self):
+        round_four = decide_parent_action(
+            replace(self._round_three_snapshot(), attempt=3)
+        )
+        drift = decide_parent_action(self._round_three_snapshot(pr_head="e" * 40))
+
+        self.assertEqual(round_four.kind, "block_parent")
+        self.assertEqual(drift.kind, "block_parent")
+        self.assertIn("out-of-band", drift.reason)
 
     def test_attempt_metadata_cannot_reset_completed_repair_history(self):
         children = (
@@ -1471,6 +1701,7 @@ class WatchWorkflowTests(unittest.TestCase):
 class FakeParentRunner(FakeWatchRunner):
     def __init__(self):
         super().__init__()
+        self.comment_records = []
         self.metadata["PRO-35"] = {
             "eventra.workflow.version": "2",
             "eventra.workflow.classification": "frontend-only",
@@ -1487,6 +1718,9 @@ class FakeParentRunner(FakeWatchRunner):
 
     def run(self, args, *, stdin_json=None):
         call = tuple(args)
+        if call[:4] == ("issue", "comment", "list", "PRO-35"):
+            self.calls.append(call)
+            return copy.deepcopy(self.comment_records)
         if call == ("issue", "children", "PRO-35", "--output", "json"):
             self.calls.append(call)
             return {
@@ -1520,7 +1754,520 @@ class FakeGitHubRunner:
         }
 
 
+class FakeRepairGitHubRunner:
+    def __init__(self):
+        self.head_sha = "b" * 40
+        self.calls = []
+
+    def run(self, args):
+        self.calls.append(tuple(args))
+        url = "https://github.com/codeExploreHub/Eventra-Backend/pull/7"
+        if tuple(args) != (
+            "pr", "view", url,
+            "--json", "url,headRefOid,state,mergeable,mergeStateStatus,statusCheckRollup",
+        ):
+            raise AssertionError(f"unsupported gh argv: {args!r}")
+        return {
+            "url": url,
+            "headRefOid": self.head_sha,
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": [],
+        }
+
+
+class FakeRepairRunner:
+    BACKEND_PR = "https://github.com/codeExploreHub/Eventra-Backend/pull/7"
+    BACKEND_SHA = "b" * 40
+    AUTH_UUID = "00000000-0000-4000-8000-000000000061"
+    REVIEW_UUID = "00000000-0000-4000-8000-000000000062"
+    QA_UUID = "00000000-0000-4000-8000-000000000063"
+
+    def __init__(self, *, attempt=2):
+        self.parent = raw_issue(
+            id=PARENT_ID,
+            identifier="PRO-65",
+            parent_issue_id=None,
+            stage=None,
+            status="in_progress",
+            assignee_type="squad",
+        )
+        self.children = []
+        self.metadata = {
+            "PRO-65": {
+                "eventra.workflow.version": "2",
+                "eventra.workflow.classification": "backend-only",
+                "eventra.workflow.next_stage": str({0: 3, 1: 5, 2: 7}[attempt]),
+                "eventra.workflow.attempt": str(attempt),
+                "eventra.workflow.backend_sha": self.BACKEND_SHA,
+                "eventra.workflow.merge_state": "not_ready",
+                "eventra.workflow.last_action": "",
+            }
+        }
+        self.comments = []
+        self.calls = []
+        self.next_child_number = 80
+        self.fail_once_parent_key = None
+        self.fail_once_create = False
+        self._add_done_child(1, "implementation", 0, result="pass", pr=True)
+        if attempt >= 1:
+            self._add_done_child(3, "repair", 1, result="pass", pr=True)
+        if attempt >= 2:
+            self._add_done_child(5, "repair", 2, result="pass", pr=True)
+        gate_stage = {0: 2, 1: 4, 2: 6}[attempt]
+        self._add_done_child(
+            gate_stage,
+            "review",
+            attempt,
+            result="fail",
+            comment_uuid=self.REVIEW_UUID,
+            owners=("backend",),
+        )
+        self._add_done_child(
+            gate_stage,
+            "qa",
+            attempt,
+            result="pass",
+            comment_uuid=self.QA_UUID,
+        )
+
+    def _identifier(self):
+        identifier = f"PRO-{self.next_child_number}"
+        self.next_child_number += 1
+        return identifier
+
+    def _add_done_child(
+        self,
+        stage,
+        kind,
+        attempt,
+        *,
+        result,
+        pr=False,
+        comment_uuid=None,
+        owners=(),
+    ):
+        identifier = self._identifier()
+        child = raw_issue(
+            id=f"01a00000-0000-7000-8000-{self.next_child_number:012d}",
+            identifier=identifier,
+            parent_issue_id=PARENT_ID,
+            stage=stage,
+            status="done",
+            project_id="00000000-0000-4000-8000-000000000040",
+        )
+        comment_uuid = comment_uuid or f"00000000-0000-4000-8000-{self.next_child_number:012d}"
+        metadata = {
+            "eventra.workflow.version": "2",
+            "eventra.phase.kind": kind,
+            "eventra.phase.result": result,
+            "eventra.phase.attempt": str(attempt),
+            "eventra.phase.evidence_comment": comment_uuid,
+            "eventra.phase.failure_repositories": json.dumps(list(owners)),
+            "eventra.phase.sha.backend": self.BACKEND_SHA,
+        }
+        if owners:
+            metadata["eventra.phase.evidence_comment_url"] = (
+                f"https://multica.example/comments/{comment_uuid}"
+            )
+        if pr:
+            metadata["eventra.phase.pr"] = self.BACKEND_PR
+        self.children.append(child)
+        self.metadata[identifier] = metadata
+
+    def authorize(self, bundle_digest, *, author_type="member", granted_round=3):
+        self.metadata["PRO-65"][
+            "eventra.workflow.repair_authorization_comment"
+        ] = self.AUTH_UUID
+        self.comments = [
+            {
+                "id": self.AUTH_UUID,
+                "author_type": author_type,
+                "content": json.dumps(
+                    {
+                        "bundle_digest": bundle_digest,
+                        "granted_round": granted_round,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
+        ]
+
+    @property
+    def mutation_calls(self):
+        return [
+            call
+            for call in self.calls
+            if call[:2] == ("issue", "create")
+            or call[:3] == ("issue", "metadata", "set")
+            or call[:3] == ("issue", "metadata", "delete")
+            or call[:2] == ("issue", "status")
+        ]
+
+    def _children_payload(self):
+        stages = []
+        for stage in sorted({child["stage"] for child in self.children}):
+            issues = [child for child in self.children if child["stage"] == stage]
+            stages.append(
+                {
+                    "stage": stage,
+                    "total": len(issues),
+                    "done": sum(child["status"] == "done" for child in issues),
+                    "issues": copy.deepcopy(issues),
+                }
+            )
+        return {"stages": stages, "total": len(self.children), "unstaged": []}
+
+    @staticmethod
+    def _flag(args, name):
+        return args[args.index(name) + 1]
+
+    def run(self, args, *, stdin_json=None):
+        if stdin_json is not None:
+            raise AssertionError("repair executor does not accept stdin JSON")
+        call = tuple(args)
+        self.calls.append(call)
+        if call[:2] == ("issue", "get"):
+            identifier = call[2]
+            if identifier == "PRO-65":
+                return copy.deepcopy(self.parent)
+            return copy.deepcopy(
+                next(child for child in self.children if child["identifier"] == identifier)
+            )
+        if call == ("issue", "children", "PRO-65", "--output", "json"):
+            return self._children_payload()
+        if call[:3] == ("issue", "metadata", "list"):
+            return copy.deepcopy(self.metadata[call[3]])
+        if call[:4] == ("issue", "comment", "list", "PRO-65"):
+            return copy.deepcopy(self.comments)
+        if call[:2] == ("issue", "create"):
+            if self.fail_once_create:
+                self.fail_once_create = False
+                raise RuntimeError("injected child create failure")
+            identifier = self._identifier()
+            child = raw_issue(
+                id=f"01a00000-0000-7000-8000-{self.next_child_number:012d}",
+                identifier=identifier,
+                parent_issue_id=PARENT_ID,
+                stage=int(self._flag(args, "--stage")),
+                status=self._flag(args, "--status"),
+                project_id=self._flag(args, "--project"),
+            )
+            self.children.append(child)
+            self.metadata[identifier] = {}
+            return copy.deepcopy(child)
+        if call[:3] == ("issue", "metadata", "set"):
+            identifier = call[3]
+            key = self._flag(args, "--key")
+            value = self._flag(args, "--value")
+            if identifier == "PRO-65" and key == self.fail_once_parent_key:
+                self.fail_once_parent_key = None
+                raise RuntimeError("injected parent metadata failure")
+            self.metadata[identifier][key] = value
+            return {"ok": True}
+        if call[:3] == ("issue", "metadata", "delete"):
+            identifier = call[3]
+            key = self._flag(args, "--key")
+            self.metadata[identifier].pop(key, None)
+            return {"ok": True}
+        if call[:2] == ("issue", "status"):
+            identifier = call[2]
+            status = call[3]
+            child = next(child for child in self.children if child["identifier"] == identifier)
+            child["status"] = status
+            return copy.deepcopy(child)
+        raise AssertionError(f"unsupported argv: {call!r}")
+
+
+class RepairExecutionTests(unittest.TestCase):
+    def test_parser_requires_the_exact_expected_repair_action(self):
+        args = build_workflow_parser().parse_args(
+            [
+                "execute-parent-repair",
+                "PRO-65",
+                "--expected-action-key",
+                "2:PRO-65:create_repair_stage:3:backend:-:" + "b" * 40,
+            ]
+        )
+
+        self.assertEqual(args.command, "execute-parent-repair")
+        self.assertEqual(args.parent, "PRO-65")
+        self.assertTrue(args.expected_action_key.startswith("2:PRO-65:"))
+
+    def _planned(self, *, attempt=2):
+        runner = FakeRepairRunner(attempt=attempt)
+        github = FakeRepairGitHubRunner()
+        snapshot = load_parent_snapshot(runner, github, "PRO-65")
+        provisional_bundle = _failure_bundle(
+            snapshot,
+            tuple(child for child in snapshot.children if child.stage == snapshot.next_stage - 1),
+        )
+        if attempt == 2:
+            runner.authorize(provisional_bundle["digest"])
+        snapshot = load_parent_snapshot(runner, github, "PRO-65")
+        decision = decide_parent_action(snapshot)
+        self.assertEqual(decision.kind, "create_repair_stage")
+        return runner, github, decision
+
+    def test_executor_replans_binds_consumes_and_replays_round_three_once(self):
+        runner, github, decision = self._planned()
+
+        first = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+        before_replay = len(runner.mutation_calls)
+        replay = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(first.next_action, "repair")
+        self.assertEqual(replay.next_action, "noop")
+        self.assertEqual(len(runner.mutation_calls), before_replay)
+        parent = runner.metadata["PRO-65"]
+        self.assertEqual(parent["eventra.workflow.attempt"], "3")
+        self.assertEqual(parent["eventra.workflow.next_stage"], "8")
+        self.assertEqual(parent["eventra.workflow.last_action"], decision.action_key)
+        self.assertNotIn(
+            "eventra.workflow.repair_authorization_comment",
+            parent,
+        )
+        self.assertEqual(
+            parent["eventra.workflow.repair_authorization_consumed"],
+            FakeRepairRunner.AUTH_UUID,
+        )
+        self.assertNotIn("eventra.workflow.repair_reservation", parent)
+        repairs = [child for child in runner.children if child["stage"] == 7]
+        self.assertEqual(len(repairs), 1)
+        self.assertEqual(repairs[0]["status"], "todo")
+        metadata = runner.metadata[repairs[0]["identifier"]]
+        self.assertEqual(metadata["eventra.repair.creation_action"], decision.action_key)
+        self.assertEqual(
+            metadata["eventra.repair.failure_bundle_digest"],
+            decision.failure_bundle["digest"],
+        )
+        self.assertEqual(
+            metadata["eventra.repair.authorizing_comment_uuid"],
+            FakeRepairRunner.AUTH_UUID,
+        )
+        self.assertEqual(metadata["eventra.repair.pull_request"], runner.BACKEND_PR)
+        create_call = next(
+            call for call in runner.calls if call[:2] == ("issue", "create")
+        )
+        self.assertIn("--assignee-id", create_call)
+        self.assertNotIn("--assignee", create_call)
+
+    def test_executor_is_the_exact_single_path_for_automatic_rounds_one_and_two(self):
+        for current_round in (0, 1):
+            with self.subTest(current_round=current_round):
+                runner, github, decision = self._planned(attempt=current_round)
+
+                result = execute_parent_repair(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+
+                self.assertEqual(result.next_action, "repair")
+                self.assertEqual(
+                    runner.metadata["PRO-65"]["eventra.workflow.attempt"],
+                    str(current_round + 1),
+                )
+                repair = next(
+                    child
+                    for child in runner.children
+                    if child["stage"] == {0: 3, 1: 5}[current_round]
+                )
+                self.assertEqual(
+                    runner.metadata[repair["identifier"]][
+                        "eventra.repair.authorizing_comment_uuid"
+                    ],
+                    "",
+                )
+
+    def test_executor_recovers_exact_reservation_after_partial_failure(self):
+        runner, github, decision = self._planned()
+        runner.fail_once_parent_key = "eventra.workflow.attempt"
+
+        interrupted = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+        self.assertEqual(interrupted.next_action, "block")
+        self.assertIn(
+            "eventra.workflow.repair_reservation",
+            runner.metadata["PRO-65"],
+        )
+
+        recovered = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(recovered.next_action, "repair")
+        self.assertNotIn(
+            "eventra.workflow.repair_reservation",
+            runner.metadata["PRO-65"],
+        )
+        self.assertEqual(
+            len([child for child in runner.children if child["stage"] == 7]),
+            1,
+        )
+
+    def test_executor_recovers_missing_owner_child_and_blocks_a_duplicate(self):
+        runner, github, decision = self._planned()
+        runner.fail_once_create = True
+
+        interrupted = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+        self.assertEqual(interrupted.next_action, "block")
+        self.assertEqual(
+            len([child for child in runner.children if child["stage"] == 7]),
+            0,
+        )
+
+        recovered = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+        self.assertEqual(recovered.next_action, "repair")
+        self.assertEqual(
+            len([child for child in runner.children if child["stage"] == 7]),
+            1,
+        )
+
+        runner, github, decision = self._planned()
+        runner.fail_once_parent_key = "eventra.workflow.attempt"
+        interrupted = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+        self.assertEqual(interrupted.next_action, "block")
+        original = next(child for child in runner.children if child["stage"] == 7)
+        duplicate = copy.deepcopy(original)
+        duplicate["identifier"] = runner._identifier()
+        duplicate["id"] = "01a00000-0000-7000-8000-000000000099"
+        runner.children.append(duplicate)
+        runner.metadata[duplicate["identifier"]] = copy.deepcopy(
+            runner.metadata[original["identifier"]]
+        )
+        before = len(runner.mutation_calls)
+
+        blocked = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(blocked.next_action, "block")
+        self.assertEqual(len(runner.mutation_calls), before)
+
+    def test_executor_blocks_conflicting_reservation_duplicate_child_and_drift(self):
+        runner, github, decision = self._planned()
+        runner.metadata["PRO-65"]["eventra.workflow.repair_reservation"] = json.dumps(
+            {
+                "action_key": "2:PRO-65:create_repair_stage:3:backend:-:"
+                + runner.BACKEND_SHA
+                + ":bundle:"
+                + "f" * 64,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        before = len(runner.mutation_calls)
+
+        conflict = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(conflict.next_action, "block")
+        self.assertEqual(len(runner.mutation_calls), before)
+
+        runner, github, decision = self._planned()
+        github.head_sha = "e" * 40
+        drift = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+        self.assertEqual(drift.next_action, "block")
+        self.assertEqual(runner.mutation_calls, [])
+
+
 class ParentSnapshotReadTests(unittest.TestCase):
+    def test_parent_authorization_comment_is_reread_from_the_parent_scoped_thread(self):
+        runner = FakeParentRunner()
+        comment_uuid = "00000000-0000-4000-8000-000000000061"
+        content = json.dumps(
+            {"bundle_digest": "a" * 64, "granted_round": 3},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        runner.metadata["PRO-35"][
+            "eventra.workflow.repair_authorization_comment"
+        ] = comment_uuid
+        runner.comment_records = [
+            {
+                "id": comment_uuid,
+                "author_type": "member",
+                "content": content,
+            }
+        ]
+
+        snapshot = load_parent_snapshot(runner, FakeGitHubRunner(), "PRO-35")
+
+        self.assertEqual(snapshot.authorization_comment_uuid, comment_uuid)
+        self.assertEqual(snapshot.authorizing_comment.author_type, "member")
+        self.assertIn(
+            (
+                "issue", "comment", "list", "PRO-35", "--thread",
+                comment_uuid, "--full", "--compact", "--output", "json",
+            ),
+            runner.calls,
+        )
+
+    def test_missing_or_wrong_parent_authorization_comment_fails_closed(self):
+        runner = FakeParentRunner()
+        comment_uuid = "00000000-0000-4000-8000-000000000061"
+        runner.metadata["PRO-35"][
+            "eventra.workflow.repair_authorization_comment"
+        ] = comment_uuid
+        runner.comment_records = [
+            {
+                "id": "00000000-0000-4000-8000-000000000099",
+                "author_type": "member",
+                "content": "{}",
+            }
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "malformed authorizing comment"):
+            load_parent_snapshot(runner, FakeGitHubRunner(), "PRO-35")
+
     def test_persisted_version_two_phase_ownership_is_semantically_validated(self):
         comment_uuid = "00000000-0000-4000-8000-000000000051"
         evidence_url = f"https://multica.example/comments/{comment_uuid}"

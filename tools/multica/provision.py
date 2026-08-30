@@ -56,6 +56,10 @@ MUTATION_COMMAND_PREFIXES = frozenset(
         ("autopilot", "update"),
         ("autopilot", "trigger-add"),
         ("autopilot", "trigger-update"),
+        ("issue", "create"),
+        ("issue", "metadata", "set"),
+        ("issue", "metadata", "delete"),
+        ("issue", "status"),
     }
 )
 READ_ONLY_COMMAND_PREFIXES = frozenset(
@@ -80,6 +84,7 @@ READ_ONLY_COMMAND_PREFIXES = frozenset(
         ("issue", "children"),
         ("issue", "runs"),
         ("issue", "metadata", "list"),
+        ("issue", "comment", "list"),
     }
 )
 
