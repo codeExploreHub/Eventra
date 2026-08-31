@@ -1,6 +1,7 @@
 """Behavior tests for deterministic Eventra Multica workflow transitions."""
 
 import copy
+import hashlib
 import io
 import json
 import unittest
@@ -3933,6 +3934,32 @@ class FakeRepairGitHubRunner:
         }
 
 
+class FakeCrossStackRepairGitHubRunner:
+    def __init__(self):
+        self.head_shas = {
+            FRONTEND_PR: FRONTEND_SHA,
+            FakeRepairRunner.BACKEND_PR: FakeRepairRunner.BACKEND_SHA,
+        }
+        self.calls = []
+
+    def run(self, args):
+        self.calls.append(tuple(args))
+        url = args[2] if len(args) > 2 else ""
+        if tuple(args) != (
+            "pr", "view", url,
+            "--json", "url,headRefOid,state,mergeable,mergeStateStatus,statusCheckRollup",
+        ) or url not in self.head_shas:
+            raise AssertionError(f"unsupported gh argv: {args!r}")
+        return {
+            "url": url,
+            "headRefOid": self.head_shas[url],
+            "state": "OPEN",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": [],
+        }
+
+
 class FakeRepairRunner:
     BACKEND_PR = "https://github.com/codeExploreHub/Eventra-Backend/pull/7"
     BACKEND_SHA = "b" * 40
@@ -4267,6 +4294,368 @@ class RepairExecutionTests(unittest.TestCase):
         decision = decide_parent_action(snapshot)
         self.assertEqual(decision.kind, "create_repair_stage")
         return runner, github, decision
+
+    @staticmethod
+    def _retarget_latest_child(
+        runner,
+        *,
+        repository,
+        project_id,
+        assignee_id,
+        creation_action=None,
+        target=None,
+        role=None,
+    ):
+        child = runner.children[-1]
+        metadata = runner.metadata[child["identifier"]]
+        metadata.pop("eventra.phase.sha.frontend", None)
+        metadata.pop("eventra.phase.sha.backend", None)
+        metadata[f"eventra.phase.sha.{repository}"] = (
+            FRONTEND_SHA if repository == "frontend" else runner.BACKEND_SHA
+        )
+        if metadata.get("eventra.phase.pr") is not None:
+            metadata["eventra.phase.pr"] = (
+                FRONTEND_PR if repository == "frontend" else runner.BACKEND_PR
+            )
+        if creation_action is not None:
+            metadata["eventra.phase.creation_action"] = creation_action
+        if target is not None:
+            metadata["eventra.phase.target"] = target
+        if role is not None:
+            metadata["eventra.phase.role"] = role
+        child["project_id"] = project_id
+        child["assignee_id"] = assignee_id
+        return child, metadata
+
+    def _planned_cross_stack_integration_failure(
+        self,
+        *,
+        attempt=2,
+        owners=("backend", "frontend"),
+    ):
+        runner = FakeRepairRunner(attempt=attempt)
+        runner.metadata["PRO-65"].update(
+            {
+                "eventra.workflow.classification": "cross-stack",
+                "eventra.workflow.frontend_sha": FRONTEND_SHA,
+            }
+        )
+        runner._add_done_child(1, "implementation", 0, result="pass", pr=True)
+        self._retarget_latest_child(
+            runner,
+            repository="frontend",
+            project_id=PROJECT_ID,
+            assignee_id=AGENT_ID,
+        )
+        gate_stage = {0: 2, 1: 4, 2: 6}[attempt]
+        gate_action = (
+            f"2:PRO-65:create_gate_stage:{attempt}:cross-stack:"
+            f"{FRONTEND_SHA}:{runner.BACKEND_SHA}:next-stage:{gate_stage}"
+        )
+        runner.metadata["PRO-65"]["eventra.workflow.last_action"] = gate_action
+        current = [child for child in runner.children if child["stage"] == gate_stage]
+        for child in current:
+            metadata = runner.metadata[child["identifier"]]
+            metadata["eventra.phase.creation_action"] = gate_action
+            metadata["eventra.phase.result"] = "pass"
+            metadata["eventra.phase.failure_repositories"] = "[]"
+            metadata.pop("eventra.phase.evidence_comment_url", None)
+
+        runner._add_done_child(
+            gate_stage,
+            "review",
+            attempt,
+            result="pass",
+            comment_uuid="00000000-0000-4000-8000-000000000064",
+        )
+        self._retarget_latest_child(
+            runner,
+            repository="frontend",
+            project_id=PROJECT_ID,
+            assignee_id=REVIEWER_ID,
+            creation_action=gate_action,
+            target="repository:frontend",
+            role="independent_reviewer",
+        )
+        runner._add_done_child(
+            gate_stage,
+            "qa",
+            attempt,
+            result="pass",
+            comment_uuid="00000000-0000-4000-8000-000000000065",
+        )
+        self._retarget_latest_child(
+            runner,
+            repository="frontend",
+            project_id=PROJECT_ID,
+            assignee_id=QA_ID,
+            creation_action=gate_action,
+            target="repository:frontend",
+            role="integration_qa",
+        )
+        integration_uuid = "00000000-0000-4000-8000-000000000066"
+        runner._add_done_child(
+            gate_stage,
+            "integration_qa",
+            attempt,
+            result="fail",
+            comment_uuid=integration_uuid,
+            owners=owners,
+        )
+        integration_child = runner.children[-1]
+        integration_metadata = runner.metadata[integration_child["identifier"]]
+        integration_metadata.update(
+            {
+                "eventra.phase.sha.frontend": FRONTEND_SHA,
+                "eventra.phase.sha.backend": runner.BACKEND_SHA,
+                "eventra.phase.failure_repositories": json.dumps(
+                    list(owners), separators=(",", ":")
+                ),
+                "eventra.phase.creation_action": gate_action,
+                "eventra.phase.target": "suite:integration",
+                "eventra.phase.role": "integration_qa",
+            }
+        )
+        integration_child["project_id"] = PROJECT_ID
+        integration_child["assignee_id"] = QA_ID
+        github = FakeCrossStackRepairGitHubRunner()
+        snapshot = load_parent_snapshot(runner, github, "PRO-65")
+        if attempt == 2:
+            provisional_bundle = _failure_bundle(
+                snapshot,
+                tuple(
+                    child
+                    for child in snapshot.children
+                    if child.stage == snapshot.next_stage - 1
+                ),
+            )
+            runner.authorize(provisional_bundle["digest"])
+            snapshot = load_parent_snapshot(runner, github, "PRO-65")
+        decision = decide_parent_action(snapshot)
+        self.assertEqual(decision.kind, "create_repair_stage")
+        return runner, github, decision, integration_uuid
+
+    @staticmethod
+    def _change_integration_suite(reservation, suite_key):
+        changed = copy.deepcopy(reservation)
+        failure = next(
+            item
+            for item in changed["failure_bundle"]["failures"]
+            if item["phase"] == "integration_qa"
+        )
+        failure["suite_key"] = suite_key
+        payload = dict(changed["failure_bundle"])
+        old_digest = payload.pop("digest")
+        new_digest = hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        changed["failure_bundle"]["digest"] = new_digest
+        changed["action_key"] = changed["action_key"].replace(
+            f":bundle:{old_digest}", f":bundle:{new_digest}"
+        )
+        return changed
+
+    def test_integration_failure_handoff_is_partitioned_and_suite_bound(self):
+        runner, _, decision, integration_uuid = (
+            self._planned_cross_stack_integration_failure()
+        )
+        snapshot = load_parent_snapshot(
+            runner, FakeCrossStackRepairGitHubRunner(), "PRO-65"
+        )
+        reservation = _build_repair_reservation(snapshot, decision)
+
+        self.assertEqual(
+            [spec["repository"] for spec in reservation["child_specs"]],
+            ["backend", "frontend"],
+        )
+        for spec in reservation["child_specs"]:
+            with self.subTest(repository=spec["repository"]):
+                rendered = workflow_module._render_repair_handoff(
+                    reservation, spec
+                )
+                self.assertIn("integration_qa |", rendered)
+                self.assertIn("suite=integration", rendered)
+                self.assertIn(integration_uuid, rendered)
+                self.assertEqual(spec["evidence_uuids"], [integration_uuid])
+
+        for malformed_suite in ("", "unknown", "suite:integration"):
+            with self.subTest(malformed_suite=malformed_suite):
+                malformed = self._change_integration_suite(
+                    reservation, malformed_suite
+                )
+                spec = malformed["child_specs"][0]
+                with self.assertRaisesRegex(RuntimeError, "failure identity"):
+                    workflow_module._render_repair_handoff(malformed, spec)
+
+    def test_execute_integration_failure_creates_exact_owner_repairs_all_rounds(self):
+        for attempt in (0, 1, 2):
+            with self.subTest(repair_round=attempt + 1):
+                runner, github, decision, integration_uuid = (
+                    self._planned_cross_stack_integration_failure(attempt=attempt)
+                )
+
+                result = execute_parent_repair(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+
+                self.assertEqual(result.next_action, "repair", result.reason)
+                created = [
+                    child
+                    for child in runner.children
+                    if child["stage"] == {0: 3, 1: 5, 2: 7}[attempt]
+                ]
+                self.assertEqual(len(created), 2)
+                for child in created:
+                    metadata = runner.metadata[child["identifier"]]
+                    self.assertEqual(
+                        metadata["eventra.repair.failure_evidence_uuids"],
+                        json.dumps([integration_uuid], separators=(",", ":")),
+                    )
+                    self.assertIn("suite=integration", child["description"])
+
+    def test_integration_failure_strict_owner_subset_creates_only_that_repair(self):
+        runner, github, decision, integration_uuid = (
+            self._planned_cross_stack_integration_failure(
+                attempt=0,
+                owners=("frontend",),
+            )
+        )
+
+        result = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(result.next_action, "repair", result.reason)
+        created = [child for child in runner.children if child["stage"] == 3]
+        self.assertEqual(len(created), 1)
+        metadata = runner.metadata[created[0]["identifier"]]
+        self.assertEqual(metadata["eventra.repair.repository"], "frontend")
+        self.assertEqual(
+            metadata["eventra.repair.failure_evidence_uuids"],
+            json.dumps([integration_uuid], separators=(",", ":")),
+        )
+
+    def test_mixed_failure_handoff_has_stable_review_qa_suite_order(self):
+        runner, github, _, _ = self._planned_cross_stack_integration_failure(
+            attempt=0
+        )
+        for child in runner.children:
+            metadata = runner.metadata[child["identifier"]]
+            if (
+                child["stage"] == 2
+                and metadata["eventra.phase.kind"] in {"review", "qa"}
+                and "eventra.phase.sha.backend" in metadata
+            ):
+                evidence_uuid = metadata["eventra.phase.evidence_comment"]
+                metadata.update(
+                    {
+                        "eventra.phase.result": "fail",
+                        "eventra.phase.failure_repositories": '["backend"]',
+                        "eventra.phase.evidence_comment_url": (
+                            f"https://multica.example/comments/{evidence_uuid}"
+                        ),
+                    }
+                )
+        snapshot = load_parent_snapshot(runner, github, "PRO-65")
+        decision = decide_parent_action(snapshot)
+        self.assertEqual(decision.kind, "create_repair_stage")
+        reservation = _build_repair_reservation(snapshot, decision)
+        backend_spec = next(
+            spec
+            for spec in reservation["child_specs"]
+            if spec["repository"] == "backend"
+        )
+
+        rendered = workflow_module._render_repair_handoff(
+            reservation, backend_spec
+        )
+
+        self.assertLess(rendered.index("review |"), rendered.index("qa |"))
+        self.assertLess(
+            rendered.index("qa |"), rendered.index("integration_qa |")
+        )
+
+    def test_integration_failure_malformed_authority_blocks_before_mutation(self):
+        cases = {
+            "missing suite": lambda runner, child, metadata: metadata.pop(
+                "eventra.phase.target"
+            ),
+            "malformed suite": lambda runner, child, metadata: metadata.__setitem__(
+                "eventra.phase.target", "suite:unknown"
+            ),
+            "unknown owner": lambda runner, child, metadata: metadata.__setitem__(
+                "eventra.phase.failure_repositories", '["frontend","unknown"]'
+            ),
+            "empty owners": lambda runner, child, metadata: metadata.__setitem__(
+                "eventra.phase.failure_repositories", "[]"
+            ),
+            "noncanonical evidence URL": lambda runner, child, metadata: metadata.__setitem__(
+                "eventra.phase.evidence_comment_url",
+                metadata["eventra.phase.evidence_comment_url"] + "?forged=1",
+            ),
+            "malformed evidence UUID": lambda runner, child, metadata: metadata.__setitem__(
+                "eventra.phase.evidence_comment", "not-a-uuid"
+            ),
+            "mixed duplicate evidence": lambda runner, child, metadata: self._make_duplicate_gate_evidence(
+                runner, metadata["eventra.phase.evidence_comment"]
+            ),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                runner, github, decision, _ = (
+                    self._planned_cross_stack_integration_failure(attempt=0)
+                )
+                integration = next(
+                    child
+                    for child in runner.children
+                    if runner.metadata[child["identifier"]]["eventra.phase.kind"]
+                    == "integration_qa"
+                )
+                metadata = runner.metadata[integration["identifier"]]
+                mutate(runner, integration, metadata)
+
+                result = execute_parent_repair(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+
+                self.assertEqual(result.next_action, "block")
+                self.assertEqual(result.mutation_count, 0)
+
+    @staticmethod
+    def _make_duplicate_gate_evidence(runner, evidence_uuid):
+        backend_qa = next(
+            child
+            for child in runner.children
+            if child["stage"] == 2
+            and runner.metadata[child["identifier"]]["eventra.phase.kind"] == "qa"
+            and "eventra.phase.sha.backend" in runner.metadata[child["identifier"]]
+        )
+        metadata = runner.metadata[backend_qa["identifier"]]
+        metadata.update(
+            {
+                "eventra.phase.result": "fail",
+                "eventra.phase.evidence_comment": evidence_uuid,
+                "eventra.phase.evidence_comment_url": (
+                    f"https://multica.example/comments/{evidence_uuid}"
+                ),
+                "eventra.phase.failure_repositories": '["backend"]',
+            }
+        )
 
     def test_executor_replans_binds_consumes_and_replays_round_three_once(self):
         runner, github, decision = self._planned()

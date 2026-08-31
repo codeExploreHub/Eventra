@@ -2436,11 +2436,14 @@ def _render_repair_handoff(
         if not isinstance(failure, dict) or set(failure) != expected_failure_keys:
             raise RuntimeError("repair handoff failure identity is malformed")
         owners = failure["responsible_repositories"]
+        phase = failure["phase"]
+        suite_key = failure["suite_key"]
         if (
             failure["candidate_shas"] != candidates
-            or failure["phase"] not in {"review", "qa"}
+            or phase not in {"review", "qa", "integration_qa"}
             or failure["result"] not in {"fail", "blocked"}
-            or type(failure["suite_key"]) is not str
+            or type(suite_key) is not str
+            or (phase == "integration_qa") != (suite_key == "integration")
             or failure["repair_round"] != validated["source_attempt"]
             or failure["stage_ordinal"] != bundle["source_stage_ordinal"]
             or type(failure["child_identifier"]) is not str
@@ -2455,13 +2458,16 @@ def _render_repair_handoff(
             or owners != sorted(owners)
             or len(owners) != len(set(owners))
             or not owners
+            or not set(owners) <= set(candidates)
         ):
             raise RuntimeError("repair handoff failure identity is malformed")
         if repository in owners:
             assigned.append(failure)
     assigned.sort(
         key=lambda item: (
-            {"review": 0, "qa": 1}[str(item["phase"])],
+            {"review": 0, "qa": 1, "integration_qa": 2}[
+                str(item["phase"])
+            ],
             str(item["suite_key"]),
             str(item["child_identifier"]),
             str(item["evidence_comment_uuid"]),
