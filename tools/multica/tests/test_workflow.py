@@ -637,87 +637,77 @@ class PhaseCompletionTests(unittest.TestCase):
 
                 self.assertEqual(runner.mutation_count, 0)
 
-        valid = FakeWorkflowRunner()
-        valid.issue["stage"] = 3
-        valid.parent_metadata.update(
-            {
-                "eventra.workflow.next_stage": "4",
-                "eventra.workflow.attempt": "1",
-                "eventra.workflow.last_action": action,
-            }
+        snapshot = ParentDecisionTests()._partial_cross_stack_repair_snapshot(
+            frontend_done=False,
+            backend_owned=False,
+            frontend_head="c" * 40,
         )
-        valid.metadata.update(provenance)
+        valid = FakeSnapshotFinishRunner(snapshot, "PRO-76")
+        github = FakeSnapshotGitHubRunner(snapshot.pull_requests)
+        immutable_before = {
+            key: value
+            for key, value in valid.metadata["PRO-76"].items()
+            if key.startswith("eventra.repair.")
+        }
 
-        result = finish_phase(valid, "PRO-36", repair)
+        with patch.object(
+            workflow_module,
+            "GitHubRunner",
+            return_value=github,
+        ):
+            result = finish_phase(valid, "PRO-76", repair)
 
         self.assertEqual(result.status, "done")
         self.assertEqual(
-            {key: valid.metadata[key] for key in repair_keys},
-            {key: provenance[key] for key in repair_keys},
+            {
+                key: value
+                for key, value in valid.metadata["PRO-76"].items()
+                if key.startswith("eventra.repair.")
+            },
+            immutable_before,
         )
 
     def test_finish_phase_replaces_seeded_repair_sha_once_without_rewriting_provenance(self):
         replacement_sha = "c" * 40
-        digest = "d" * 64
-        source_uuid = "00000000-0000-4000-8000-000000000071"
-        action = (
-            "2:PRO-35:create_repair_stage:1:frontend:"
-            + FRONTEND_SHA
-            + ":-:next-stage:3:source-stage:2:bundle:"
-            + digest
+        snapshot = ParentDecisionTests()._partial_cross_stack_repair_snapshot(
+            frontend_done=False,
+            backend_owned=False,
+            frontend_head=replacement_sha,
         )
-        runner = FakeWorkflowRunner()
-        runner.issue["stage"] = 3
-        runner.parent_metadata.update(
-            {
-                "eventra.workflow.next_stage": "4",
-                "eventra.workflow.attempt": "1",
-                "eventra.workflow.last_action": action,
-            }
-        )
-        provenance = {
-            "eventra.repair.creation_action": action,
-            "eventra.repair.failure_bundle_digest": digest,
-            "eventra.repair.failure_evidence_uuids": f'["{source_uuid}"]',
-            "eventra.repair.authorizing_comment_uuid": "",
-            "eventra.repair.repository": "frontend",
-            "eventra.repair.pull_request": FRONTEND_PR,
-            "eventra.repair.round": "1",
-            "eventra.repair.source_candidates": json.dumps(
-                {"frontend": FRONTEND_SHA},
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
+        runner = FakeSnapshotFinishRunner(snapshot, "PRO-76")
+        github = FakeSnapshotGitHubRunner(snapshot.pull_requests)
+        immutable_before = {
+            key: value
+            for key, value in runner.metadata["PRO-76"].items()
+            if key.startswith("eventra.repair.")
         }
-        runner.metadata.update(
-            {
-                "eventra.workflow.version": "2",
-                "eventra.phase.kind": "repair",
-                "eventra.phase.attempt": "1",
-                "eventra.phase.failure_repositories": "[]",
-                "eventra.phase.sha.frontend": FRONTEND_SHA,
-                "eventra.phase.pr": FRONTEND_PR,
-                **provenance,
-            }
-        )
 
-        result = finish_phase(
-            runner,
-            "PRO-36",
-            replace(
-                implementation_completion(kind="repair", attempt=1),
-                frontend_sha=replacement_sha,
-            ),
-        )
+        with patch.object(
+            workflow_module,
+            "GitHubRunner",
+            return_value=github,
+        ):
+            result = finish_phase(
+                runner,
+                "PRO-76",
+                replace(
+                    implementation_completion(kind="repair", attempt=1),
+                    frontend_sha=replacement_sha,
+                ),
+            )
 
         self.assertEqual(result.status, "done")
         self.assertEqual(
-            runner.metadata["eventra.phase.sha.frontend"],
+            runner.metadata["PRO-76"]["eventra.phase.sha.frontend"],
             replacement_sha,
         )
         self.assertEqual(
-            {key: runner.metadata[key] for key in provenance},
-            provenance,
+            {
+                key: value
+                for key, value in runner.metadata["PRO-76"].items()
+                if key.startswith("eventra.repair.")
+            },
+            immutable_before,
         )
 
     def test_finish_phase_rejects_conflicting_current_repair_provenance(self):
@@ -853,63 +843,40 @@ class PhaseCompletionTests(unittest.TestCase):
 
     def test_repair_pass_rejects_noop_sha_and_terminal_replay_is_exact(self):
         replacement_sha = "c" * 40
-        runner = FakeWorkflowRunner()
-        runner.issue["stage"] = 3
-        digest = "d" * 64
-        action = (
-            "2:PRO-35:create_repair_stage:1:frontend:"
-            + FRONTEND_SHA
-            + ":-:next-stage:3:source-stage:2:bundle:"
-            + digest
+        snapshot = ParentDecisionTests()._partial_cross_stack_repair_snapshot(
+            frontend_done=False,
+            backend_owned=False,
+            frontend_head=replacement_sha,
         )
-        runner.parent_metadata.update(
-            {
-                "eventra.workflow.next_stage": "4",
-                "eventra.workflow.attempt": "1",
-                "eventra.workflow.last_action": action,
-            }
-        )
-        runner.metadata.update(
-            {
-                "eventra.workflow.version": "2",
-                "eventra.phase.kind": "repair",
-                "eventra.phase.attempt": "1",
-                "eventra.phase.failure_repositories": "[]",
-                "eventra.phase.sha.frontend": FRONTEND_SHA,
-                "eventra.phase.pr": FRONTEND_PR,
-                "eventra.repair.creation_action": action,
-                "eventra.repair.failure_bundle_digest": digest,
-                "eventra.repair.failure_evidence_uuids": (
-                    '["00000000-0000-4000-8000-000000000071"]'
-                ),
-                "eventra.repair.authorizing_comment_uuid": "",
-                "eventra.repair.repository": "frontend",
-                "eventra.repair.pull_request": FRONTEND_PR,
-                "eventra.repair.round": "1",
-                "eventra.repair.source_candidates": json.dumps(
-                    {"frontend": FRONTEND_SHA},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-            }
-        )
+        runner = FakeSnapshotFinishRunner(snapshot, "PRO-76")
+        github = FakeSnapshotGitHubRunner(snapshot.pull_requests)
         noop = implementation_completion(kind="repair", attempt=1)
 
         with self.assertRaisesRegex(RuntimeError, "replacement SHA"):
-            finish_phase(runner, "PRO-36", noop)
+            finish_phase(runner, "PRO-76", noop)
         self.assertEqual(runner.mutation_count, 0)
 
         replacement = replace(noop, frontend_sha=replacement_sha)
-        finish_phase(runner, "PRO-36", replacement)
+        with patch.object(
+            workflow_module,
+            "GitHubRunner",
+            return_value=github,
+        ):
+            finish_phase(runner, "PRO-76", replacement)
         before_replay = runner.mutation_count
 
-        replay = finish_phase(runner, "PRO-36", replacement)
+        with patch.object(
+            workflow_module,
+            "GitHubRunner",
+            return_value=github,
+        ):
+            replay = finish_phase(runner, "PRO-76", replacement)
         self.assertEqual(replay.mutation_count, 0)
         self.assertEqual(runner.mutation_count, before_replay)
         with self.assertRaisesRegex(RuntimeError, "terminal phase metadata conflicts"):
             finish_phase(
                 runner,
-                "PRO-36",
+                "PRO-76",
                 replace(replacement, frontend_sha="e" * 40),
             )
         self.assertEqual(runner.mutation_count, before_replay)
@@ -1523,6 +1490,98 @@ class ParentDecisionTests(unittest.TestCase):
             decide_parent_action(unaffected_drift).kind,
             "block_parent",
         )
+
+    def test_source_equal_repair_completion_reads_every_managed_head(self):
+        backend_pr = "https://github.com/codeExploreHub/Eventra-Backend/pull/7"
+        for repair_round in (1, 2, 3):
+            with self.subTest(repair_round=repair_round):
+                snapshot = self._partial_cross_stack_repair_snapshot(
+                    repair_round=repair_round,
+                    frontend_done=False,
+                    backend_owned=False,
+                    frontend_head="c" * 40,
+                )
+                self.assertEqual(decide_parent_action(snapshot).kind, "noop")
+                runner = FakeSnapshotFinishRunner(snapshot, "PRO-76")
+                github = FakeSnapshotGitHubRunner(snapshot.pull_requests)
+
+                with patch.object(
+                    workflow_module,
+                    "GitHubRunner",
+                    return_value=github,
+                ):
+                    result = finish_phase(
+                        runner,
+                        "PRO-76",
+                        PhaseCompletion(
+                            kind="repair",
+                            result="pass",
+                            attempt=repair_round,
+                            evidence_comment=COMMENT_ID,
+                            frontend_sha="c" * 40,
+                            backend_sha=None,
+                            pr_url=FRONTEND_PR,
+                        ),
+                    )
+
+                self.assertEqual(
+                    (
+                        result.status,
+                        runner.mutation_count,
+                        frozenset(call[2] for call in github.calls),
+                    ),
+                    ("done", 9, frozenset((FRONTEND_PR, backend_pr))),
+                )
+
+    def test_source_equal_repair_completion_blocks_unaffected_head_drift(self):
+        backend_pr = "https://github.com/codeExploreHub/Eventra-Backend/pull/7"
+        for repair_round in (1, 2, 3):
+            with self.subTest(repair_round=repair_round):
+                snapshot = self._partial_cross_stack_repair_snapshot(
+                    repair_round=repair_round,
+                    frontend_done=False,
+                    backend_owned=False,
+                    frontend_head="c" * 40,
+                    backend_head="f" * 40,
+                )
+                self.assertEqual(
+                    decide_parent_action(snapshot).kind,
+                    "block_parent",
+                )
+                runner = FakeSnapshotFinishRunner(snapshot, "PRO-76")
+                github = FakeSnapshotGitHubRunner(snapshot.pull_requests)
+                error = None
+
+                with patch.object(
+                    workflow_module,
+                    "GitHubRunner",
+                    return_value=github,
+                ):
+                    try:
+                        finish_phase(
+                            runner,
+                            "PRO-76",
+                            PhaseCompletion(
+                                kind="repair",
+                                result="pass",
+                                attempt=repair_round,
+                                evidence_comment=COMMENT_ID,
+                                frontend_sha="c" * 40,
+                                backend_sha=None,
+                                pr_url=FRONTEND_PR,
+                            ),
+                        )
+                    except RuntimeError as problem:
+                        error = problem
+
+                self.assertEqual(
+                    (
+                        type(error),
+                        runner.mutation_count,
+                        frozenset(call[2] for call in github.calls),
+                    ),
+                    (RuntimeError, 0, frozenset((FRONTEND_PR, backend_pr))),
+                )
 
     def test_partial_repair_multiset_and_terminal_controls_remain_fail_closed(self):
         partial = self._partial_cross_stack_repair_snapshot()
@@ -3809,8 +3868,14 @@ class RepairExecutionTests(unittest.TestCase):
                     backend_sha=replacement_sha,
                     pr_url=runner.BACKEND_PR,
                 )
+                github.head_sha = replacement_sha
 
-                finished = finish_phase(runner, child_key, completion)
+                with patch.object(
+                    workflow_module,
+                    "GitHubRunner",
+                    return_value=github,
+                ):
+                    finished = finish_phase(runner, child_key, completion)
 
                 self.assertEqual(finished.status, "done")
                 self.assertEqual(
@@ -3830,7 +3895,6 @@ class RepairExecutionTests(unittest.TestCase):
                     runner.BACKEND_SHA,
                 )
 
-                github.head_sha = replacement_sha
                 before_copy = decide_parent_action(
                     load_parent_snapshot(runner, github, "PRO-65")
                 )

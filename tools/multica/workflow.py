@@ -3473,8 +3473,26 @@ def _finish_phase_authority_problem(
         }
         if (
             source_candidates == action_source_candidates
+            and parent_candidates == source_candidates
+        ):
+            local_problem = _repair_completion_provenance_problem(
+                metadata,
+                detail,
+                parent_metadata,
+                str(parent["identifier"]),
+                current_stage,
+                attempt,
+                value,
+            )
+            if local_problem is not None:
+                return local_problem
+        if (
+            source_candidates == action_source_candidates
             and set(parent_candidates) == set(source_candidates)
-            and parent_candidates != source_candidates
+            and (
+                detail["status"] != "done"
+                or parent_candidates != source_candidates
+            )
         ):
             try:
                 authoritative_repair_snapshot = load_parent_snapshot(
