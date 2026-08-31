@@ -898,6 +898,78 @@ def _repair_or_block(
     )
 
 
+def _repair_head_parent_problem(
+    snapshot: ParentSnapshot,
+    source_candidates: dict[str, str],
+    repairs: dict[str, PhaseSnapshot],
+    expected_repositories: set[str],
+    *,
+    allow_pending_parent_copy: bool = False,
+) -> str | None:
+    if (
+        not expected_repositories
+        or not expected_repositories.issubset(source_candidates)
+        or set(repairs) != expected_repositories
+    ):
+        return "current repair child multiset is incomplete or conflicting"
+    parent_candidates = _candidate_sha_map(snapshot)
+    observed_heads = {
+        item.repository: item.head_sha for item in snapshot.pull_requests
+    }
+    if (
+        len(snapshot.pull_requests) != len(source_candidates)
+        or set(observed_heads) != set(source_candidates)
+    ):
+        return "current managed pull-request identity set is incomplete"
+    replacement_candidates = dict(source_candidates)
+    allowed_partial_parent_values: dict[str, set[str]] = {
+        repository: {source_sha}
+        for repository, source_sha in source_candidates.items()
+    }
+    all_repairs_passed = True
+    for repository in sorted(source_candidates):
+        source_sha = source_candidates[repository]
+        head_sha = observed_heads[repository]
+        item = repairs.get(repository)
+        if item is None:
+            if head_sha != source_sha:
+                return "unaffected managed pull-request head changed during repair"
+            continue
+        phase_sha = (
+            item.frontend_sha
+            if repository == "frontend"
+            else item.backend_sha
+        )
+        if item.status == "done" and item.result == "pass":
+            if phase_sha is None or phase_sha == source_sha:
+                return "completed repair PASS did not produce a replacement SHA"
+            replacement_candidates[repository] = phase_sha
+            if head_sha != phase_sha:
+                return "completed repair replacement does not match its current head"
+            allowed_partial_parent_values[repository].add(phase_sha)
+        else:
+            all_repairs_passed = False
+            if phase_sha != source_sha:
+                return "nonpassing or active repair changed its seeded source SHA"
+            if item.status == "done" and head_sha != source_sha:
+                return "nonpassing repair changed its managed pull-request head"
+    if all_repairs_passed:
+        if observed_heads != replacement_candidates:
+            return "current managed pull-request heads do not match completed repair replacements"
+        if parent_candidates == source_candidates and allow_pending_parent_copy:
+            return None
+        if parent_candidates == source_candidates:
+            return "completed repair replacement awaits parent candidate metadata copy"
+        if parent_candidates != replacement_candidates:
+            return "parent candidate metadata does not match completed repair replacements"
+    elif set(parent_candidates) != set(source_candidates) or any(
+        parent_candidates[repository] not in allowed_values
+        for repository, allowed_values in allowed_partial_parent_values.items()
+    ):
+        return "parent candidate metadata changed before its repair completed"
+    return None
+
+
 def _current_repair_provenance_problem(
     snapshot: ParentSnapshot,
     phases: tuple[PhaseSnapshot, ...],
@@ -994,8 +1066,6 @@ def _current_repair_provenance_problem(
         str(spec["repository"]): spec for spec in specs
     }
     observed: dict[str, PhaseSnapshot] = {}
-    replacement_candidates = dict(source_candidates)
-    all_repairs_passed = True
     for item in phases:
         repository = item.repair_repository
         if repository in observed or repository not in expected_specs:
@@ -1024,67 +1094,13 @@ def _current_repair_provenance_problem(
             or not item.failure_evidence_uuids
         ):
             return "current repair child provenance is incomplete or conflicting"
-        phase_sha = (
-            item.frontend_sha
-            if repository == "frontend"
-            else item.backend_sha
-        )
-        if item.status == "done" and item.result == "pass":
-            if phase_sha == source_candidates[repository]:
-                return "completed repair PASS did not produce a replacement SHA"
-            replacement_candidates[repository] = str(phase_sha)
-        else:
-            all_repairs_passed = False
-            if phase_sha != source_candidates[repository]:
-                return "nonpassing or active repair changed its seeded source SHA"
         observed[repository] = item
-    if set(observed) != set(expected_specs):
-        return "current repair child multiset is incomplete or conflicting"
-    parent_candidates = _candidate_sha_map(snapshot)
-    observed_heads = {
-        item.repository: item.head_sha for item in snapshot.pull_requests
-    }
-    if (
-        len(snapshot.pull_requests) != len(source_candidates)
-        or set(observed_heads) != set(source_candidates)
-    ):
-        return "current managed pull-request identity set is incomplete"
-    allowed_partial_parent_values: dict[str, set[str]] = {
-        repository: {source_sha}
-        for repository, source_sha in source_candidates.items()
-    }
-    for repository, source_sha in source_candidates.items():
-        item = observed.get(repository)
-        head_sha = observed_heads[repository]
-        if item is None:
-            if head_sha != source_sha:
-                return "unaffected managed pull-request head changed during repair"
-            continue
-        phase_sha = (
-            item.frontend_sha
-            if repository == "frontend"
-            else item.backend_sha
-        )
-        if item.status == "done" and item.result == "pass":
-            if head_sha != phase_sha:
-                return "completed repair replacement does not match its current head"
-            allowed_partial_parent_values[repository].add(str(phase_sha))
-        elif item.status == "done" and head_sha != source_sha:
-            return "nonpassing repair changed its managed pull-request head"
-    if all_repairs_passed:
-        if observed_heads != replacement_candidates:
-            return "current managed pull-request heads do not match completed repair replacements"
-        if parent_candidates == source_candidates:
-            return "completed repair replacement awaits parent candidate metadata copy"
-        if parent_candidates != replacement_candidates:
-            return "parent candidate metadata does not match completed repair replacements"
-    else:
-        if set(parent_candidates) != set(source_candidates) or any(
-            parent_candidates[repository] not in allowed_values
-            for repository, allowed_values in allowed_partial_parent_values.items()
-        ):
-            return "parent candidate metadata changed before its repair completed"
-    return None
+    return _repair_head_parent_problem(
+        snapshot,
+        source_candidates,
+        observed,
+        set(expected_specs),
+    )
 
 
 def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
@@ -2113,41 +2129,27 @@ def _validate_repair_reservation(
             raise RuntimeError("reserved repair authorization was not consumed")
     elif authorization_uuid:
         raise RuntimeError("automatic repair cannot carry authorization")
-    expected_heads = dict(source_candidates)
-    allowed_parent_candidates = (source_candidates,)
     if committed_children is not None:
         expected_repositories = {
             str(spec["repository"]) for spec in reservation["child_specs"]
         }
-        if set(committed_children) != expected_repositories:
-            raise RuntimeError("recorded repair child multiset changed")
-        all_repairs_passed = True
-        for repository, child in committed_children.items():
-            if child.status == "done" and child.result == "pass":
-                replacement_sha = (
-                    child.frontend_sha
-                    if repository == "frontend"
-                    else child.backend_sha
-                )
-                if (
-                    replacement_sha is None
-                    or replacement_sha == source_candidates[repository]
-                ):
-                    raise RuntimeError(
-                        "recorded repair PASS lacks its exact replacement"
-                    )
-                expected_heads[repository] = replacement_sha
-            else:
-                all_repairs_passed = False
-        if all_repairs_passed:
-            allowed_parent_candidates = (source_candidates, expected_heads)
-    if _candidate_sha_map(snapshot) not in allowed_parent_candidates:
-        raise RuntimeError("reserved repair parent candidates changed")
-    observed_heads = {
-        item.repository: item.head_sha for item in snapshot.pull_requests
-    }
-    if observed_heads != expected_heads:
-        raise RuntimeError("pull-request head changed during repair execution")
+        problem = _repair_head_parent_problem(
+            snapshot,
+            source_candidates,
+            committed_children,
+            expected_repositories,
+            allow_pending_parent_copy=True,
+        )
+        if problem is not None:
+            raise RuntimeError(problem)
+    else:
+        if _candidate_sha_map(snapshot) != source_candidates:
+            raise RuntimeError("reserved repair parent candidates changed")
+        observed_heads = {
+            item.repository: item.head_sha for item in snapshot.pull_requests
+        }
+        if observed_heads != source_candidates:
+            raise RuntimeError("pull-request head changed during repair execution")
 
 
 def _repair_child_metadata(

@@ -184,7 +184,7 @@ class FakeWorkflowRunner:
 class FakeSnapshotFinishRunner:
     """Authoritative Multica reads for one snapshot-backed completion."""
 
-    def __init__(self, snapshot, target_key):
+    def __init__(self, snapshot, target_key, *, repair_replay=False):
         self.snapshot = snapshot
         self.target_key = target_key
         self.parent = raw_issue(
@@ -197,6 +197,7 @@ class FakeSnapshotFinishRunner:
         )
         self.issues = {}
         self.metadata = {}
+        self.runs = {}
         for index, item in enumerate(snapshot.children, start=100):
             issue_id = f"01a00000-0000-7000-8000-{index:012d}"
             self.issues[item.issue_key] = raw_issue(
@@ -262,6 +263,21 @@ class FakeSnapshotFinishRunner:
                     }
                 )
             self.metadata[item.issue_key] = metadata
+            self.runs[item.issue_key] = (
+                [
+                    {
+                        "id": f"run-{item.issue_key}",
+                        "issue_id": issue_id,
+                        "status": "running",
+                        "created_at": "2026-08-25T09:00:00Z",
+                        "dispatched_at": "2026-08-25T09:00:01Z",
+                        "started_at": "2026-08-25T09:00:02Z",
+                        "completed_at": None,
+                    }
+                ]
+                if item.status in {"todo", "in_progress", "in_review"}
+                else []
+            )
         self.parent_metadata = {
             "eventra.workflow.version": str(snapshot.workflow_version),
             "eventra.workflow.classification": snapshot.classification,
@@ -282,7 +298,75 @@ class FakeSnapshotFinishRunner:
             self.parent_metadata[
                 workflow_module.REPAIR_AUTHORIZATION_CONSUMED_KEY
             ] = snapshot.consumed_authorization_uuid
+        if repair_replay:
+            self._install_repair_replay_identity()
         self.calls = []
+
+    def _install_repair_replay_identity(self):
+        repairs = tuple(
+            item
+            for item in self.snapshot.children
+            if item.kind == "repair"
+            and item.creation_action == self.snapshot.last_action
+        )
+        action_next_stage, source_stage = (
+            workflow_module._repair_action_stage_identity(
+                self.snapshot.last_action
+            )
+        )
+        repair_round = repairs[0].repair_round
+        authorization_uuid = repairs[0].authorizing_comment_uuid
+        source_candidates = dict(repairs[0].repair_source_candidates)
+        source_snapshot = workflow_module._snapshot_with_candidates(
+            replace(
+                self.snapshot,
+                attempt=repair_round - 1,
+                next_stage=action_next_stage,
+                last_action=None,
+                authorization_comment_uuid="",
+                authorizing_comment=None,
+                repair_reservation=None,
+            ),
+            source_candidates,
+        )
+        source_phases = tuple(
+            item
+            for item in self.snapshot.children
+            if item.stage == source_stage
+        )
+        bundle = _failure_bundle(source_snapshot, source_phases)
+        reservation = workflow_module._decode_repair_reservation(
+            workflow_module._canonical_json(
+                {
+                    "action_key": self.snapshot.last_action,
+                    "authorizing_comment_uuid": authorization_uuid,
+                    "child_specs": _repair_child_specs(source_snapshot, bundle),
+                    "failure_bundle": bundle,
+                    "next_stage": action_next_stage,
+                    "parent_identifier": self.snapshot.identifier,
+                    "previous_last_action": "",
+                    "prior_consumed_authorization_uuid": "",
+                    "repair_round": repair_round,
+                    "source_attempt": repair_round - 1,
+                    "source_candidates": source_candidates,
+                }
+            )
+        )
+        specs = {
+            str(spec["repository"]): spec
+            for spec in reservation["child_specs"]
+        }
+        for repair in repairs:
+            spec = specs[repair.repair_repository]
+            issue = self.issues[repair.issue_key]
+            issue["title"] = workflow_module._repair_child_title(
+                reservation,
+                spec,
+            )
+            issue["description"] = workflow_module._render_repair_handoff(
+                reservation,
+                spec,
+            )
 
     @property
     def mutation_count(self):
@@ -340,6 +424,8 @@ class FakeSnapshotFinishRunner:
                 "--value",
             )
             return {"ok": True}
+        if call[:2] == ("issue", "runs"):
+            return copy.deepcopy(self.runs[call[2]])
         if call[:3] == ("issue", "status", self.target_key):
             self.issues[self.target_key]["status"] = call[3]
             return copy.deepcopy(self.issues[self.target_key])
@@ -4008,6 +4094,105 @@ class RepairExecutionTests(unittest.TestCase):
                 self.assertEqual(replay.next_action, "noop", replay.reason)
                 self.assertEqual(len(runner.mutation_calls), before_replay)
 
+    def test_partial_cross_stack_exact_action_replay_uses_planner_head_rules(self):
+        snapshots = ParentDecisionTests()
+        for repair_round in (1, 2, 3):
+            for parent_copied in (False, True):
+                for active_head in ("b" * 40, "e" * 40):
+                    with self.subTest(
+                        repair_round=repair_round,
+                        parent_copied=parent_copied,
+                        active_head=active_head,
+                    ):
+                        snapshot = snapshots._partial_cross_stack_repair_snapshot(
+                            repair_round=repair_round,
+                            backend_head=active_head,
+                            parent_frontend_sha=(
+                                "c" * 40 if parent_copied else FRONTEND_SHA
+                            ),
+                        )
+                        self.assertEqual(decide_parent_action(snapshot).kind, "noop")
+                        runner = FakeSnapshotFinishRunner(
+                            snapshot,
+                            "PRO-77",
+                            repair_replay=True,
+                        )
+                        github = FakeSnapshotGitHubRunner(snapshot.pull_requests)
+
+                        result = execute_parent_repair(
+                            runner,
+                            github,
+                            snapshot.identifier,
+                            expected_action_key=snapshot.last_action,
+                        )
+
+                        self.assertEqual(result.next_action, "noop", result.reason)
+                        self.assertEqual(result.mutation_count, 0)
+                        self.assertEqual(runner.mutation_count, 0)
+
+    def test_partial_cross_stack_exact_action_replay_blocks_head_provenance_drift(self):
+        snapshots = ParentDecisionTests()
+        for repair_round in (1, 2, 3):
+            valid = snapshots._partial_cross_stack_repair_snapshot(
+                repair_round=repair_round,
+            )
+            active_single_owner = snapshots._partial_cross_stack_repair_snapshot(
+                repair_round=repair_round,
+                frontend_done=False,
+                backend_owned=False,
+                frontend_head="e" * 40,
+            )
+            cases = {
+                "completed head mismatch": replace(
+                    valid,
+                    pull_requests=(
+                        replace(valid.pull_requests[0], head_sha="e" * 40),
+                        valid.pull_requests[1],
+                    ),
+                ),
+                "active owner adopted": replace(
+                    valid,
+                    candidate_backend_sha="e" * 40,
+                    pull_requests=(
+                        valid.pull_requests[0],
+                        replace(valid.pull_requests[1], head_sha="e" * 40),
+                    ),
+                ),
+                "unaffected head drift": replace(
+                    active_single_owner,
+                    pull_requests=(
+                        active_single_owner.pull_requests[0],
+                        replace(
+                            active_single_owner.pull_requests[1],
+                            head_sha="f" * 40,
+                        ),
+                    ),
+                ),
+            }
+            for label, snapshot in cases.items():
+                with self.subTest(repair_round=repair_round, case=label):
+                    self.assertEqual(
+                        decide_parent_action(snapshot).kind,
+                        "block_parent",
+                    )
+                    runner = FakeSnapshotFinishRunner(
+                        snapshot,
+                        "PRO-77",
+                        repair_replay=True,
+                    )
+                    github = FakeSnapshotGitHubRunner(snapshot.pull_requests)
+
+                    result = execute_parent_repair(
+                        runner,
+                        github,
+                        snapshot.identifier,
+                        expected_action_key=snapshot.last_action,
+                    )
+
+                    self.assertEqual(result.next_action, "block", result.reason)
+                    self.assertEqual(result.mutation_count, 0)
+                    self.assertEqual(runner.mutation_count, 0)
+
     def test_executor_recovers_exact_reservation_after_partial_failure(self):
         runner, github, decision = self._planned()
         runner.fail_once_parent_key = "eventra.workflow.attempt"
@@ -4453,7 +4638,7 @@ class RepairExecutionTests(unittest.TestCase):
             runner.metadata["PRO-65"],
         )
 
-    def test_replay_blocks_a_post_commit_pull_request_head_drift(self):
+    def test_replay_allows_active_owner_head_motion_without_adoption(self):
         runner, github, decision = self._planned()
         completed = execute_parent_repair(
             runner,
@@ -4471,7 +4656,12 @@ class RepairExecutionTests(unittest.TestCase):
             expected_action_key=decision.action_key,
         )
 
-        self.assertEqual(replay.next_action, "block")
+        self.assertEqual(replay.next_action, "noop", replay.reason)
+        self.assertEqual(replay.mutation_count, 0)
+        self.assertEqual(
+            runner.metadata["PRO-65"]["eventra.workflow.backend_sha"],
+            runner.BACKEND_SHA,
+        )
 
     def test_lost_acknowledgements_reconcile_and_report_observed_effects(self):
         cases = (
