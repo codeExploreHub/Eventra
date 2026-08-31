@@ -101,6 +101,14 @@ class FakeWorkflowRunner:
         self.corrupt_metadata_key = None
         self.inject_metadata_after_sets = None
         self.freeze_status = False
+        self.change_metadata_after_first_post_write_read = False
+        self.drift_parent_before_status = False
+        self.drift_child_before_status = False
+        self.drift_post_done_metadata = False
+        self.drift_post_done_detail = False
+        self._post_write_metadata_reads = 0
+        self._post_done_metadata_reads = 0
+        self._post_done_detail_reads = 0
 
     @property
     def mutation_count(self):
@@ -115,6 +123,13 @@ class FakeWorkflowRunner:
         call = tuple(args)
         self.calls.append(call)
         if call == ("issue", "get", "PRO-36", "--output", "json"):
+            if self.issue["status"] == "done":
+                self._post_done_detail_reads += 1
+                if (
+                    self.drift_post_done_detail
+                    and self._post_done_detail_reads >= 2
+                ):
+                    self.issue["status"] = "blocked"
             return copy.deepcopy(self.issue)
         if call == ("issue", "get", PARENT_ID, "--output", "json"):
             return copy.deepcopy(self.parent)
@@ -140,6 +155,29 @@ class FakeWorkflowRunner:
             "issue", "metadata", "list", "PRO-36", "--output", "json"
         ):
             value = copy.deepcopy(self.metadata)
+            after_writes = any(
+                previous[:3] == ("issue", "metadata", "set")
+                for previous in self.calls[:-1]
+            )
+            if after_writes and self.issue["status"] != "done":
+                self._post_write_metadata_reads += 1
+                if (
+                    self.change_metadata_after_first_post_write_read
+                    and self._post_write_metadata_reads >= 2
+                ):
+                    value["eventra.phase.result"] = "fail"
+                if self._post_write_metadata_reads >= 2:
+                    if self.drift_parent_before_status:
+                        self.parent_metadata["eventra.workflow.next_stage"] = "3"
+                    if self.drift_child_before_status:
+                        self.issue["stage"] = 2
+            if self.issue["status"] == "done":
+                self._post_done_metadata_reads += 1
+                if (
+                    self.drift_post_done_metadata
+                    and self._post_done_metadata_reads >= 2
+                ):
+                    value["eventra.phase.result"] = "fail"
             if self.corrupt_metadata_key is not None and any(
                 previous[:3] == ("issue", "metadata", "set")
                 for previous in self.calls[:-1]
@@ -638,11 +676,57 @@ class PhaseCompletionTests(unittest.TestCase):
         self.assertEqual(result.kind, "implementation")
         self.assertEqual(result.result, "pass")
         self.assertEqual(result.mutation_count, 9)
-        self.assertEqual(runner.calls[-2][0:3], ("issue", "status", "PRO-36"))
+        status_index = runner.calls.index(
+            (
+                "issue", "status", "PRO-36", "done", "--no-start", "--output", "json"
+            )
+        )
+        self.assertLess(status_index, len(runner.calls) - 2)
         self.assertEqual(
             runner.metadata["eventra.phase.result"],
             "pass",
         )
+        self.assertEqual(runner._post_write_metadata_reads, 2)
+        self.assertEqual(runner._post_done_metadata_reads, 2)
+        self.assertEqual(runner._post_done_detail_reads, 2)
+
+    def test_finish_phase_never_returns_done_after_write_boundary_drift(self):
+        cases = (
+            "metadata double-read",
+            "parent before status",
+            "child before status",
+            "metadata after done",
+            "detail after done",
+        )
+        for label in cases:
+            with self.subTest(label=label):
+                runner = FakeWorkflowRunner()
+                if label == "metadata double-read":
+                    runner.change_metadata_after_first_post_write_read = True
+                elif label == "parent before status":
+                    runner.drift_parent_before_status = True
+                elif label == "child before status":
+                    runner.drift_child_before_status = True
+                elif label == "metadata after done":
+                    runner.drift_post_done_metadata = True
+                else:
+                    runner.drift_post_done_detail = True
+
+                with self.assertRaises(RuntimeError):
+                    finish_phase(runner, "PRO-36", implementation_completion())
+
+                status_calls = tuple(
+                    call for call in runner.calls if call[:2] == ("issue", "status")
+                )
+                if label in {
+                    "metadata double-read",
+                    "parent before status",
+                    "child before status",
+                }:
+                    self.assertFalse(status_calls)
+                    self.assertNotEqual(runner.issue["status"], "done")
+                else:
+                    self.assertEqual(len(status_calls), 1)
 
     def test_finish_phase_rejects_noncurrent_stage_attempt_and_membership_without_mutation(self):
         cases = {

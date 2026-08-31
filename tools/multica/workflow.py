@@ -50,6 +50,13 @@ CONTROLLED_PHASE_KEYS = frozenset(
         "eventra.phase.failure_repositories",
     }
 )
+GATE_PROVENANCE_KEYS = frozenset(
+    {
+        "eventra.phase.creation_action",
+        "eventra.phase.target",
+        "eventra.phase.role",
+    }
+)
 REPAIR_RESERVATION_KEY = "eventra.workflow.repair_reservation"
 REPAIR_AUTHORIZATION_KEY = "eventra.workflow.repair_authorization_comment"
 REPAIR_AUTHORIZATION_CONSUMED_KEY = (
@@ -3776,6 +3783,49 @@ def _finish_phase_authority_problem(
     return None
 
 
+def _finish_parent_authority_envelope(
+    runner: MulticaRunner,
+    detail: dict[str, object],
+) -> tuple[dict[str, object], dict[str, str], tuple[dict[str, object], ...]]:
+    parent_id = str(detail["parent_issue_id"])
+    raw_parent = runner.run(["issue", "get", parent_id, "--output", "json"])
+    if not isinstance(raw_parent, dict) or type(raw_parent.get("identifier")) is not str:
+        raise RuntimeError("authoritative parent detail is malformed")
+    parent = parse_issue_detail(raw_parent, str(raw_parent["identifier"]))
+    parent_metadata = parse_issue_metadata(
+        runner.run(
+            [
+                "issue",
+                "metadata",
+                "list",
+                str(parent["identifier"]),
+                "--output",
+                "json",
+            ]
+        )
+    )
+    children = parse_issue_children(
+        runner.run(
+            [
+                "issue",
+                "children",
+                str(parent["identifier"]),
+                "--output",
+                "json",
+            ]
+        ),
+        str(parent["id"]),
+    )
+    return parent, parent_metadata, children
+
+
+def _controlled_phase_authority(metadata: dict[str, str]) -> dict[str, str]:
+    authority_keys = CONTROLLED_PHASE_KEYS | GATE_PROVENANCE_KEYS | REPAIR_PROVENANCE_KEYS
+    return {
+        key: item for key, item in metadata.items() if key in authority_keys
+    }
+
+
 def finish_phase(
     runner: MulticaRunner,
     issue_key: str,
@@ -3824,6 +3874,7 @@ def finish_phase(
         raise RuntimeError("phase issue is not mutable")
     if controlled_before.get("eventra.workflow.version") == "1":
         raise RuntimeError("version 1 workflow requires explicit migration")
+    authority_envelope = _finish_parent_authority_envelope(runner, detail)
     authority_problem = _finish_phase_authority_problem(
         runner,
         detail,
@@ -3832,6 +3883,8 @@ def finish_phase(
     )
     if authority_problem is not None:
         raise RuntimeError(authority_problem)
+    if _finish_parent_authority_envelope(runner, detail) != authority_envelope:
+        raise RuntimeError("phase authority changed before metadata mutation")
     allowed_replacement_key = (
         f"eventra.phase.sha.{before['eventra.repair.repository']}"
         if value.kind == "repair" and value.result == "pass"
@@ -3861,14 +3914,33 @@ def finish_phase(
                 "json",
             ]
         )
-    observed = parse_issue_metadata(
-        runner.run(["issue", "metadata", "list", issue_key, "--output", "json"])
+    expected_authority = _controlled_phase_authority(before)
+    expected_authority.update(wanted)
+    observed_authorities = tuple(
+        _controlled_phase_authority(
+            parse_issue_metadata(
+                runner.run(
+                    [
+                        "issue",
+                        "metadata",
+                        "list",
+                        issue_key,
+                        "--output",
+                        "json",
+                    ]
+                )
+            )
+        )
+        for _ in range(2)
     )
-    controlled_observed = {
-        key: item for key, item in observed.items() if key in CONTROLLED_PHASE_KEYS
-    }
-    if controlled_observed != wanted:
+    if (
+        observed_authorities[0] != expected_authority
+        or observed_authorities[1] != expected_authority
+        or observed_authorities[0] != observed_authorities[1]
+    ):
         raise RuntimeError("phase metadata reconciliation failed")
+    if _finish_parent_authority_envelope(runner, detail) != authority_envelope:
+        raise RuntimeError("phase authority changed before terminal transition")
     runner.run(
         [
             "issue",
@@ -3880,12 +3952,36 @@ def finish_phase(
             "json",
         ]
     )
-    final = parse_issue_detail(
-        runner.run(["issue", "get", issue_key, "--output", "json"]),
-        issue_key,
+    final_observations = tuple(
+        (
+            parse_issue_detail(
+                runner.run(["issue", "get", issue_key, "--output", "json"]),
+                issue_key,
+            ),
+            _controlled_phase_authority(
+                parse_issue_metadata(
+                    runner.run(
+                        [
+                            "issue",
+                            "metadata",
+                            "list",
+                            issue_key,
+                            "--output",
+                            "json",
+                        ]
+                    )
+                )
+            ),
+        )
+        for _ in range(2)
     )
-    if final["status"] != "done":
+    if (
+        final_observations[0] != final_observations[1]
+        or final_observations[0][0]["status"] != "done"
+        or final_observations[0][1] != expected_authority
+    ):
         raise RuntimeError("phase completion failed")
+    final = final_observations[0][0]
     return PhaseResult(
         str(final["id"]),
         issue_key,
