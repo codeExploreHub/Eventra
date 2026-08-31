@@ -46,6 +46,9 @@ ISSUE_ID = "01a00000-0000-7000-8000-000000000002"
 PARENT_ID = "01a00000-0000-7000-8000-000000000001"
 AGENT_ID = "00000000-0000-4000-8000-000000000004"
 PROJECT_ID = "00000000-0000-4000-8000-000000000003"
+BACKEND_PROJECT_ID = "00000000-0000-4000-8000-000000000013"
+REVIEWER_ID = "00000000-0000-4000-8000-000000000014"
+QA_ID = "00000000-0000-4000-8000-000000000015"
 COMMENT_ID = "01a00000-0000-7000-8000-000000000010"
 FRONTEND_SHA = "a" * 40
 FRONTEND_PR = "https://github.com/codeExploreHub/Eventra/pull/6"
@@ -238,7 +241,8 @@ class FakeSnapshotFinishRunner:
             if item.pr_url:
                 metadata["eventra.phase.pr"] = item.pr_url
             if item.creation_action:
-                metadata.update(
+                if item.kind == "repair":
+                    metadata.update(
                     {
                         "eventra.repair.creation_action": item.creation_action,
                         "eventra.repair.failure_bundle_digest": (
@@ -261,7 +265,15 @@ class FakeSnapshotFinishRunner:
                             separators=(",", ":"),
                         ),
                     }
-                )
+                    )
+                else:
+                    metadata.update(
+                        {
+                            "eventra.phase.creation_action": item.creation_action,
+                            "eventra.phase.target": item.phase_target,
+                            "eventra.phase.role": item.phase_role,
+                        }
+                    )
             self.metadata[item.issue_key] = metadata
             self.runs[item.issue_key] = (
                 [
@@ -662,6 +674,105 @@ class PhaseCompletionTests(unittest.TestCase):
                 self.assertEqual(runner.mutation_count, 0)
                 self.assertEqual(runner.issue["status"], "in_review")
 
+    def test_finish_phase_rejects_wrong_current_gate_authority_without_mutation(self):
+        review = phase(
+            "PRO-36",
+            2,
+            "review",
+            result=None,
+            status="in_review",
+        )
+        qa = phase(
+            "PRO-38",
+            2,
+            "qa",
+            evidence_comment="00000000-0000-4000-8000-000000000032",
+        )
+        valid = parent_snapshot(children=(review, qa))
+        target = valid.children[0]
+        corruptions = {
+            "creation action": replace(target, creation_action="forged"),
+            "target": replace(target, phase_target="repository:backend"),
+            "role": replace(target, phase_role="integration_qa"),
+            "project": replace(
+                target,
+                project_id="00000000-0000-4000-8000-000000000099",
+            ),
+            "assignee": replace(target, assignee_id=valid.children[1].assignee_id),
+            "candidate": replace(target, frontend_sha="c" * 40),
+        }
+        completion = PhaseCompletion(
+            kind="review",
+            result="pass",
+            attempt=0,
+            evidence_comment="00000000-0000-4000-8000-000000000031",
+            frontend_sha=FRONTEND_SHA,
+            backend_sha=None,
+            pr_url=None,
+        )
+        for label, corrupt in corruptions.items():
+            with self.subTest(label=label):
+                snapshot = replace(
+                    valid,
+                    children=(corrupt, *valid.children[1:]),
+                )
+                runner = FakeSnapshotFinishRunner(snapshot, "PRO-36")
+                with self.assertRaises(RuntimeError):
+                    finish_phase(runner, "PRO-36", completion)
+                self.assertEqual(runner.mutation_count, 0)
+        runner = FakeSnapshotFinishRunner(valid, "PRO-36")
+        result = finish_phase(runner, "PRO-36", completion)
+        self.assertEqual(result.status, "done")
+
+    def test_finish_phase_accepts_valid_repository_qa_and_integration_suite(self):
+        backend_sha = "b" * 40
+        templates = (
+            phase("PRO-36", 2, "review", evidence_comment="00000000-0000-4000-8000-000000000031"),
+            phase("PRO-37", 2, "qa", evidence_comment="00000000-0000-4000-8000-000000000032"),
+            phase("PRO-38", 2, "review", frontend_sha=None, backend_sha=backend_sha, evidence_comment="00000000-0000-4000-8000-000000000033"),
+            phase("PRO-39", 2, "qa", frontend_sha=None, backend_sha=backend_sha, evidence_comment="00000000-0000-4000-8000-000000000034"),
+            phase("PRO-40", 2, "integration_qa", backend_sha=backend_sha, evidence_comment="00000000-0000-4000-8000-000000000035"),
+        )
+        completions = {
+            "PRO-37": PhaseCompletion(
+                "qa", "pass", 0,
+                "00000000-0000-4000-8000-000000000032",
+                FRONTEND_SHA, None, None,
+            ),
+            "PRO-40": PhaseCompletion(
+                "integration_qa", "pass", 0,
+                "00000000-0000-4000-8000-000000000035",
+                FRONTEND_SHA, backend_sha, None,
+            ),
+        }
+        for target_key, completion in completions.items():
+            with self.subTest(kind=completion.kind):
+                children = tuple(
+                    replace(item, result=None, status="in_review")
+                    if item.issue_key == target_key
+                    else item
+                    for item in templates
+                )
+                snapshot = parent_snapshot(
+                    classification="cross-stack",
+                    candidate_backend_sha=backend_sha,
+                    children=children,
+                    pull_requests=(
+                        frontend_pr(),
+                        PullRequestSnapshot(
+                            "backend",
+                            "https://github.com/codeExploreHub/Eventra-Backend/pull/7",
+                            backend_sha,
+                            "open", True, True,
+                        ),
+                    ),
+                )
+                runner = FakeSnapshotFinishRunner(snapshot, target_key)
+                self.assertEqual(
+                    finish_phase(runner, target_key, completion).status,
+                    "done",
+                )
+
     def test_finish_phase_requires_and_preserves_current_repair_provenance(self):
         digest = "d" * 64
         source_uuid = "00000000-0000-4000-8000-000000000071"
@@ -986,8 +1097,6 @@ class PhaseCompletionTests(unittest.TestCase):
     def test_finish_phase_accepts_each_valid_current_nonrepair_kind(self):
         completions = (
             implementation_completion(),
-            implementation_completion(kind="review", pr_url=None),
-            implementation_completion(kind="qa", pr_url=None),
             implementation_completion(kind="smoke", pr_url=None),
         )
         for completion in completions:
@@ -1169,6 +1278,8 @@ def phase(
     assignee_id="",
     status="done",
     creation_action="",
+    phase_target="",
+    phase_role="",
     failure_bundle_digest="",
     failure_evidence_uuids=(),
     authorizing_comment_uuid="",
@@ -1194,6 +1305,8 @@ def phase(
         pr_url=pr_url,
         assignee_id=assignee_id,
         creation_action=creation_action,
+        phase_target=phase_target,
+        phase_role=phase_role,
         failure_bundle_digest=failure_bundle_digest,
         failure_evidence_uuids=failure_evidence_uuids,
         authorizing_comment_uuid=authorizing_comment_uuid,
@@ -1237,6 +1350,62 @@ def parent_snapshot(**overrides):
             (child.stage for child in values["children"]),
             default=0,
         ) + 1
+    current_stage = values["next_stage"] - 1
+    current = tuple(
+        child for child in values["children"] if child.stage == current_stage
+    )
+    if current and {child.kind for child in current} <= {
+        "review", "qa", "integration_qa"
+    }:
+        action_snapshot = ParentSnapshot(**values)
+        action = _action_key(
+            replace(action_snapshot, next_stage=current_stage, last_action=None),
+            "create_gate_stage",
+            values["attempt"],
+        )
+        if "last_action" not in overrides:
+            values["last_action"] = action
+        enriched = []
+        for child in values["children"]:
+            if child.stage != current_stage:
+                enriched.append(child)
+                continue
+            repositories = tuple(
+                repository
+                for repository, sha in (
+                    ("frontend", child.frontend_sha),
+                    ("backend", child.backend_sha),
+                )
+                if sha is not None
+            )
+            if child.kind in {"review", "qa"} and len(repositories) == 1:
+                repository = repositories[0]
+                role = (
+                    "independent_reviewer"
+                    if child.kind == "review"
+                    else "integration_qa"
+                )
+                target = f"repository:{repository}"
+                project_id = (
+                    PROJECT_ID if repository == "frontend" else BACKEND_PROJECT_ID
+                )
+            else:
+                role = "integration_qa"
+                target = "suite:integration"
+                project_id = PROJECT_ID
+            enriched.append(
+                replace(
+                    child,
+                    creation_action=child.creation_action or action,
+                    phase_target=child.phase_target or target,
+                    phase_role=child.phase_role or role,
+                    project_id=child.project_id or project_id,
+                    assignee_id=child.assignee_id or (
+                        REVIEWER_ID if role == "independent_reviewer" else QA_ID
+                    ),
+                )
+            )
+        values["children"] = tuple(enriched)
     return ParentSnapshot(**values)
 
 
@@ -1530,7 +1699,6 @@ class ParentDecisionTests(unittest.TestCase):
                     decide_parent_action(changed).kind,
                     "block_parent",
                 )
-
     def test_partial_repair_allows_active_head_motion_but_not_early_adoption(self):
         for repair_round in (1, 2, 3):
             for active_head in ("b" * 40, "e" * 40, "f" * 40):
@@ -2005,6 +2173,7 @@ class ParentDecisionTests(unittest.TestCase):
             ),
             phase(
                 "PRO-62", 2, "review", result="fail",
+                frontend_sha=None,
                 backend_sha=backend_sha,
                 evidence_comment=review_uuid,
                 responsible_repositories=("backend",),
@@ -2013,6 +2182,7 @@ class ParentDecisionTests(unittest.TestCase):
             ),
             phase(
                 "PRO-63", 2, "qa",
+                frontend_sha=None,
                 backend_sha=backend_sha,
                 evidence_comment=qa_uuid,
                 project_id=frontend_project,
@@ -2437,6 +2607,11 @@ class ParentDecisionTests(unittest.TestCase):
                 backend_sha=backend_sha,
                 evidence_comment=backend_qa_uuid,
             ),
+            phase(
+                "PRO-45", 2, "integration_qa",
+                backend_sha=backend_sha,
+                evidence_comment="00000000-0000-4000-8000-000000000085",
+            ),
         )
         pull_requests = (
             frontend_pr(),
@@ -2541,6 +2716,11 @@ class ParentDecisionTests(unittest.TestCase):
                 frontend_sha=None,
                 backend_sha=backend_sha,
                 evidence_comment="00000000-0000-4000-8000-000000000094",
+            ),
+            phase(
+                "PRO-78", 2, "integration_qa",
+                backend_sha=backend_sha,
+                evidence_comment="00000000-0000-4000-8000-000000000095",
             ),
         )
         source_prs = (
@@ -2842,8 +3022,86 @@ class ParentDecisionTests(unittest.TestCase):
                     }
                 )
             ).kind,
-            "merge",
+            "block_parent",
         )
+
+    def test_cross_stack_gate_membership_is_typed_not_sha_expanded(self):
+        backend_sha = "b" * 40
+        backend_pr = PullRequestSnapshot(
+            repository="backend",
+            url="https://github.com/codeExploreHub/Eventra-Backend/pull/7",
+            head_sha=backend_sha,
+            state="open",
+            mergeable=True,
+            checks_pass=True,
+        )
+        combined = (
+            phase("PRO-60", 2, "review", backend_sha=backend_sha),
+            phase("PRO-61", 2, "qa", backend_sha=backend_sha),
+        )
+        invalid = parent_snapshot(
+            classification="cross-stack",
+            candidate_backend_sha=backend_sha,
+            children=combined,
+            pull_requests=(frontend_pr(), backend_pr),
+        )
+        self.assertEqual(decide_parent_action(invalid).kind, "block_parent")
+
+        legal = (
+            phase("PRO-60", 2, "review"),
+            phase("PRO-61", 2, "qa"),
+            phase(
+                "PRO-62", 2, "review",
+                frontend_sha=None,
+                backend_sha=backend_sha,
+            ),
+            phase(
+                "PRO-63", 2, "qa",
+                frontend_sha=None,
+                backend_sha=backend_sha,
+            ),
+            phase("PRO-64", 2, "integration_qa", backend_sha=backend_sha),
+        )
+        valid = parent_snapshot(
+            classification="cross-stack",
+            candidate_backend_sha=backend_sha,
+            children=legal,
+            pull_requests=(frontend_pr(), backend_pr),
+        )
+        self.assertEqual(decide_parent_action(valid).kind, "merge")
+
+    def test_current_gate_provenance_rejects_wrong_authority(self):
+        valid = parent_snapshot(
+            children=(
+                phase("PRO-37", 2, "review"),
+                phase("PRO-38", 2, "qa"),
+            )
+        )
+        self.assertEqual(decide_parent_action(valid).kind, "merge")
+        current = valid.children
+        corruptions = {
+            "creation action": replace(current[0], creation_action="forged"),
+            "target": replace(current[0], phase_target="repository:backend"),
+            "role": replace(current[0], phase_role="integration_qa"),
+            "project": replace(
+                current[0],
+                project_id="00000000-0000-4000-8000-000000000099",
+            ),
+            "assignee": replace(current[0], assignee_id=current[1].assignee_id),
+        }
+        for label, corrupt in corruptions.items():
+            with self.subTest(label=label):
+                self.assertEqual(
+                    decide_parent_action(
+                        replace(valid, children=(corrupt, *current[1:]))
+                    ).kind,
+                    "block_parent",
+                )
+        self.assertEqual(
+            decide_parent_action(replace(valid, last_action="forged")).kind,
+            "block_parent",
+        )
+
 
     def test_partial_merge_blocks_while_merged_state_routes_smoke_then_done(self):
         self.assertEqual(
@@ -3637,6 +3895,10 @@ class FakeRepairRunner:
         if attempt >= 2:
             self._add_done_child(5, "repair", 2, result="pass", pr=True)
         gate_stage = {0: 2, 1: 4, 2: 6}[attempt]
+        self.metadata["PRO-65"]["eventra.workflow.last_action"] = (
+            f"2:PRO-65:create_gate_stage:{attempt}:backend:-:"
+            f"{self.BACKEND_SHA}:next-stage:{gate_stage}"
+        )
         self._add_done_child(
             gate_stage,
             "review",
@@ -3677,6 +3939,9 @@ class FakeRepairRunner:
             stage=stage,
             status="done",
             project_id="00000000-0000-4000-8000-000000000040",
+            assignee_id=(
+                REVIEWER_ID if kind == "review" else QA_ID
+            ),
         )
         comment_uuid = comment_uuid or f"00000000-0000-4000-8000-{self.next_child_number:012d}"
         metadata = {
@@ -3694,6 +3959,21 @@ class FakeRepairRunner:
             )
         if pr:
             metadata["eventra.phase.pr"] = self.BACKEND_PR
+        if kind in {"review", "qa"}:
+            metadata.update(
+                {
+                    "eventra.phase.creation_action": (
+                        f"2:PRO-65:create_gate_stage:{attempt}:backend:-:"
+                        f"{self.BACKEND_SHA}:next-stage:{stage}"
+                    ),
+                    "eventra.phase.target": "repository:backend",
+                    "eventra.phase.role": (
+                        "independent_reviewer"
+                        if kind == "review"
+                        else "integration_qa"
+                    ),
+                }
+            )
         self.children.append(child)
         self.metadata[identifier] = metadata
 

@@ -86,8 +86,13 @@ Use the current `eventra.workflow.next_stage`; never reuse a Stage number.
 Deduplicate using `eventra.workflow.last_action`. Create and verify the full
 next barrier group, then advance `next_stage` and record `last_action`.
 
-- `create_gate_stage`: create one Reviewer child per affected repository and
-  Integration QA for the same exact SHA set in one new Stage.
+- `create_gate_stage`: create one single-repository Reviewer child and one
+  single-repository QA child per affected repository, plus one independent
+  `integration_qa` suite child for a cross-stack exact SHA pair, in one new
+  Stage. Persist the exact parent action as `eventra.phase.creation_action`,
+  the typed `repository:NAME` or `suite:integration` target as
+  `eventra.phase.target`, and the assigned `independent_reviewer` or
+  `integration_qa` role as `eventra.phase.role` before starting any child.
 - `create_repair_stage`: Delivery Lead validates the Core decision and uses its
   exact returned immutable FailureBundle and digest without reconstruction. The
   bundle contains the parent/stage/action identity, exact candidate SHA map,

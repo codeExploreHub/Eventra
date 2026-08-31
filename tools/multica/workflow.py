@@ -27,7 +27,9 @@ from .issue_contracts import (
 from .provision import MulticaRunner
 
 
-PHASE_KINDS = frozenset({"implementation", "review", "qa", "repair", "smoke"})
+PHASE_KINDS = frozenset(
+    {"implementation", "review", "qa", "integration_qa", "repair", "smoke"}
+)
 PHASE_RESULTS = frozenset({"pass", "fail", "blocked"})
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 ISSUE_KEY_PATTERN = re.compile(r"[A-Z][A-Z0-9]*-[1-9][0-9]*\Z")
@@ -76,7 +78,9 @@ REPAIR_PROVENANCE_KEYS = frozenset(
 
 @dataclass(frozen=True)
 class PhaseCompletion:
-    kind: Literal["implementation", "review", "qa", "repair", "smoke"]
+    kind: Literal[
+        "implementation", "review", "qa", "integration_qa", "repair", "smoke"
+    ]
     result: Literal["pass", "fail", "blocked"]
     attempt: int
     evidence_comment: str
@@ -120,6 +124,8 @@ class PhaseSnapshot:
     evidence_comment_url: str | None = None
     project_id: str = ""
     creation_action: str = ""
+    phase_target: str = ""
+    phase_role: str = ""
     failure_bundle_digest: str = ""
     failure_evidence_uuids: tuple[str, ...] = ()
     authorizing_comment_uuid: str = ""
@@ -334,7 +340,7 @@ def _valid_phase_ownership(
     evidence_comment_url: str | None,
 ) -> bool:
     owners = set(responsible_repositories)
-    if kind not in {"review", "qa"}:
+    if kind not in {"review", "qa", "integration_qa"}:
         return not owners and evidence_comment_url is None
     if result == "pass":
         return not owners and evidence_comment_url is None
@@ -346,7 +352,11 @@ def _valid_phase_ownership(
         or not _is_canonical_evidence_url(evidence_comment_url)
     ):
         return False
-    return len(phase_repositories) > 1 or owners == phase_repositories
+    if kind == "review":
+        return len(phase_repositories) == 1 and owners == phase_repositories
+    if kind == "qa":
+        return len(phase_repositories) > 1 or owners == phase_repositories
+    return len(phase_repositories) > 1
 
 
 def build_phase_metadata(value: PhaseCompletion) -> dict[str, str]:
@@ -399,6 +409,14 @@ def build_phase_metadata(value: PhaseCompletion) -> dict[str, str]:
         )
         if sha is not None
     }
+    if (
+        value.kind == "review"
+        and len(phase_repositories) != 1
+    ) or (
+        value.kind == "integration_qa"
+        and len(phase_repositories) < 2
+    ):
+        _invalid_completion()
     if not _valid_phase_ownership(
         value.kind,
         value.result,
@@ -656,14 +674,64 @@ def _attempt_history_is_consistent(snapshot: ParentSnapshot) -> bool:
     return repair_attempts == set(range(1, snapshot.attempt + 1))
 
 
-def _gate_coverage(snapshot: ParentSnapshot, phases: tuple[PhaseSnapshot, ...]) -> bool:
+def _gate_coverage(
+    snapshot: ParentSnapshot,
+    phases: tuple[PhaseSnapshot, ...],
+    *,
+    strict_identity: bool = False,
+) -> bool:
     expected = _expected_repositories(snapshot)
     expected_identities = {
         (kind, repository)
         for kind in ("review", "qa")
         for repository in expected
     }
+    if not strict_identity:
+        legacy_expected = set(expected_identities)
+        if any(item.kind == "integration_qa" for item in phases):
+            legacy_expected.update(
+                ("integration_qa", repository) for repository in expected
+            )
+        observed: list[tuple[str, str]] = []
+        for item in phases:
+            repositories = tuple(
+                repository
+                for repository, sha in (
+                    ("frontend", item.frontend_sha),
+                    ("backend", item.backend_sha),
+                )
+                if sha is not None
+            )
+            if not repositories or item.attempt != snapshot.attempt:
+                return False
+            observed.extend((item.kind, repository) for repository in repositories)
+        return (
+            bool(observed)
+            and len(observed) == len(set(observed))
+            and set(observed) == legacy_expected
+        )
+    if len(expected) > 1:
+        expected_identities.add(("integration_qa", "suite:integration"))
     observed: list[tuple[str, str]] = []
+    expected_action = _action_key(
+        replace(
+            snapshot,
+            next_stage=phases[0].stage if phases else snapshot.next_stage,
+            last_action=None,
+        ),
+        "create_gate_stage",
+        snapshot.attempt,
+    )
+    role_assignees: dict[str, set[str]] = {
+        "independent_reviewer": set(),
+        "integration_qa": set(),
+    }
+    repository_projects: dict[str, set[str]] = {
+        repository: set() for repository in expected
+    }
+    integration_projects: set[str] = set()
+    if snapshot.last_action != expected_action:
+        return False
     for item in phases:
         repositories = tuple(
             repository
@@ -673,9 +741,58 @@ def _gate_coverage(snapshot: ParentSnapshot, phases: tuple[PhaseSnapshot, ...]) 
             )
             if sha is not None
         )
-        if not repositories or item.attempt != snapshot.attempt:
+        if (
+            not repositories
+            or item.attempt != snapshot.attempt
+            or item.creation_action != expected_action
+            or item.assignee_type != "agent"
+            or not _is_uuid(item.assignee_id)
+            or not _is_uuid(item.project_id)
+        ):
             return False
-        observed.extend((item.kind, repository) for repository in repositories)
+        if item.kind in {"review", "qa"}:
+            if len(repositories) != 1:
+                return False
+            repository = repositories[0]
+            role = (
+                "independent_reviewer"
+                if item.kind == "review"
+                else "integration_qa"
+            )
+            if (
+                item.phase_target != f"repository:{repository}"
+                or item.phase_role != role
+            ):
+                return False
+            observed.append((item.kind, repository))
+            role_assignees[role].add(item.assignee_id)
+            repository_projects.setdefault(repository, set()).add(item.project_id)
+        elif item.kind == "integration_qa":
+            if (
+                set(repositories) != expected
+                or item.phase_target != "suite:integration"
+                or item.phase_role != "integration_qa"
+            ):
+                return False
+            observed.append((item.kind, "suite:integration"))
+            role_assignees["integration_qa"].add(item.assignee_id)
+            integration_projects.add(item.project_id)
+        else:
+            return False
+    reviewer_ids = role_assignees["independent_reviewer"]
+    qa_ids = role_assignees["integration_qa"]
+    if (
+        len(reviewer_ids) != 1
+        or len(qa_ids) != 1
+        or reviewer_ids == qa_ids
+        or any(len(projects) != 1 for projects in repository_projects.values())
+        or (
+            len(expected) > 1
+            and integration_projects
+            != repository_projects.get("frontend", set())
+        )
+    ):
+        return False
     return (
         bool(observed)
         and len(observed) == len(set(observed))
@@ -742,7 +859,7 @@ def _failure_bundle(
         }
         owners = phase.responsible_repositories
         if (
-            phase.kind not in {"review", "qa"}
+            phase.kind not in {"review", "qa", "integration_qa"}
             or type(owners) is not tuple
             or len(set(owners)) != len(owners)
             or any(repository not in phase_candidates for repository in owners)
@@ -777,7 +894,9 @@ def _failure_bundle(
                 "responsible_repositories": list(sorted(owners)),
                 "result": phase.result,
                 "stage_ordinal": stage,
-                "suite_key": "",
+                "suite_key": (
+                    "integration" if phase.kind == "integration_qa" else ""
+                ),
             }
         )
     if not failures:
@@ -1256,14 +1375,14 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
             "implementation evidence is ready for exact-SHA gates",
         )
 
-    if kinds <= {"review", "qa"}:
+    if kinds <= {"review", "qa", "integration_qa"}:
         if not _phase_shas_match(snapshot, latest):
             return _parent_decision(
                 snapshot,
                 "create_gate_stage",
                 "candidate SHA changed after the latest gate set",
             )
-        if not _gate_coverage(snapshot, latest):
+        if not _gate_coverage(snapshot, latest, strict_identity=True):
             return _parent_decision(
                 snapshot,
                 "block_parent",
@@ -1639,7 +1758,12 @@ def _phase_snapshot(
     phase_pr_url = metadata.get("eventra.phase.pr", "")
     failure_repositories = metadata.get("eventra.phase.failure_repositories")
     responsible_repositories: tuple[str, ...] = ()
-    creation_action = metadata.get("eventra.repair.creation_action", "")
+    creation_action = metadata.get(
+        "eventra.repair.creation_action",
+        metadata.get("eventra.phase.creation_action", ""),
+    )
+    phase_target = metadata.get("eventra.phase.target", "")
+    phase_role = metadata.get("eventra.phase.role", "")
     failure_bundle_digest = metadata.get(
         "eventra.repair.failure_bundle_digest",
         "",
@@ -1763,6 +1887,8 @@ def _phase_snapshot(
         evidence_comment_url=evidence_comment_url,
         project_id=str(issue["project_id"]),
         creation_action=creation_action,
+        phase_target=phase_target,
+        phase_role=phase_role,
         failure_bundle_digest=failure_bundle_digest,
         failure_evidence_uuids=failure_evidence_uuids,
         authorizing_comment_uuid=authorizing_comment_uuid,
@@ -3571,6 +3697,80 @@ def _finish_phase_authority_problem(
             value,
             authoritative_repair_snapshot,
         )
+    if value.kind in {"review", "qa", "integration_qa"}:
+        try:
+            current_children = tuple(
+                child for child in children if child["stage"] == current_stage
+            )
+            current_phases = tuple(
+                _phase_snapshot(
+                    child,
+                    parse_issue_metadata(
+                        runner.run(
+                            [
+                                "issue",
+                                "metadata",
+                                "list",
+                                str(child["identifier"]),
+                                "--output",
+                                "json",
+                            ]
+                        )
+                    ),
+                )
+                for child in current_children
+            )
+            gate_snapshot = ParentSnapshot(
+                identifier=str(parent["identifier"]),
+                classification=str(parent_workflow["classification"]),
+                attempt=attempt,
+                last_action=parent_workflow["last_action"],
+                merge_state=str(parent_workflow["merge_state"]),
+                candidate_frontend_sha=parent_workflow["frontend_sha"],
+                candidate_backend_sha=parent_workflow["backend_sha"],
+                children=current_phases,
+                pull_requests=(),
+                workflow_version=2,
+                parent_status=str(parent["status"]),
+                next_stage=next_stage,
+                parent_id=str(parent["id"]),
+            )
+        except (RuntimeError, TypeError, ValueError):
+            return "authoritative current Gate metadata is malformed"
+        loaded_target = tuple(
+            item
+            for item in current_phases
+            if item.issue_key == detail["identifier"]
+        )
+        requested_candidates = {
+            repository: sha
+            for repository, sha in (
+                ("frontend", value.frontend_sha),
+                ("backend", value.backend_sha),
+            )
+            if sha is not None
+        }
+        if (
+            len(loaded_target) != 1
+            or loaded_target[0].kind != value.kind
+            or loaded_target[0].attempt != value.attempt
+            or {
+                repository: sha
+                for repository, sha in (
+                    ("frontend", loaded_target[0].frontend_sha),
+                    ("backend", loaded_target[0].backend_sha),
+                )
+                if sha is not None
+            }
+            != requested_candidates
+            or not _gate_coverage(
+                gate_snapshot,
+                current_phases,
+                strict_identity=True,
+            )
+            or not _phase_shas_match(gate_snapshot, current_phases)
+        ):
+            return "phase completion conflicts with current Gate authority"
     if any(key.startswith("eventra.repair.") for key in metadata):
         return "non-repair completion carries repair provenance"
     return None

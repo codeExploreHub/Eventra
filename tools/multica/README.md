@@ -177,6 +177,12 @@ canonical managed PR URLs, verdict evidence UUIDs, and non-PASS canonical HTTPS
 evidence-comment URLs. Any malformed JSON or bundle, version mismatch, stale
 child, or PR drift is a human-visible block.
 
+Current version-2 Gate membership is typed and exact: every affected repository
+has one single-repository Review and one single-repository QA child, while a
+cross-stack Gate additionally has one `integration_qa` child for the complete
+SHA pair. Each child carries the canonical Gate creation action, typed target,
+and assigned role; a combined child is never expanded into several identities.
+
 Reviewer and QA finish only a structured verdict. Every non-PASS completion
 declares the legal repair owner(s), evidence UUID, and canonical HTTPS
 `--evidence-comment-url`; PASS and smoke omit both failure-only fields. They do

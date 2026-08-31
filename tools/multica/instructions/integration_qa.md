@@ -41,7 +41,7 @@ one completion form.
 ### PASS gate completion
 
 ```text
-python3 -B -m tools.multica.workflow finish-phase PRO-N --kind qa --result pass --attempt N --frontend-sha FULL_SHA --backend-sha FULL_SHA --evidence-comment COMMENT_UUID
+python3 -B -m tools.multica.workflow finish-phase PRO-N --kind integration_qa --result pass --attempt N --frontend-sha FULL_SHA --backend-sha FULL_SHA --evidence-comment COMMENT_UUID
 ```
 
 PASS declares neither `--evidence-comment-url` nor
@@ -50,7 +50,7 @@ PASS declares neither `--evidence-comment-url` nor
 ### Non-PASS gate completion
 
 ```text
-python3 -B -m tools.multica.workflow finish-phase PRO-N --kind qa --result fail --attempt N --frontend-sha FULL_SHA --backend-sha FULL_SHA --evidence-comment COMMENT_UUID --evidence-comment-url HTTPS_URL --responsible-repository frontend
+python3 -B -m tools.multica.workflow finish-phase PRO-N --kind integration_qa --result fail --attempt N --frontend-sha FULL_SHA --backend-sha FULL_SHA --evidence-comment COMMENT_UUID --evidence-comment-url HTTPS_URL --responsible-repository frontend
 ```
 
 Omit only the unaffected SHA flag. Every FAIL or BLOCKED gate result uses a
