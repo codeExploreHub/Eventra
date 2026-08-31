@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import unittest
+from collections import Counter
 from dataclasses import replace
 from unittest.mock import patch
 
@@ -668,6 +669,466 @@ class ProvisionerTests(unittest.TestCase):
             agent.name, description=agent.description, instructions=agent.instructions_file.read_text(),
             runtime_id=self.config.runtime_id, visibility="workspace", max_concurrent_tasks=1,
         )
+
+    def _dry_run_cli_output(self, runner):
+        stdout = io.StringIO()
+        with (
+            patch("tools.multica.provision.MulticaRunner", return_value=runner),
+            patch(
+                "tools.multica.provision.prompt_backend_env",
+                side_effect=AssertionError("dry-run requested a secret prompt"),
+            ),
+            patch(
+                "tools.multica.provision.recover_backend_env",
+                side_effect=AssertionError("dry-run requested secret reuse"),
+            ),
+            contextlib.redirect_stdout(stdout),
+        ):
+            self.assertEqual(
+                main(
+                    [
+                        "--runtime-id", "runtime-id",
+                        "--daemon-id", "daemon-id",
+                    ]
+                ),
+                0,
+            )
+        return stdout.getvalue()
+
+    def _assert_plan(self, result):
+        self.assertTrue(
+            hasattr(result, "plan"),
+            "dry-run result must expose the observed reconciliation plan",
+        )
+        self.assertIsNotNone(result.plan)
+        return result.plan
+
+    def test_dry_run_cli_distinguishes_empty_converged_and_instruction_drift(self):
+        empty_runner = FakeRunner()
+        empty_output = self._dry_run_cli_output(empty_runner)
+
+        converged_runner = FakeRunner()
+        first = Provisioner(converged_runner).reconcile(
+            self.config,
+            apply=True,
+            backend_env=self.backend_env,
+        )
+        converged_runner.calls.clear()
+        converged_output = self._dry_run_cli_output(converged_runner)
+        converged_runner.agents[first.agent_ids["delivery_lead"]][
+            "instructions"
+        ] = "stale delivery instructions"
+        instruction_output = self._dry_run_cli_output(converged_runner)
+
+        self.assertNotEqual(empty_output, converged_output)
+        self.assertNotEqual(converged_output, instruction_output)
+        self.assertNotEqual(empty_output, instruction_output)
+        for output in (empty_output, converged_output, instruction_output):
+            self.assertTrue(output.startswith("{"), output)
+            parsed = json.loads(output)
+            self.assertEqual(
+                set(parsed),
+                {"mode", "mutation_count", "summary", "actions"},
+            )
+            self.assertEqual(parsed["mode"], "dry-run")
+            self.assertEqual(parsed["mutation_count"], 0)
+        self.assertEqual(empty_runner.mutation_count, 0)
+        self.assertEqual(converged_runner.mutation_count, 0)
+
+    def test_dry_run_rejects_environment_modes_without_reading_secrets(self):
+        for mode in ("--prompt-backend-env", "--reuse-backend-env"):
+            with self.subTest(mode=mode):
+                runner = FakeRunner()
+                stderr = io.StringIO()
+                with (
+                    patch(
+                        "tools.multica.provision.MulticaRunner",
+                        return_value=runner,
+                    ),
+                    patch(
+                        "tools.multica.provision.prompt_backend_env",
+                        return_value=self.backend_env,
+                    ) as prompt,
+                    patch(
+                        "tools.multica.provision.recover_backend_env",
+                        return_value=self.backend_env,
+                    ) as recover,
+                    contextlib.redirect_stderr(stderr),
+                    self.assertRaises(SystemExit) as caught,
+                ):
+                    main(
+                        [
+                            "--runtime-id", "runtime-id",
+                            "--daemon-id", "daemon-id",
+                            mode,
+                        ]
+                    )
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn("require --apply", stderr.getvalue())
+                self.assertEqual(prompt.call_count, 0)
+                self.assertEqual(recover.call_count, 0)
+                self.assertEqual(runner.calls, [])
+
+    def test_empty_dry_run_reports_exact_sanitized_action_inventory(self):
+        result = self.provisioner.reconcile(
+            self.config,
+            apply=False,
+            backend_env=None,
+        )
+        plan = self._assert_plan(result)
+
+        self.assertEqual(
+            plan.summary,
+            {
+                "total": 38,
+                "noop": False,
+                "by_action": {"create": 31, "update": 7},
+                "by_kind": {
+                    "agent": 6,
+                    "agent_skill_binding": 6,
+                    "autopilot": 1,
+                    "autopilot_trigger": 1,
+                    "project": 2,
+                    "resource": 2,
+                    "skill": 14,
+                    "squad": 2,
+                    "squad_member": 4,
+                },
+            },
+        )
+        self.assertEqual(
+            Counter(action.operation for action in plan.actions),
+            Counter(
+                {
+                    "skill.import": 14,
+                    "agent.create": 6,
+                    "agent.skills.add": 6,
+                    "squad.create": 1,
+                    "squad.update": 1,
+                    "squad.member.add": 4,
+                    "project.create": 2,
+                    "project.resource.add": 2,
+                    "autopilot.create": 1,
+                    "autopilot.trigger-add": 1,
+                }
+            ),
+        )
+        lead = next(
+            action
+            for action in plan.actions
+            if action.kind == "agent" and action.key == "delivery_lead"
+        )
+        self.assertEqual(lead.name, "Eventra Delivery Lead")
+        self.assertEqual(lead.resource_id, "new")
+        backend = next(
+            action
+            for action in plan.actions
+            if action.kind == "agent" and action.key == "backend_engineer"
+        )
+        self.assertEqual(backend.changes["environment"], "missing")
+        rendered = json.dumps(plan.to_dict(), sort_keys=True)
+        for forbidden in (
+            "JWT_SECRET",
+            "MAIL_USERNAME",
+            "MAIL_PASSWORD",
+            *self.backend_env.values(),
+        ):
+            self.assertNotIn(forbidden, rendered)
+        self.assertEqual(self.runner.mutation_count, 0)
+        self.assertTrue(
+            all(call["command"] not in FakeRunner.MUTATIONS for call in self.runner.calls)
+        )
+
+        planned_operations = Counter(action.operation for action in plan.actions)
+        self.runner.calls.clear()
+        applied = self.provisioner.reconcile(
+            self.config,
+            apply=True,
+            backend_env=self.backend_env,
+        )
+        actual_operations = Counter(
+            ".".join(call["command"])
+            for call in self.runner.calls
+            if call["command"] in FakeRunner.MUTATIONS
+        )
+        self.assertEqual(applied.mutation_count, 38)
+        self.assertEqual(actual_operations, planned_operations)
+
+    def test_converged_plan_is_noop_and_instruction_plan_matches_apply_identity(self):
+        first = self.provisioner.reconcile(
+            self.config,
+            apply=True,
+            backend_env=self.backend_env,
+        )
+        self.runner.calls.clear()
+
+        converged = self.provisioner.reconcile(
+            self.config,
+            apply=False,
+            backend_env=None,
+        )
+        converged_plan = self._assert_plan(converged)
+        self.assertEqual(converged_plan.actions, ())
+        self.assertEqual(
+            converged_plan.summary,
+            {"total": 0, "noop": True, "by_action": {}, "by_kind": {}},
+        )
+        self.assertEqual(self.runner.mutation_count, 0)
+
+        lead_id = first.agent_ids["delivery_lead"]
+        self.runner.agents[lead_id]["instructions"] = "stale instructions"
+        self.runner.calls.clear()
+        drift = self.provisioner.reconcile(
+            self.config,
+            apply=False,
+            backend_env=None,
+        )
+        drift_plan = self._assert_plan(drift)
+        self.assertEqual(len(drift_plan.actions), 1)
+        action = drift_plan.actions[0]
+        self.assertEqual(
+            (
+                action.action,
+                action.kind,
+                action.key,
+                action.name,
+                action.resource_id,
+                action.operation,
+                action.changes,
+            ),
+            (
+                "update",
+                "agent",
+                "delivery_lead",
+                "Eventra Delivery Lead",
+                lead_id,
+                "agent.update",
+                {"fields": ["instructions"]},
+            ),
+        )
+        self.assertEqual(self.runner.mutation_count, 0)
+        self.runner.calls.clear()
+
+        applied = self.provisioner.reconcile(
+            self.config,
+            apply=True,
+            backend_env=None,
+        )
+        mutations = [
+            call for call in self.runner.calls if call["command"] in FakeRunner.MUTATIONS
+        ]
+        self.assertEqual(applied.mutation_count, 1)
+        self.assertEqual(
+            [(call["command"], call["positionals"]) for call in mutations],
+            [(('agent', 'update'), [lead_id])],
+        )
+        self.assertEqual(action.operation, ".".join(mutations[0]["command"]))
+
+    def test_dry_run_names_each_agent_control_field_that_will_be_updated(self):
+        first = self.provisioner.reconcile(
+            self.config,
+            apply=True,
+            backend_env=self.backend_env,
+        )
+        pristine = copy.deepcopy(self.runner)
+        lead_id = first.agent_ids["delivery_lead"]
+        cases = (
+            ("instructions", "stale instructions"),
+            ("runtime_id", "stale-runtime"),
+            ("visibility", "private"),
+            ("max_concurrent_tasks", 7),
+        )
+        for field, value in cases:
+            with self.subTest(field=field):
+                runner = copy.deepcopy(pristine)
+                runner.agents[lead_id][field] = value
+                runner.calls.clear()
+                result = Provisioner(runner).reconcile(
+                    self.config,
+                    apply=False,
+                    backend_env=None,
+                )
+                plan = self._assert_plan(result)
+                self.assertEqual(len(plan.actions), 1)
+                action = plan.actions[0]
+                self.assertEqual(action.operation, "agent.update")
+                self.assertEqual(action.changes, {"fields": [field]})
+                self.assertEqual(runner.mutation_count, 0)
+
+    def test_dry_run_reports_each_supported_single_resource_drift(self):
+        first = self.provisioner.reconcile(
+            self.config,
+            apply=True,
+            backend_env=self.backend_env,
+        )
+        pristine = copy.deepcopy(self.runner)
+        frontend_path = self.config.resources[0].local_path
+        frontend_resource_id = first.resource_ids[frontend_path]
+        frontend_id = first.agent_ids["frontend_engineer"]
+        cases = (
+            (
+                "resource",
+                lambda runner: runner.projects[first.project_id]["resources"][
+                    frontend_resource_id
+                ]["resource_ref"].update(execution_mode="in_place"),
+                ("update", "resource", frontend_path, "project.resource.update"),
+            ),
+            (
+                "project context",
+                lambda runner: runner.projects[first.project_id].update(
+                    description="stale Project context"
+                ),
+                ("update", "project", "frontend", "project.update"),
+            ),
+            (
+                "squad",
+                lambda runner: runner.squads[first.squad_id].update(
+                    description="stale Squad description"
+                ),
+                ("update", "squad", "delivery", "squad.update"),
+            ),
+            (
+                "member",
+                lambda runner: runner.squads[first.squad_id]["members"][
+                    frontend_id
+                ].update(role="stale_role"),
+                (
+                    "update",
+                    "squad_member",
+                    "frontend_engineer",
+                    "squad.member.set-role",
+                ),
+            ),
+            (
+                "autopilot",
+                lambda runner: runner.autopilots[first.autopilot_id].update(
+                    description="stale watcher description"
+                ),
+                (
+                    "update",
+                    "autopilot",
+                    "workflow_watcher",
+                    "autopilot.update",
+                ),
+            ),
+            (
+                "trigger",
+                lambda runner: runner.autopilots[first.autopilot_id]["triggers"][
+                    0
+                ].update(timezone="UTC"),
+                (
+                    "update",
+                    "autopilot_trigger",
+                    "workflow_watcher_schedule",
+                    "autopilot.trigger-update",
+                ),
+            ),
+        )
+        for name, mutate, expected in cases:
+            with self.subTest(name=name):
+                runner = copy.deepcopy(pristine)
+                mutate(runner)
+                runner.calls.clear()
+                result = Provisioner(runner).reconcile(
+                    self.config,
+                    apply=False,
+                    backend_env=None,
+                )
+                plan = self._assert_plan(result)
+                self.assertEqual(len(plan.actions), 1)
+                action = plan.actions[0]
+                self.assertEqual(
+                    (action.action, action.kind, action.key, action.operation),
+                    expected,
+                )
+                self.assertEqual(runner.mutation_count, 0)
+                runner.calls.clear()
+                applied = Provisioner(runner).reconcile(
+                    self.config,
+                    apply=True,
+                    backend_env=None,
+                )
+                mutations = [
+                    call
+                    for call in runner.calls
+                    if call["command"] in FakeRunner.MUTATIONS
+                ]
+                self.assertEqual(applied.mutation_count, 1)
+                self.assertEqual(len(mutations), 1)
+                self.assertEqual(
+                    action.operation, ".".join(mutations[0]["command"])
+                )
+
+    def test_dry_run_reports_binding_and_environment_state_without_secrets(self):
+        first = self.provisioner.reconcile(
+            self.config,
+            apply=True,
+            backend_env=self.backend_env,
+        )
+        backend_id = first.agent_ids["backend_engineer"]
+        lead_id = first.agent_ids["delivery_lead"]
+        missing_skill_id = next(iter(self.runner.bindings[lead_id]))
+        self.runner.bindings[lead_id].remove(missing_skill_id)
+        self.runner.envs[backend_id] = {}
+        self.runner.calls.clear()
+
+        result = self.provisioner.reconcile(
+            self.config,
+            apply=False,
+            backend_env=None,
+        )
+        plan = self._assert_plan(result)
+        binding = next(
+            action for action in plan.actions if action.kind == "agent_skill_binding"
+        )
+        environment = next(
+            action
+            for action in plan.actions
+            if action.kind == "agent_environment"
+            and action.key == "backend_engineer"
+        )
+        self.assertEqual(binding.action, "update")
+        self.assertEqual(binding.resource_id, lead_id)
+        self.assertEqual(environment.action, "update")
+        self.assertEqual(environment.changes, {"environment": "missing"})
+        rendered = json.dumps(plan.to_dict(), sort_keys=True)
+        for forbidden in (
+            "JWT_SECRET",
+            "MAIL_USERNAME",
+            "MAIL_PASSWORD",
+            *self.backend_env.values(),
+        ):
+            self.assertNotIn(forbidden, rendered)
+        self.assertEqual(self.runner.mutation_count, 0)
+
+    def test_dry_run_wrong_skill_origin_and_duplicate_state_fail_closed(self):
+        source = self.config.skills["using-superpowers"]
+        for corrupt in ("origin", "duplicate"):
+            with self.subTest(corrupt=corrupt):
+                runner = FakeRunner()
+                runner.seed_skill(source.key, source.url)
+                if corrupt == "origin":
+                    skill = next(iter(runner.skills.values()))
+                    skill["config"]["origin"] = {
+                        "type": "github",
+                        "owner": "attacker",
+                        "repo": "wrong",
+                        "ref": "a" * 40,
+                        "path": "skills/using-superpowers",
+                        "source_url": (
+                            "https://github.com/attacker/wrong/tree/"
+                            f"{'a' * 40}/skills/using-superpowers"
+                        ),
+                    }
+                else:
+                    runner.seed_skill(source.key, source.url)
+                with self.assertRaisesRegex(RuntimeError, "origin|duplicate"):
+                    Provisioner(runner).reconcile(
+                        self.config,
+                        apply=False,
+                        backend_env=None,
+                    )
+                self.assertEqual(runner.mutation_count, 0)
 
     def test_delivery_lead_is_reconciled_to_one_serial_task_slot(self):
         lead = next(

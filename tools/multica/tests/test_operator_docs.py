@@ -139,6 +139,24 @@ class OperatorDocsTests(unittest.TestCase):
             readme,
         )
 
+    def test_provision_dry_run_observed_plan_schema_is_documented(self):
+        readme = " ".join(
+            Path("tools/multica/README.md").read_text().split()
+        )
+        for fragment in (
+            '"mode": "dry-run"',
+            '"mutation_count": 0',
+            '"summary"',
+            '"actions"',
+            '`action`, `kind`, `key`, `name`, `id`, `operation`, and `changes`',
+            'environment state as only `missing`, `set`, or `update`',
+            'does not print environment key names or values',
+            'An empty `actions` array with `summary.noop: true`',
+            'deterministic',
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, readme)
+
     def test_every_execution_role_uses_terminal_phase_helper(self):
         instructions = Path("tools/multica/instructions")
         for name in (

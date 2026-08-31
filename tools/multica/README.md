@@ -28,6 +28,34 @@ a dry-run plan ID or hash. The reusable package's exact-plan hash boundary is a
 separate Task 8 concern. Review dry-run output before authorizing apply; neither
 operation licenses an invented or extended reconciliation:
 
+The dry-run response is deterministic JSON derived from authoritative observed
+state, not a static desired inventory. Its stable top-level schema is:
+
+```json
+{
+  "actions": [],
+  "mode": "dry-run",
+  "mutation_count": 0,
+  "summary": {
+    "by_action": {},
+    "by_kind": {},
+    "noop": true,
+    "total": 0
+  }
+}
+```
+
+Each changed item in `actions` has `action`, `kind`, `key`, `name`, `id`,
+`operation`, and `changes`; missing object IDs are rendered as `new`. Actions
+are deterministically ordered across approved skills, Agents, skill bindings,
+the Squad and members, Projects, worktree resources, Autopilot, and trigger.
+Environment reconciliation reports environment state as only `missing`, `set`,
+or `update`; it does not print environment key names or values. An empty
+`actions` array with `summary.noop: true` proves that this fresh observed
+preflight found no intended change. A non-empty plan is advisory input for
+review: `--apply` performs its own fresh preflight and is not bound to the prior
+dry-run response.
+
 ```bash
 python3 -m tools.multica.provision --runtime-id RUNTIME_ID --daemon-id DAEMON_ID --apply
 ```
@@ -36,7 +64,9 @@ Use `--prompt-backend-env` only when Backend Engineer and Integration QA need
 the local backend environment. It prompts for the secret without echoing it
 and passes it only through those agents' custom environment. Do not put a
 secret in shell history, Issue text, logs, pull-request descriptions, or a
-tracked environment file.
+tracked environment file. Both backend environment modes require `--apply`;
+the dry-run path rejects them before any prompt, environment read, or Multica
+preflight.
 
 ## Contract recovery runbook
 

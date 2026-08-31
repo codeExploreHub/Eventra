@@ -103,6 +103,58 @@ class ProvisioningResult:
     resource_ids: dict[str, str | None]
     autopilot_id: str | None
     mutation_count: int
+    plan: ProvisioningPlan | None = None
+
+
+@dataclass(frozen=True)
+class ProvisionAction:
+    """One deterministic, redacted reconciliation effect."""
+
+    action: str
+    kind: str
+    key: str
+    name: str
+    resource_id: str
+    operation: str
+    changes: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action": self.action,
+            "kind": self.kind,
+            "key": self.key,
+            "name": self.name,
+            "id": self.resource_id,
+            "operation": self.operation,
+            "changes": self.changes,
+        }
+
+
+@dataclass(frozen=True)
+class ProvisioningPlan:
+    """Observed, mutation-free reconciliation plan safe for rendering."""
+
+    actions: tuple[ProvisionAction, ...]
+
+    @property
+    def summary(self) -> dict[str, Any]:
+        by_action: dict[str, int] = {}
+        by_kind: dict[str, int] = {}
+        for item in self.actions:
+            by_action[item.action] = by_action.get(item.action, 0) + 1
+            by_kind[item.kind] = by_kind.get(item.kind, 0) + 1
+        return {
+            "total": len(self.actions),
+            "noop": not self.actions,
+            "by_action": dict(sorted(by_action.items())),
+            "by_kind": dict(sorted(by_kind.items())),
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "summary": self.summary,
+            "actions": [item.to_dict() for item in self.actions],
+        }
 
 
 @dataclass(frozen=True)
@@ -110,6 +162,7 @@ class _Preflight:
     skill_details: dict[str, dict[str, Any] | None]
     agent_details: dict[str, dict[str, Any] | None]
     agent_envs: dict[str, dict[str, str] | None]
+    agent_bindings: dict[str, frozenset[str] | None]
     squad_detail: dict[str, Any] | None
     members: list[dict[str, Any]]
     project_detail: dict[str, Any] | None
@@ -201,6 +254,7 @@ class Provisioner:
         canonical_env = self._validate_env_preconditions(
             config, state, apply, backend_env
         )
+        plan = self._build_plan(config, desired_skills, state, backend_env)
 
         if not apply:
             return ProvisioningResult(
@@ -232,6 +286,7 @@ class Provisioner:
                     else state.autopilot_detail["autopilot"]["id"]
                 ),
                 mutation_count=self.runner.mutation_count - starting_mutation_count,
+                plan=plan,
             )
 
         skill_ids = self._reconcile_skills(desired_skills, state.skill_details)
@@ -242,7 +297,9 @@ class Provisioner:
             backend_env,
             canonical_env,
         )
-        self._reconcile_bindings(config, agent_ids, skill_ids)
+        self._reconcile_bindings(
+            config, agent_ids, skill_ids, state.agent_bindings
+        )
         squad_id = self._reconcile_squad(config, state.squad_detail, state.members, agent_ids)
         project_id = self._reconcile_project(
             config.project_title,
@@ -281,6 +338,7 @@ class Provisioner:
             resource_ids=resource_ids,
             autopilot_id=autopilot_id,
             mutation_count=self.runner.mutation_count - starting_mutation_count,
+            plan=plan,
         )
 
     def _preflight(self, config, desired_skills) -> _Preflight:
@@ -303,7 +361,7 @@ class Provisioner:
         agent_records = parse_agent_list(
             self.runner.run(["agent", "list", "--output", "json"])
         )
-        agent_details, agent_envs = {}, {}
+        agent_details, agent_envs, agent_bindings = {}, {}, {}
         for agent in config.agents:
             item = self._exact_record(agent_records, agent.name, "name", "agent")
             detail = None if item is None else self._agent_get(item["id"])
@@ -312,6 +370,11 @@ class Provisioner:
                 None
                 if detail is None or not agent.needs_backend_env
                 else self._agent_env_get(detail["id"])
+            )
+            agent_bindings[agent.role] = (
+                None
+                if detail is None
+                else frozenset(self._binding_ids(detail["id"]))
             )
 
         squad_records = parse_squad_list(
@@ -378,6 +441,7 @@ class Provisioner:
             skill_details,
             agent_details,
             agent_envs,
+            agent_bindings,
             squad_detail,
             members,
             project_detail,
@@ -514,7 +578,269 @@ class Provisioner:
         missing = keys.difference(config.skills)
         if missing:
             raise ValueError(f"configuration is missing approved skills: {sorted(missing)!r}")
-        return {key: source for key, source in config.skills.items() if key in keys}
+        return {
+            key: source for key, source in config.skills.items() if key in keys
+        }
+
+    def _build_plan(self, config, desired_skills, state, backend_env):
+        actions: list[ProvisionAction] = []
+
+        def add(action, kind, key, name, resource_id, operation, changes):
+            actions.append(
+                ProvisionAction(
+                    action=action,
+                    kind=kind,
+                    key=key,
+                    name=name,
+                    resource_id=resource_id,
+                    operation=operation,
+                    changes=changes,
+                )
+            )
+
+        for key, source in desired_skills.items():
+            if state.skill_details[key] is None:
+                add(
+                    "create", "skill", key, key, "new", "skill.import",
+                    {"origin": "approved_github", "source": source.url},
+                )
+
+        valid_recipient_envs = [
+            state.agent_envs[role]
+            for role in sorted(ENV_RECIPIENTS)
+            if state.agent_details[role] is not None
+        ]
+        shared_existing_env = (
+            len(valid_recipient_envs) == len(ENV_RECIPIENTS)
+            and all(self._is_valid_backend_env(value) for value in valid_recipient_envs)
+            and valid_recipient_envs[0] == valid_recipient_envs[1]
+        )
+        for agent in config.agents:
+            detail = state.agent_details[agent.role]
+            desired = self._desired_agent(config, agent)
+            if detail is None:
+                changes: dict[str, Any] = {
+                    "fields": [
+                        "description", "instructions", "max_concurrent_tasks",
+                        "name", "runtime_id", "visibility",
+                    ]
+                }
+                if agent.needs_backend_env:
+                    changes["environment"] = "missing"
+                add(
+                    "create", "agent", agent.role, agent.name, "new",
+                    "agent.create", changes,
+                )
+            else:
+                changed = self._changed_fields(detail, desired)
+                if changed:
+                    add(
+                        "update", "agent", agent.role, agent.name, detail["id"],
+                        "agent.update", {"fields": changed},
+                    )
+                if agent.needs_backend_env:
+                    observed_env = state.agent_envs[agent.role]
+                    env_matches = (
+                        observed_env == backend_env
+                        if backend_env is not None
+                        else shared_existing_env
+                    )
+                    if not env_matches:
+                        env_state = (
+                            "missing"
+                            if not self._is_valid_backend_env(observed_env)
+                            else "update"
+                        )
+                        add(
+                            "update", "agent_environment", agent.role,
+                            agent.name, detail["id"], "agent.env.set",
+                            {"environment": env_state},
+                        )
+
+            binding_detail = state.agent_bindings[agent.role]
+            missing_skill_keys = self._missing_binding_keys(
+                agent, state.skill_details, binding_detail
+            )
+            if missing_skill_keys:
+                add(
+                    "update", "agent_skill_binding", agent.role, agent.name,
+                    "new" if detail is None else detail["id"],
+                    "agent.skills.add", {"skills": missing_skill_keys},
+                )
+
+        agent_ids = {
+            role: None if detail is None else detail["id"]
+            for role, detail in state.agent_details.items()
+        }
+        blueprint = config.blueprint
+        leader_id = agent_ids[blueprint.leader_role]
+        squad = state.squad_detail
+        if squad is None:
+            add(
+                "create", "squad", "delivery", blueprint.squad_name, "new",
+                "squad.create", {"fields": ["description", "leader"]},
+            )
+            add(
+                "update", "squad", "delivery", blueprint.squad_name, "new",
+                "squad.update", {"fields": ["instructions"]},
+            )
+            for agent in blueprint.agents:
+                if agent.role != blueprint.leader_role:
+                    add(
+                        "create", "squad_member", agent.role,
+                        agent.name, "new", "squad.member.add",
+                        {"role": agent.role},
+                    )
+        else:
+            desired_squad = self._desired_squad(config, leader_id)
+            changed = self._changed_fields(squad, desired_squad)
+            if leader_id is None and "leader_id" not in changed:
+                changed.append("leader_id")
+            if changed:
+                add(
+                    "update", "squad", "delivery", blueprint.squad_name,
+                    squad["id"], "squad.update", {"fields": sorted(changed)},
+                )
+            all_delivery_agents_exist = all(
+                agent_ids[agent.role] is not None for agent in blueprint.agents
+            )
+            if all_delivery_agents_exist:
+                self._validate_server_managed_leader(state.members, leader_id)
+            by_member = self._validate_members(state.members)
+            known_wanted = {
+                agent_ids[agent.role]
+                for agent in blueprint.agents
+                if agent_ids[agent.role] is not None
+            }
+            if all_delivery_agents_exist and set(by_member).difference(known_wanted):
+                raise RuntimeError("unsafe Squad member state")
+            for agent in blueprint.agents:
+                if agent.role == blueprint.leader_role:
+                    continue
+                member_id = agent_ids[agent.role]
+                existing = None if member_id is None else by_member.get(member_id)
+                if existing is None:
+                    add(
+                        "create", "squad_member", agent.role, agent.name,
+                        "new", "squad.member.add", {"role": agent.role},
+                    )
+                elif existing["role"] != agent.role:
+                    add(
+                        "update", "squad_member", agent.role, agent.name,
+                        existing.get("id", existing["member_id"]),
+                        "squad.member.set-role",
+                        {"role": agent.role},
+                    )
+
+        project_specs = (
+            (
+                "frontend", config.project_title,
+                config.project_context_file.read_text(), state.project_detail,
+            ),
+            (
+                "backend", config.backend_project_title,
+                config.backend_project_context_file.read_text(),
+                state.backend_project_detail,
+            ),
+        )
+        for key, title, description, detail in project_specs:
+            desired = self._desired_project(title, description)
+            if detail is None:
+                add(
+                    "create", "project", key, title, "new", "project.create",
+                    {"fields": ["description", "title"]},
+                )
+            else:
+                changed = self._changed_fields(detail, desired)
+                if changed:
+                    add(
+                        "update", "project", key, title, detail["id"],
+                        "project.update", {"fields": changed},
+                    )
+
+        resource_states = (state.resources, state.backend_resources)
+        for resource, matches in zip(config.resources, resource_states):
+            detail = matches[resource.local_path]
+            if detail is None:
+                add(
+                    "create", "resource", resource.local_path,
+                    resource.local_path, "new", "project.resource.add",
+                    {"execution_mode": "worktree"},
+                )
+            elif self._resource_needs_update(detail, config.daemon_id):
+                add(
+                    "update", "resource", resource.local_path,
+                    resource.local_path, detail["id"],
+                    "project.resource.update", {"execution_mode": "worktree"},
+                )
+
+        autopilot = state.autopilot_detail
+        frontend_project_id = (
+            None if state.project_detail is None else state.project_detail["id"]
+        )
+        backend_project_id = (
+            None
+            if state.backend_project_detail is None
+            else state.backend_project_detail["id"]
+        )
+        watcher_id = agent_ids[config.watcher.agent_role]
+        if autopilot is None:
+            add(
+                "create", "autopilot", "workflow_watcher",
+                config.watcher.title, "new", "autopilot.create",
+                {"fields": ["assignee", "description", "mode", "project"]},
+            )
+            add(
+                "create", "autopilot_trigger", "workflow_watcher_schedule",
+                config.watcher.label, "new", "autopilot.trigger-add",
+                {"fields": ["cron", "enabled", "timezone"]},
+            )
+        else:
+            autopilot_id = autopilot["autopilot"]["id"]
+            if None in {frontend_project_id, backend_project_id, watcher_id}:
+                autopilot_changed = ["assignee_id", "description", "project_id"]
+            else:
+                wanted = self._desired_autopilot(
+                    config, watcher_id, frontend_project_id, backend_project_id
+                )
+                autopilot_changed = self._changed_fields(
+                    autopilot["autopilot"], wanted
+                )
+            if autopilot_changed:
+                add(
+                    "update", "autopilot", "workflow_watcher",
+                    config.watcher.title, autopilot_id, "autopilot.update",
+                    {"fields": autopilot_changed},
+                )
+            triggers = autopilot["triggers"]
+            if not triggers:
+                add(
+                    "create", "autopilot_trigger", "workflow_watcher_schedule",
+                    config.watcher.label, "new", "autopilot.trigger-add",
+                    {"fields": ["cron", "enabled", "timezone"]},
+                )
+            else:
+                wanted_trigger = self._desired_trigger(config, autopilot_id)
+                trigger_changed = self._changed_fields(triggers[0], wanted_trigger)
+                if trigger_changed:
+                    add(
+                        "update", "autopilot_trigger",
+                        "workflow_watcher_schedule", config.watcher.label,
+                        triggers[0]["id"], "autopilot.trigger-update",
+                        {"fields": trigger_changed},
+                    )
+        return ProvisioningPlan(tuple(actions))
+
+    @staticmethod
+    def _missing_binding_keys(agent, skill_details, existing):
+        if existing is None:
+            return sorted(agent.skill_keys)
+        return sorted(
+            key
+            for key in agent.skill_keys
+            if skill_details[key] is None
+            or skill_details[key]["id"] not in existing
+        )
 
     def _reconcile_skills(self, desired, details):
         ids = {}
@@ -602,10 +928,16 @@ class Provisioner:
             "max_concurrent_tasks": 1,
         }
 
-    def _reconcile_bindings(self, config, agent_ids, skill_ids) -> None:
+    def _reconcile_bindings(
+        self, config, agent_ids, skill_ids, observed_bindings
+    ) -> None:
         for agent in config.agents:
             agent_id = agent_ids[agent.role]
-            existing = self._binding_ids(agent_id)
+            existing = (
+                self._binding_ids(agent_id)
+                if observed_bindings[agent.role] is None
+                else set(observed_bindings[agent.role])
+            )
             missing = [skill_ids[key] for key in agent.skill_keys if skill_ids[key] not in existing]
             if missing:
                 self.runner.run(
@@ -628,13 +960,9 @@ class Provisioner:
 
     def _reconcile_squad(self, config, detail, members, agent_ids):
         blueprint = config.blueprint
-        desired = {
-            "id": None,
-            "name": blueprint.squad_name,
-            "description": blueprint.squad_description,
-            "instructions": blueprint.squad_instructions_file.read_text(),
-            "leader_id": agent_ids[blueprint.leader_role],
-        }
+        desired = self._desired_squad(
+            config, agent_ids[blueprint.leader_role]
+        )
         created = detail is None
         if created:
             self.runner.run(
@@ -725,12 +1053,19 @@ class Provisioner:
             raise RuntimeError("Squad member reconciliation failed")
         return squad_id
 
-    def _reconcile_project(self, title, description, detail):
-        desired = {
+    @staticmethod
+    def _desired_squad(config, leader_id):
+        blueprint = config.blueprint
+        return {
             "id": None,
-            "title": title,
-            "description": description,
+            "name": blueprint.squad_name,
+            "description": blueprint.squad_description,
+            "instructions": blueprint.squad_instructions_file.read_text(),
+            "leader_id": leader_id,
         }
+
+    def _reconcile_project(self, title, description, detail):
+        desired = self._desired_project(title, description)
         if detail is None:
             self.runner.run(
                 ["project", "create", "--title", desired["title"], "--description", desired["description"], "--output", "json"]
@@ -747,6 +1082,10 @@ class Provisioner:
         if not self._matches(detail, desired):
             raise RuntimeError("Project reconciliation failed")
         return detail["id"]
+
+    @staticmethod
+    def _desired_project(title, description):
+        return {"id": None, "title": title, "description": description}
 
     def _reconcile_resources(self, config, project_id, resources, matches):
         ids = {}
@@ -770,7 +1109,7 @@ class Provisioner:
             else:
                 ids[resource.local_path] = detail["id"]
                 ref = detail["resource_ref"]
-                if ref.get("execution_mode") != "worktree" or ref["daemon_id"] != config.daemon_id:
+                if self._resource_needs_update(detail, config.daemon_id):
                     self.runner.run(
                         [
                             "project", "resource", "update", project_id, detail["id"],
@@ -794,6 +1133,14 @@ class Provisioner:
             ids[path] = detail["id"]
         return ids
 
+    @staticmethod
+    def _resource_needs_update(detail, daemon_id):
+        ref = detail["resource_ref"]
+        return (
+            ref.get("execution_mode") != "worktree"
+            or ref["daemon_id"] != daemon_id
+        )
+
     def _reconcile_autopilot(
         self,
         config,
@@ -802,21 +1149,12 @@ class Provisioner:
         frontend_project_id,
         backend_project_id,
     ):
-        description = (
-            config.watcher.description_file.read_text()
-            .replace("__FRONTEND_PROJECT_ID__", frontend_project_id)
-            .replace("__BACKEND_PROJECT_ID__", backend_project_id)
+        wanted = self._desired_autopilot(
+            config,
+            watcher_agent_id,
+            frontend_project_id,
+            backend_project_id,
         )
-        wanted = {
-            "id": None,
-            "title": config.watcher.title,
-            "description": description,
-            "execution_mode": "run_only",
-            "project_id": frontend_project_id,
-            "assignee_id": watcher_agent_id,
-            "assignee_type": "agent",
-            "status": "active",
-        }
         if detail is None:
             self.runner.run(
                 [
@@ -852,14 +1190,7 @@ class Provisioner:
 
         autopilot_id = detail["autopilot"]["id"]
         triggers = detail["triggers"]
-        wanted_trigger = {
-            "autopilot_id": autopilot_id,
-            "kind": "schedule",
-            "cron_expression": config.watcher.cron,
-            "timezone": config.watcher.timezone,
-            "enabled": True,
-            "label": config.watcher.label,
-        }
+        wanted_trigger = self._desired_trigger(config, autopilot_id)
         if not triggers:
             self.runner.run(
                 [
@@ -891,6 +1222,37 @@ class Provisioner:
         ):
             raise RuntimeError("Autopilot reconciliation failed")
         return autopilot_id
+
+    @staticmethod
+    def _desired_autopilot(
+        config, watcher_agent_id, frontend_project_id, backend_project_id
+    ):
+        description = (
+            config.watcher.description_file.read_text()
+            .replace("__FRONTEND_PROJECT_ID__", frontend_project_id)
+            .replace("__BACKEND_PROJECT_ID__", backend_project_id)
+        )
+        return {
+            "id": None,
+            "title": config.watcher.title,
+            "description": description,
+            "execution_mode": "run_only",
+            "project_id": frontend_project_id,
+            "assignee_id": watcher_agent_id,
+            "assignee_type": "agent",
+            "status": "active",
+        }
+
+    @staticmethod
+    def _desired_trigger(config, autopilot_id):
+        return {
+            "autopilot_id": autopilot_id,
+            "kind": "schedule",
+            "cron_expression": config.watcher.cron,
+            "timezone": config.watcher.timezone,
+            "enabled": True,
+            "label": config.watcher.label,
+        }
 
     def _autopilot_get(self, autopilot_id):
         autopilot, triggers = parse_autopilot_detail(
@@ -1060,8 +1422,18 @@ class Provisioner:
 
     @staticmethod
     def _matches(detail, desired):
-        return detail is not None and all(
-            key == "id" or detail.get(key) == value for key, value in desired.items()
+        return detail is not None and not Provisioner._changed_fields(
+            detail, desired
+        )
+
+    @staticmethod
+    def _changed_fields(detail, desired):
+        if detail is None:
+            return sorted(key for key in desired if key != "id")
+        return sorted(
+            key
+            for key, value in desired.items()
+            if key != "id" and detail.get(key) != value
         )
 
 
@@ -1109,15 +1481,34 @@ def recover_backend_env(config: ProjectConfig, runner: MulticaRunner) -> dict[st
     return dict(value)
 
 
-def _planned_output(config: ProjectConfig) -> str:
-    lines = ["Planned Multica reconciliation:"]
-    lines.extend(f"agent: {agent.name}" for agent in config.agents)
-    lines.extend(f"skill: {source.key} <- {source.url}" for source in config.skills.values())
-    lines.append(f"Squad: {config.blueprint.squad_name}")
-    lines.append(f"Project: {config.project_title}")
-    lines.append(f"Backend Project: {config.backend_project_title}")
-    lines.extend(f"resource: {resource.local_path} (worktree)" for resource in config.resources)
-    return "\n".join(lines)
+def _planned_output(result: ProvisioningResult) -> str:
+    if result.plan is None:
+        raise RuntimeError("dry-run plan is unavailable")
+    return json.dumps(
+        {
+            "mode": "dry-run",
+            "mutation_count": result.mutation_count,
+            "summary": result.plan.summary,
+            "actions": [item.to_dict() for item in result.plan.actions],
+        },
+        sort_keys=True,
+    )
+
+
+def _apply_output(result: ProvisioningResult) -> str:
+    return json.dumps(
+        {
+            "agent_ids": result.agent_ids,
+            "skill_ids": result.skill_ids,
+            "squad_id": result.squad_id,
+            "project_id": result.project_id,
+            "backend_project_id": result.backend_project_id,
+            "resource_ids": result.resource_ids,
+            "autopilot_id": result.autopilot_id,
+            "mutation_count": result.mutation_count,
+        },
+        sort_keys=True,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1129,6 +1520,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     environment_mode.add_argument("--prompt-backend-env", action="store_true")
     environment_mode.add_argument("--reuse-backend-env", action="store_true")
     args = parser.parse_args(argv)
+    if not args.apply and (
+        args.prompt_backend_env or args.reuse_backend_env
+    ):
+        parser.error("backend environment modes require --apply")
     config = build_eventra_config(args.runtime_id, args.daemon_id)
     runner = MulticaRunner()
     backend_env = (
@@ -1142,9 +1537,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         config, apply=args.apply, backend_env=backend_env
     )
     if args.apply:
-        print(json.dumps(result.__dict__, sort_keys=True))
+        print(_apply_output(result))
     else:
-        print(_planned_output(config))
+        print(_planned_output(result))
     return 0
 
 
