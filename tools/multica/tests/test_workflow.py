@@ -4436,12 +4436,12 @@ class RepairExecutionTests(unittest.TestCase):
         return runner, github, decision, integration_uuid
 
     @staticmethod
-    def _change_integration_suite(reservation, suite_key):
+    def _change_failure_suite(reservation, phase, suite_key):
         changed = copy.deepcopy(reservation)
         failure = next(
             item
             for item in changed["failure_bundle"]["failures"]
-            if item["phase"] == "integration_qa"
+            if item["phase"] == phase
         )
         failure["suite_key"] = suite_key
         payload = dict(changed["failure_bundle"])
@@ -4486,12 +4486,64 @@ class RepairExecutionTests(unittest.TestCase):
 
         for malformed_suite in ("", "unknown", "suite:integration"):
             with self.subTest(malformed_suite=malformed_suite):
-                malformed = self._change_integration_suite(
-                    reservation, malformed_suite
+                malformed = self._change_failure_suite(
+                    reservation, "integration_qa", malformed_suite
                 )
                 spec = malformed["child_specs"][0]
                 with self.assertRaisesRegex(RuntimeError, "failure identity"):
                     workflow_module._render_repair_handoff(malformed, spec)
+
+    def test_repository_gate_handoff_rejects_coherent_nonempty_suite_forgery(self):
+        for failure_phase in ("review", "qa"):
+            with self.subTest(failure_phase=failure_phase):
+                runner = FakeRepairRunner(attempt=0)
+                if failure_phase == "qa":
+                    for child in runner.children:
+                        if child["stage"] != 2:
+                            continue
+                        metadata = runner.metadata[child["identifier"]]
+                        if metadata["eventra.phase.kind"] == "review":
+                            metadata["eventra.phase.result"] = "pass"
+                            metadata["eventra.phase.failure_repositories"] = "[]"
+                            metadata.pop(
+                                "eventra.phase.evidence_comment_url", None
+                            )
+                        elif metadata["eventra.phase.kind"] == "qa":
+                            evidence_uuid = metadata[
+                                "eventra.phase.evidence_comment"
+                            ]
+                            metadata.update(
+                                {
+                                    "eventra.phase.result": "fail",
+                                    "eventra.phase.failure_repositories": '["backend"]',
+                                    "eventra.phase.evidence_comment_url": (
+                                        "https://multica.example/comments/"
+                                        + evidence_uuid
+                                    ),
+                                }
+                            )
+                github = FakeRepairGitHubRunner()
+                snapshot = load_parent_snapshot(runner, github, "PRO-65")
+                decision = decide_parent_action(snapshot)
+                self.assertEqual(decision.kind, "create_repair_stage")
+                reservation = _build_repair_reservation(snapshot, decision)
+                spec = reservation["child_specs"][0]
+                valid = workflow_module._render_repair_handoff(
+                    reservation, spec
+                )
+                self.assertIn(f"{failure_phase} |", valid)
+                self.assertNotIn("suite=", valid)
+                forged = self._change_failure_suite(
+                    reservation,
+                    failure_phase,
+                    "forged-suite",
+                )
+                before = len(runner.mutation_calls)
+
+                with self.assertRaisesRegex(RuntimeError, "failure identity"):
+                    workflow_module._render_repair_handoff(forged, spec)
+
+                self.assertEqual(len(runner.mutation_calls), before)
 
     def test_execute_integration_failure_creates_exact_owner_repairs_all_rounds(self):
         for attempt in (0, 1, 2):

@@ -2443,7 +2443,14 @@ def _render_repair_handoff(
             or phase not in {"review", "qa", "integration_qa"}
             or failure["result"] not in {"fail", "blocked"}
             or type(suite_key) is not str
-            or (phase == "integration_qa") != (suite_key == "integration")
+            or (
+                phase == "integration_qa"
+                and suite_key != "integration"
+            )
+            or (
+                phase in {"review", "qa"}
+                and suite_key != ""
+            )
             or failure["repair_round"] != validated["source_attempt"]
             or failure["stage_ordinal"] != bundle["source_stage_ordinal"]
             or type(failure["child_identifier"]) is not str
