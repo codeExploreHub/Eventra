@@ -74,8 +74,25 @@ class FakeWorkflowRunner:
 
     def __init__(self):
         self.issue = raw_issue()
+        self.parent = raw_issue(
+            id=PARENT_ID,
+            identifier="PRO-35",
+            parent_issue_id=None,
+            stage=None,
+            status="in_progress",
+            assignee_type="squad",
+        )
         self.metadata = {}
-        self.parent_metadata = {"eventra.workflow.version": "2"}
+        self.parent_metadata = {
+            "eventra.workflow.version": "2",
+            "eventra.workflow.classification": "frontend-only",
+            "eventra.workflow.next_stage": "2",
+            "eventra.workflow.attempt": "0",
+            "eventra.workflow.frontend_sha": FRONTEND_SHA,
+            "eventra.workflow.merge_state": "not_ready",
+            "eventra.workflow.last_action": "",
+        }
+        self.include_child = True
         self.calls = []
         self.fail_metadata_key = None
         self.corrupt_metadata_key = None
@@ -96,6 +113,26 @@ class FakeWorkflowRunner:
         self.calls.append(call)
         if call == ("issue", "get", "PRO-36", "--output", "json"):
             return copy.deepcopy(self.issue)
+        if call == ("issue", "get", PARENT_ID, "--output", "json"):
+            return copy.deepcopy(self.parent)
+        if call == ("issue", "children", "PRO-35", "--output", "json"):
+            issues = [copy.deepcopy(self.issue)] if self.include_child else []
+            return {
+                "stages": (
+                    []
+                    if not issues
+                    else [
+                        {
+                            "stage": self.issue["stage"],
+                            "total": 1,
+                            "done": int(self.issue["status"] == "done"),
+                            "issues": issues,
+                        }
+                    ]
+                ),
+                "total": len(issues),
+                "unstaged": [],
+            }
         if call == (
             "issue", "metadata", "list", "PRO-36", "--output", "json"
         ):
@@ -112,9 +149,10 @@ class FakeWorkflowRunner:
                 key, item = self.inject_metadata_after_sets
                 value[key] = item
             return value
-        if call == (
-            "issue", "metadata", "list", PARENT_ID, "--output", "json"
-        ):
+        if call in {
+            ("issue", "metadata", "list", PARENT_ID, "--output", "json"),
+            ("issue", "metadata", "list", "PRO-35", "--output", "json"),
+        }:
             return copy.deepcopy(self.parent_metadata)
         if call[:3] == ("issue", "metadata", "set"):
             self.assert_metadata_set_grammar(call)
@@ -325,6 +363,242 @@ class PhaseCompletionTests(unittest.TestCase):
             "pass",
         )
 
+    def test_finish_phase_rejects_noncurrent_stage_attempt_and_membership_without_mutation(self):
+        cases = {
+            "stage behind": ({"stage": 1}, {"eventra.workflow.next_stage": "3"}, 0),
+            "stage ahead": ({"stage": 3}, {"eventra.workflow.next_stage": "3"}, 0),
+            "attempt mismatch": ({}, {"eventra.workflow.attempt": "1"}, 0),
+            "not a current child": ({}, {}, 0),
+            "repair reservation": (
+                {},
+                {workflow_module.REPAIR_RESERVATION_KEY: "{}"},
+                0,
+            ),
+        }
+        for label, (detail_changes, parent_changes, _) in cases.items():
+            with self.subTest(label=label):
+                runner = FakeWorkflowRunner()
+                runner.issue.update(detail_changes)
+                runner.parent_metadata.update(parent_changes)
+                if label == "not a current child":
+                    runner.include_child = False
+
+                with self.assertRaises(RuntimeError):
+                    finish_phase(
+                        runner,
+                        "PRO-36",
+                        implementation_completion(),
+                    )
+
+                self.assertEqual(runner.mutation_count, 0)
+                self.assertEqual(runner.issue["status"], "in_review")
+
+    def test_finish_phase_requires_and_preserves_current_repair_provenance(self):
+        digest = "d" * 64
+        source_uuid = "00000000-0000-4000-8000-000000000071"
+        action = (
+            "2:PRO-35:create_repair_stage:1:frontend:"
+            + FRONTEND_SHA
+            + ":-:next-stage:3:source-stage:2:bundle:"
+            + digest
+        )
+        repair = implementation_completion(kind="repair", attempt=1)
+        provenance = {
+            "eventra.workflow.version": "2",
+            "eventra.phase.kind": "repair",
+            "eventra.phase.attempt": "1",
+            "eventra.phase.failure_repositories": "[]",
+            "eventra.phase.sha.frontend": FRONTEND_SHA,
+            "eventra.phase.pr": FRONTEND_PR,
+            "eventra.repair.creation_action": action,
+            "eventra.repair.failure_bundle_digest": digest,
+            "eventra.repair.failure_evidence_uuids": f'["{source_uuid}"]',
+            "eventra.repair.authorizing_comment_uuid": "",
+            "eventra.repair.repository": "frontend",
+            "eventra.repair.pull_request": FRONTEND_PR,
+            "eventra.repair.round": "1",
+        }
+        repair_keys = tuple(
+            key for key in provenance if key.startswith("eventra.repair.")
+        )
+        for missing in (None, *repair_keys):
+            with self.subTest(missing=missing or "all repair provenance"):
+                runner = FakeWorkflowRunner()
+                runner.issue["stage"] = 3
+                runner.parent_metadata.update(
+                    {
+                        "eventra.workflow.next_stage": "4",
+                        "eventra.workflow.attempt": "1",
+                        "eventra.workflow.last_action": action,
+                    }
+                )
+                runner.metadata.update(
+                    {
+                        key: value
+                        for key, value in provenance.items()
+                        if not key.startswith("eventra.repair.")
+                        or (missing is not None and key != missing)
+                    }
+                )
+
+                with self.assertRaises(RuntimeError):
+                    finish_phase(runner, "PRO-36", repair)
+
+                self.assertEqual(runner.mutation_count, 0)
+
+        valid = FakeWorkflowRunner()
+        valid.issue["stage"] = 3
+        valid.parent_metadata.update(
+            {
+                "eventra.workflow.next_stage": "4",
+                "eventra.workflow.attempt": "1",
+                "eventra.workflow.last_action": action,
+            }
+        )
+        valid.metadata.update(provenance)
+
+        result = finish_phase(valid, "PRO-36", repair)
+
+        self.assertEqual(result.status, "done")
+        self.assertEqual(
+            {key: valid.metadata[key] for key in repair_keys},
+            {key: provenance[key] for key in repair_keys},
+        )
+
+    def test_finish_phase_rejects_conflicting_current_repair_provenance(self):
+        digest = "d" * 64
+        source_uuid = "00000000-0000-4000-8000-000000000071"
+        action = (
+            "2:PRO-35:create_repair_stage:1:frontend:"
+            + FRONTEND_SHA
+            + ":-:next-stage:3:source-stage:2:bundle:"
+            + digest
+        )
+        provenance = {
+            "eventra.workflow.version": "2",
+            "eventra.phase.kind": "repair",
+            "eventra.phase.attempt": "1",
+            "eventra.phase.failure_repositories": "[]",
+            "eventra.phase.sha.frontend": FRONTEND_SHA,
+            "eventra.phase.pr": FRONTEND_PR,
+            "eventra.repair.creation_action": action,
+            "eventra.repair.failure_bundle_digest": digest,
+            "eventra.repair.failure_evidence_uuids": f'["{source_uuid}"]',
+            "eventra.repair.authorizing_comment_uuid": "",
+            "eventra.repair.repository": "frontend",
+            "eventra.repair.pull_request": FRONTEND_PR,
+            "eventra.repair.round": "1",
+        }
+        corruptions = {
+            "creation action": {
+                "eventra.repair.creation_action": action.replace("PRO-35", "PRO-99"),
+            },
+            "bundle digest": {"eventra.repair.failure_bundle_digest": "e" * 64},
+            "evidence partition": {"eventra.repair.failure_evidence_uuids": "[]"},
+            "automatic authorization": {
+                "eventra.repair.authorizing_comment_uuid": source_uuid,
+            },
+            "repository": {"eventra.repair.repository": "backend"},
+            "repair PR": {
+                "eventra.repair.pull_request": (
+                    "https://github.com/codeExploreHub/Eventra-Backend/pull/7"
+                ),
+            },
+            "round": {"eventra.repair.round": "2"},
+            "managed phase PR": {
+                "eventra.phase.pr": (
+                    "https://github.com/codeExploreHub/Eventra/pull/8"
+                ),
+            },
+            "candidate SHA": {"eventra.phase.sha.frontend": "e" * 40},
+        }
+        for label, changes in corruptions.items():
+            with self.subTest(label=label):
+                runner = FakeWorkflowRunner()
+                runner.issue["stage"] = 3
+                runner.parent_metadata.update(
+                    {
+                        "eventra.workflow.next_stage": "4",
+                        "eventra.workflow.attempt": "1",
+                        "eventra.workflow.last_action": action,
+                    }
+                )
+                runner.metadata.update(provenance)
+                runner.metadata.update(changes)
+
+                with self.assertRaises(RuntimeError):
+                    finish_phase(
+                        runner,
+                        "PRO-36",
+                        implementation_completion(kind="repair", attempt=1),
+                    )
+
+                self.assertEqual(runner.mutation_count, 0)
+
+        forged_actions = {
+            "parent identifier": action.replace("PRO-35", "PRO-99"),
+            "repair attempt": action.replace(
+                "create_repair_stage:1",
+                "create_repair_stage:2",
+            ),
+            "workflow scope": action.replace(":frontend:", ":backend:"),
+            "candidate SHA": action.replace(FRONTEND_SHA, "e" * 40),
+            "automatic authorization": action + ":authorization:" + source_uuid,
+        }
+        for label, forged_action in forged_actions.items():
+            with self.subTest(forged_action=label):
+                runner = FakeWorkflowRunner()
+                runner.issue["stage"] = 3
+                runner.parent_metadata.update(
+                    {
+                        "eventra.workflow.next_stage": "4",
+                        "eventra.workflow.attempt": "1",
+                        "eventra.workflow.last_action": forged_action,
+                    }
+                )
+                runner.metadata.update(provenance)
+                runner.metadata["eventra.repair.creation_action"] = forged_action
+
+                with self.assertRaises(RuntimeError):
+                    finish_phase(
+                        runner,
+                        "PRO-36",
+                        implementation_completion(kind="repair", attempt=1),
+                    )
+
+                self.assertEqual(runner.mutation_count, 0)
+
+    def test_historical_terminal_replay_cannot_claim_current_completion(self):
+        runner = FakeWorkflowRunner()
+        runner.issue["status"] = "done"
+        runner.metadata.update(build_phase_metadata(implementation_completion()))
+        runner.parent_metadata.update(
+            {
+                "eventra.workflow.next_stage": "6",
+                "eventra.workflow.attempt": "2",
+            }
+        )
+
+        with self.assertRaises(RuntimeError):
+            finish_phase(runner, "PRO-36", implementation_completion())
+
+        self.assertEqual(runner.mutation_count, 0)
+
+    def test_finish_phase_accepts_each_valid_current_nonrepair_kind(self):
+        completions = (
+            implementation_completion(),
+            implementation_completion(kind="review", pr_url=None),
+            implementation_completion(kind="qa", pr_url=None),
+            implementation_completion(kind="smoke", pr_url=None),
+        )
+        for completion in completions:
+            with self.subTest(kind=completion.kind):
+                runner = FakeWorkflowRunner()
+
+                result = finish_phase(runner, "PRO-36", completion)
+
+                self.assertEqual(result.status, "done")
+
     def test_finish_phase_is_idempotent_when_done_metadata_matches(self):
         runner = FakeWorkflowRunner()
         wanted = build_phase_metadata(implementation_completion())
@@ -494,6 +768,15 @@ def phase(
     project_id="",
     pr_url="",
     assignee_id="",
+    status="done",
+    creation_action="",
+    failure_bundle_digest="",
+    failure_evidence_uuids=(),
+    authorizing_comment_uuid="",
+    repair_repository="",
+    repair_pull_request="",
+    repair_round=0,
+    workflow_version=2,
 ):
     return PhaseSnapshot(
         issue_key=issue_key,
@@ -501,7 +784,7 @@ def phase(
         kind=kind,
         result=result,
         attempt=attempt,
-        status="done",
+        status=status,
         frontend_sha=frontend_sha,
         backend_sha=backend_sha,
         evidence_comment=evidence_comment,
@@ -510,6 +793,14 @@ def phase(
         project_id=project_id,
         pr_url=pr_url,
         assignee_id=assignee_id,
+        creation_action=creation_action,
+        failure_bundle_digest=failure_bundle_digest,
+        failure_evidence_uuids=failure_evidence_uuids,
+        authorizing_comment_uuid=authorizing_comment_uuid,
+        repair_repository=repair_repository,
+        repair_pull_request=repair_pull_request,
+        repair_round=repair_round,
+        workflow_version=workflow_version,
     )
 
 
@@ -543,6 +834,115 @@ def parent_snapshot(**overrides):
 
 
 class ParentDecisionTests(unittest.TestCase):
+    def _authoritative_current_repair_snapshot(self):
+        project_id = "00000000-0000-4000-8000-000000000040"
+        assignee_id = "00000000-0000-4000-8000-000000000042"
+        review_uuid = "00000000-0000-4000-8000-000000000071"
+        qa_uuid = "00000000-0000-4000-8000-000000000072"
+        implementation = phase(
+            "PRO-60",
+            1,
+            "implementation",
+            project_id=project_id,
+            pr_url=FRONTEND_PR,
+            assignee_id=assignee_id,
+        )
+        gates = (
+            phase(
+                "PRO-61",
+                2,
+                "review",
+                result="fail",
+                evidence_comment=review_uuid,
+                responsible_repositories=("frontend",),
+                evidence_comment_url=f"https://multica.example/comments/{review_uuid}",
+            ),
+            phase(
+                "PRO-62",
+                2,
+                "qa",
+                evidence_comment=qa_uuid,
+            ),
+        )
+        source = parent_snapshot(
+            children=(implementation, *gates),
+            next_stage=3,
+        )
+        decision = decide_parent_action(source)
+        self.assertEqual(decision.kind, "create_repair_stage")
+        bundle = decision.failure_bundle
+        self.assertIsInstance(bundle, dict)
+        repair = phase(
+            "PRO-63",
+            3,
+            "repair",
+            attempt=1,
+            project_id=project_id,
+            pr_url=FRONTEND_PR,
+            assignee_id=assignee_id,
+            creation_action=decision.action_key,
+            failure_bundle_digest=bundle["digest"],
+            failure_evidence_uuids=(review_uuid,),
+            repair_repository="frontend",
+            repair_pull_request=FRONTEND_PR,
+            repair_round=1,
+        )
+        return replace(
+            source,
+            attempt=1,
+            last_action=decision.action_key,
+            next_stage=4,
+            children=(implementation, *gates, repair),
+        )
+
+    def test_current_repair_pass_requires_complete_authoritative_provenance(self):
+        valid = self._authoritative_current_repair_snapshot()
+        current = valid.children[-1]
+        corruptions = {
+            "all provenance absent": replace(
+                current,
+                creation_action="",
+                failure_bundle_digest="",
+                failure_evidence_uuids=(),
+                repair_repository="",
+                repair_pull_request="",
+                repair_round=0,
+            ),
+            "workflow version": replace(current, workflow_version=1),
+            "creation action": replace(current, creation_action="different-action"),
+            "bundle digest": replace(current, failure_bundle_digest="f" * 64),
+            "evidence partition": replace(current, failure_evidence_uuids=()),
+            "repository": replace(current, repair_repository="backend"),
+            "repair PR": replace(
+                current,
+                repair_pull_request=(
+                    "https://github.com/codeExploreHub/Eventra-Backend/pull/7"
+                ),
+            ),
+            "round": replace(current, repair_round=2),
+            "managed phase PR": replace(current, pr_url=""),
+            "project identity": replace(current, project_id=""),
+            "assignee identity": replace(current, assignee_id=""),
+            "automatic authorization": replace(
+                current,
+                authorizing_comment_uuid="00000000-0000-4000-8000-000000000099",
+            ),
+        }
+
+        for label, repair in corruptions.items():
+            with self.subTest(label=label):
+                decision = decide_parent_action(
+                    replace(valid, children=(*valid.children[:-1], repair))
+                )
+
+                self.assertEqual(decision.kind, "block_parent")
+                self.assertIsNone(decision.action_key)
+                self.assertIsNone(decision.failure_bundle)
+
+        self.assertEqual(
+            decide_parent_action(valid).kind,
+            "create_gate_stage",
+        )
     def test_cross_stack_repair_owner_uses_its_managed_pr_project(self):
         backend_sha = "b" * 40
         frontend_project = "00000000-0000-4000-8000-000000000040"
@@ -906,32 +1306,89 @@ class ParentDecisionTests(unittest.TestCase):
 
     def test_cross_stack_repair_may_target_only_affected_repository(self):
         backend_sha = "b" * 40
-        children = (
-            phase("PRO-36", 1, "implementation"),
+        backend_pr_url = "https://github.com/codeExploreHub/Eventra-Backend/pull/7"
+        frontend_project = "00000000-0000-4000-8000-000000000040"
+        backend_project = "00000000-0000-4000-8000-000000000041"
+        frontend_owner = "00000000-0000-4000-8000-000000000042"
+        backend_owner = "00000000-0000-4000-8000-000000000043"
+        review_uuid = "00000000-0000-4000-8000-000000000081"
+        qa_uuid = "00000000-0000-4000-8000-000000000082"
+        backend_review_uuid = "00000000-0000-4000-8000-000000000083"
+        backend_qa_uuid = "00000000-0000-4000-8000-000000000084"
+        source_children = (
+            phase(
+                "PRO-36", 1, "implementation",
+                project_id=frontend_project,
+                pr_url=FRONTEND_PR,
+                assignee_id=frontend_owner,
+            ),
             phase(
                 "PRO-37",
                 1,
                 "implementation",
                 frontend_sha=None,
                 backend_sha=backend_sha,
+                project_id=backend_project,
+                pr_url=backend_pr_url,
+                assignee_id=backend_owner,
             ),
-            phase("PRO-38", 2, "review", result="fail"),
+            phase(
+                "PRO-38", 2, "review", result="fail",
+                evidence_comment=review_uuid,
+                responsible_repositories=("frontend",),
+                evidence_comment_url=f"https://multica.example/comments/{review_uuid}",
+            ),
             phase(
                 "PRO-39",
                 2,
                 "review",
                 frontend_sha=None,
                 backend_sha=backend_sha,
+                evidence_comment=backend_review_uuid,
             ),
-            phase("PRO-40", 2, "qa", backend_sha=backend_sha),
-            phase("PRO-41", 3, "repair", attempt=1),
+            phase("PRO-40", 2, "qa", evidence_comment=qa_uuid),
+            phase(
+                "PRO-41", 2, "qa",
+                frontend_sha=None,
+                backend_sha=backend_sha,
+                evidence_comment=backend_qa_uuid,
+            ),
+        )
+        pull_requests = (
+            frontend_pr(),
+            PullRequestSnapshot(
+                "backend", backend_pr_url, backend_sha, "open", True, True,
+            ),
+        )
+        source = parent_snapshot(
+            classification="cross-stack",
+            candidate_backend_sha=backend_sha,
+            children=source_children,
+            pull_requests=pull_requests,
+            next_stage=3,
+        )
+        repair_decision = decide_parent_action(source)
+        self.assertEqual(repair_decision.kind, "create_repair_stage")
+        bundle = repair_decision.failure_bundle
+        repair = phase(
+            "PRO-42", 3, "repair", attempt=1,
+            project_id=frontend_project,
+            pr_url=FRONTEND_PR,
+            assignee_id=frontend_owner,
+            creation_action=repair_decision.action_key,
+            failure_bundle_digest=bundle["digest"],
+            failure_evidence_uuids=(review_uuid,),
+            repair_repository="frontend",
+            repair_pull_request=FRONTEND_PR,
+            repair_round=1,
         )
         decision = decide_parent_action(
-            parent_snapshot(
-                classification="cross-stack",
+            replace(
+                source,
                 attempt=1,
-                candidate_backend_sha=backend_sha,
-                children=children,
+                last_action=repair_decision.action_key,
+                next_stage=4,
+                children=(*source_children, repair),
             )
         )
         self.assertEqual(decision.kind, "create_gate_stage")
@@ -1344,11 +1801,76 @@ def stalled_workflow(**overrides):
         "active_parent_has_no_executable_successor": False,
         "children": (child,),
     }
+    current_stage = overrides.pop("current_stage", 1)
     values.update(overrides)
-    return WorkflowSnapshot(**values)
+    snapshot = WorkflowSnapshot(**values)
+    object.__setattr__(snapshot, "current_stage", current_stage)
+    return snapshot
 
 
 class RecoveryDecisionTests(unittest.TestCase):
+    def test_recovery_never_selects_a_historical_child_over_current_stage(self):
+        old_terminal = stalled_workflow().children[0]
+        current_active = replace(
+            old_terminal,
+            issue_id="01a00000-0000-7000-8000-000000000020",
+            identifier="PRO-40",
+            stage=5,
+            latest_run_status="running",
+            has_active_run=True,
+        )
+        active = stalled_workflow(
+            current_stage=5,
+            children=(old_terminal, current_active),
+        )
+
+        self.assertEqual(decide_recovery(active).kind, "noop")
+
+        old_unstarted = replace(
+            old_terminal,
+            issue_status="todo",
+            latest_run_status=None,
+            latest_run_activity_at=None,
+        )
+        current_unstarted = replace(
+            old_unstarted,
+            issue_id="01a00000-0000-7000-8000-000000000021",
+            identifier="PRO-41",
+            stage=5,
+        )
+        eligible = stalled_workflow(
+            current_stage=5,
+            children=(old_unstarted, current_unstarted),
+        )
+
+        self.assertEqual(
+            decide_recovery(eligible).issue_key,
+            "PRO-41",
+        )
+
+    def test_recovery_noops_when_authoritative_current_stage_membership_is_missing(self):
+        old_terminal = stalled_workflow().children[0]
+        snapshot = stalled_workflow(
+            current_stage=5,
+            children=(old_terminal,),
+        )
+
+        decision = decide_recovery(snapshot)
+
+        self.assertEqual(decision.kind, "noop")
+        self.assertIn("current Stage", decision.reason)
+
+    def test_loaded_historical_child_alone_is_visibly_not_current(self):
+        runner = FakeWatchRunner()
+        runner.metadata["PRO-35"]["eventra.workflow.next_stage"] = "6"
+
+        snapshot = workflow_module.load_workflow_snapshot(runner, "PRO-35")
+        decision = decide_recovery(snapshot)
+
+        self.assertTrue(snapshot.has_malformed_state)
+        self.assertEqual(snapshot.current_stage, 5)
+        self.assertEqual(decision.kind, "noop")
+        self.assertIn("current Stage", decision.reason)
     def test_version_one_workflow_requires_migration_without_recovery(self):
         decision = decide_recovery(stalled_workflow(workflow_version=1))
 
@@ -1553,7 +2075,10 @@ class FakeWatchRunner:
         )
         self.child = raw_issue()
         self.metadata = {
-            "PRO-35": {"eventra.workflow.version": "2"},
+            "PRO-35": {
+                "eventra.workflow.version": "2",
+                "eventra.workflow.next_stage": "2",
+            },
             "PRO-36": {},
         }
         self.runs = {
@@ -2689,6 +3214,71 @@ class RepairExecutionTests(unittest.TestCase):
 
 
 class ParentSnapshotReadTests(unittest.TestCase):
+    def test_loaded_partial_repair_executor_provenance_fails_closed(self):
+        digest = "d" * 64
+        action = (
+            "2:PRO-65:create_repair_stage:1:backend:-:"
+            + FakeRepairRunner.BACKEND_SHA
+            + ":next-stage:3:source-stage:2:bundle:"
+            + digest
+        )
+        evidence_uuid = "00000000-0000-4000-8000-000000000071"
+        provenance = {
+            "eventra.repair.creation_action": action,
+            "eventra.repair.failure_bundle_digest": digest,
+            "eventra.repair.failure_evidence_uuids": f'["{evidence_uuid}"]',
+            "eventra.repair.authorizing_comment_uuid": "",
+            "eventra.repair.repository": "backend",
+            "eventra.repair.pull_request": FakeRepairRunner.BACKEND_PR,
+            "eventra.repair.round": "1",
+        }
+        for missing in provenance:
+            with self.subTest(missing=missing):
+                runner = FakeRepairRunner(attempt=1)
+                repair = next(
+                    child for child in runner.children if child["stage"] == 3
+                )
+                runner.metadata[str(repair["identifier"])].update(
+                    {
+                        key: value
+                        for key, value in provenance.items()
+                        if key != missing
+                    }
+                )
+
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "repair provenance",
+                ):
+                    load_parent_snapshot(
+                        runner,
+                        FakeRepairGitHubRunner(),
+                        "PRO-65",
+                    )
+
+    def test_loaded_current_repair_without_executor_provenance_blocks(self):
+        runner = FakeRepairRunner(attempt=1)
+        runner.children = [
+            child for child in runner.children if child["stage"] <= 3
+        ]
+        runner.metadata["PRO-65"]["eventra.workflow.next_stage"] = "4"
+        runner.metadata["PRO-65"]["eventra.workflow.last_action"] = (
+            "2:PRO-65:create_repair_stage:1:backend:-:"
+            + runner.BACKEND_SHA
+            + ":next-stage:3:source-stage:2:bundle:"
+            + "d" * 64
+        )
+
+        snapshot = load_parent_snapshot(
+            runner,
+            FakeRepairGitHubRunner(),
+            "PRO-65",
+        )
+        decision = decide_parent_action(snapshot)
+
+        self.assertEqual(decision.kind, "block_parent")
+        self.assertNotEqual(decision.kind, "create_gate_stage")
+
     def test_parent_authorization_comment_is_reread_from_the_parent_scoped_thread(self):
         runner = FakeParentRunner()
         comment_uuid = "00000000-0000-4000-8000-000000000061"

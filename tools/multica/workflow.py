@@ -60,6 +60,17 @@ REPAIR_ASSIGNEES = {
     "frontend": "Eventra Frontend Engineer",
     "backend": "Eventra Backend Engineer",
 }
+REPAIR_PROVENANCE_KEYS = frozenset(
+    {
+        "eventra.repair.creation_action",
+        "eventra.repair.failure_bundle_digest",
+        "eventra.repair.failure_evidence_uuids",
+        "eventra.repair.authorizing_comment_uuid",
+        "eventra.repair.repository",
+        "eventra.repair.pull_request",
+        "eventra.repair.round",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -207,6 +218,7 @@ class WorkflowSnapshot:
     active_parent_has_no_executable_successor: bool
     children: tuple[ChildRunSnapshot, ...]
     workflow_version: int = 2
+    current_stage: int | None = None
 
     def first_terminal_run_needing_transition(
         self,
@@ -215,7 +227,8 @@ class WorkflowSnapshot:
             (
                 child
                 for child in self.children
-                if child.latest_run_status in {"completed", "failed"}
+                if child.stage == self.current_stage
+                and child.latest_run_status in {"completed", "failed"}
                 and child.issue_status in {"todo", "in_progress", "in_review"}
                 and not child.has_active_run
             ),
@@ -822,6 +835,127 @@ def _repair_or_block(
     )
 
 
+def _current_repair_provenance_problem(
+    snapshot: ParentSnapshot,
+    phases: tuple[PhaseSnapshot, ...],
+) -> str | None:
+    if not phases or {item.kind for item in phases} != {"repair"}:
+        return "current repair Stage membership is malformed"
+    stage = phases[0].stage
+    if (
+        any(item.stage != stage for item in phases)
+        or stage != snapshot.next_stage - 1
+        or snapshot.last_action is None
+    ):
+        return "current repair Stage identity is not authoritative"
+    rounds = {item.attempt for item in phases}
+    creation_actions = {item.creation_action for item in phases}
+    digests = {item.failure_bundle_digest for item in phases}
+    authorizations = {item.authorizing_comment_uuid for item in phases}
+    if (
+        rounds != {snapshot.attempt}
+        or snapshot.attempt not in {1, 2, 3}
+        or creation_actions != {snapshot.last_action}
+        or len(digests) != 1
+        or re.fullmatch(r"[0-9a-f]{64}", next(iter(digests), "")) is None
+        or len(authorizations) != 1
+    ):
+        return "current repair provenance is incomplete or conflicting"
+    authorization_uuid = next(iter(authorizations))
+    if snapshot.attempt == 3:
+        if (
+            not _is_uuid(authorization_uuid)
+            or authorization_uuid != snapshot.consumed_authorization_uuid
+        ):
+            return "current repair authorization provenance is invalid"
+    elif authorization_uuid:
+        return "automatic repair provenance carries an authorization"
+    try:
+        action_next_stage, source_stage = _repair_action_stage_identity(
+            snapshot.last_action
+        )
+    except RuntimeError:
+        return "current repair creation action is malformed"
+    if action_next_stage != stage or source_stage != stage - 1:
+        return "current repair creation action has the wrong Stage identity"
+    source_phases = tuple(
+        item for item in snapshot.children if item.stage == source_stage
+    )
+    source_snapshot = replace(
+        snapshot,
+        attempt=snapshot.attempt - 1,
+        next_stage=stage,
+        last_action=None,
+        authorization_comment_uuid="",
+        authorizing_comment=None,
+        repair_reservation=None,
+    )
+    try:
+        if (
+            not source_phases
+            or any(item.status != "done" for item in source_phases)
+            or not _gate_coverage(source_snapshot, source_phases)
+            or not _phase_shas_match(source_snapshot, source_phases)
+        ):
+            return "current repair source gate membership is incomplete"
+        bundle = _failure_bundle(source_snapshot, source_phases)
+        expected_action = _action_key(
+            source_snapshot,
+            "create_repair_stage",
+            snapshot.attempt,
+            str(bundle["digest"]),
+            authorization_uuid or None,
+            int(bundle["source_stage_ordinal"]),
+        )
+        specs = _repair_child_specs(source_snapshot, bundle)
+    except (RuntimeError, ValueError, TypeError):
+        return "current repair source bundle cannot be reconstructed"
+    digest = str(bundle["digest"])
+    if expected_action != snapshot.last_action or digests != {digest}:
+        return "current repair bundle or creation action is not canonical"
+    expected_specs = {
+        str(spec["repository"]): spec for spec in specs
+    }
+    observed: dict[str, PhaseSnapshot] = {}
+    for item in phases:
+        repository = item.repair_repository
+        if repository in observed or repository not in expected_specs:
+            return "current repair child multiset is incomplete or conflicting"
+        spec = expected_specs[repository]
+        phase_repositories = {
+            name
+            for name, sha in (
+                ("frontend", item.frontend_sha),
+                ("backend", item.backend_sha),
+            )
+            if sha is not None
+        }
+        if (
+            item.workflow_version != 2
+            or item.repair_round != snapshot.attempt
+            or phase_repositories != {repository}
+            or (
+                item.frontend_sha
+                if repository == "frontend"
+                else item.backend_sha
+            )
+            != spec["candidate_sha"]
+            or item.pr_url != spec["pull_request"]
+            or item.repair_pull_request != spec["pull_request"]
+            or item.project_id != spec["project_id"]
+            or item.assignee_id != spec["assignee_id"]
+            or item.assignee_type != "agent"
+            or item.failure_evidence_uuids
+            != tuple(spec["evidence_uuids"])
+            or not item.failure_evidence_uuids
+        ):
+            return "current repair child provenance is incomplete or conflicting"
+        observed[repository] = item
+    if set(observed) != set(expected_specs):
+        return "current repair child multiset is incomplete or conflicting"
+    return None
+
+
 def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
     """Return one deterministic coordinator action without mutating state."""
 
@@ -903,6 +1037,10 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
 
     if not latest:
         return ParentDecision("noop", None, "parent has no completed stage")
+    if {item.kind for item in latest} == {"repair"}:
+        repair_problem = _current_repair_provenance_problem(snapshot, latest)
+        if repair_problem is not None:
+            return ParentDecision("block_parent", None, repair_problem)
     if any(item.status != "done" for item in latest):
         return ParentDecision("noop", None, "latest stage is still active")
     if not _attempt_history_is_consistent(snapshot):
@@ -995,8 +1133,34 @@ def decide_recovery(snapshot: WorkflowSnapshot) -> RecoveryDecision:
         )
     if snapshot.workflow_version != 2:
         return RecoveryDecision("noop", None, "state is not auto-recoverable")
-    if snapshot.has_human_approval_wait or snapshot.has_malformed_state:
+    if snapshot.has_human_approval_wait:
         return RecoveryDecision("noop", None, "state is not auto-recoverable")
+    if (
+        type(snapshot.current_stage) is not int
+        or snapshot.current_stage < 0
+    ):
+        return RecoveryDecision(
+            "noop",
+            None,
+            "authoritative current Stage is malformed",
+        )
+    current_children = tuple(
+        child
+        for child in snapshot.children
+        if child.stage == snapshot.current_stage
+    )
+    if snapshot.children and not current_children:
+        return RecoveryDecision(
+            "noop",
+            None,
+            "authoritative current Stage membership is missing",
+        )
+    if snapshot.has_malformed_state:
+        return RecoveryDecision(
+            "noop",
+            None,
+            "authoritative current Stage membership is malformed",
+        )
     stalled_child = snapshot.first_terminal_run_needing_transition()
     if stalled_child is not None:
         return RecoveryDecision(
@@ -1008,7 +1172,7 @@ def decide_recovery(snapshot: WorkflowSnapshot) -> RecoveryDecision:
         (
             child
             for child in sorted(
-                snapshot.children,
+                current_children,
                 key=lambda item: (item.stage, item.identifier),
             )
             if child.issue_status in {"todo", "in_progress", "in_review"}
@@ -1294,15 +1458,6 @@ def _phase_snapshot(
     phase_pr_url = metadata.get("eventra.phase.pr", "")
     failure_repositories = metadata.get("eventra.phase.failure_repositories")
     responsible_repositories: tuple[str, ...] = ()
-    repair_provenance_keys = {
-        "eventra.repair.creation_action",
-        "eventra.repair.failure_bundle_digest",
-        "eventra.repair.failure_evidence_uuids",
-        "eventra.repair.authorizing_comment_uuid",
-        "eventra.repair.repository",
-        "eventra.repair.pull_request",
-        "eventra.repair.round",
-    }
     creation_action = metadata.get("eventra.repair.creation_action", "")
     failure_bundle_digest = metadata.get(
         "eventra.repair.failure_bundle_digest",
@@ -1343,14 +1498,14 @@ def _phase_snapshot(
         ):
             raise RuntimeError("malformed child phase metadata")
         responsible_repositories = tuple(decoded_repositories)
-    provenance_present = bool(repair_provenance_keys & set(metadata))
+    provenance_present = bool(REPAIR_PROVENANCE_KEYS & set(metadata))
     if provenance_present:
         try:
             decoded_evidence_uuids = json.loads(evidence_uuids_text)
         except (json.JSONDecodeError, TypeError):
             raise RuntimeError("malformed child repair provenance") from None
         if (
-            not repair_provenance_keys <= set(metadata)
+            not REPAIR_PROVENANCE_KEYS <= set(metadata)
             or kind != "repair"
             or not creation_action
             or re.fullmatch(r"[0-9a-f]{64}", failure_bundle_digest) is None
@@ -2662,18 +2817,29 @@ def load_workflow_snapshot(
             )
         )
 
+    next_stage_text = parent_metadata.get("eventra.workflow.next_stage")
+    current_stage = (
+        int(next_stage_text) - 1
+        if workflow_version == "2"
+        and isinstance(next_stage_text, str)
+        and next_stage_text.isdigit()
+        and int(next_stage_text) >= 1
+        else None
+    )
     staged = [item for item in children if item["stage"] is not None]
-    latest_stage_children: list[dict[str, object]] = []
-    if staged:
-        latest_stage = max(int(item["stage"]) for item in staged)
-        latest_stage_children = [
-            item for item in staged if item["stage"] == latest_stage
-        ]
-    latest_stage_finished = bool(latest_stage_children) and all(
-        item["status"] == "done" for item in latest_stage_children
+    current_stage_children = [
+        item for item in staged if item["stage"] == current_stage
+    ]
+    malformed_current_stage = workflow_version == "2" and (
+        current_stage is None
+        or any(int(item["stage"]) > current_stage for item in staged)
+        or (bool(staged) and not current_stage_children)
+    )
+    latest_stage_finished = bool(current_stage_children) and all(
+        item["status"] == "done" for item in current_stage_children
     )
     stage_activity = max(
-        (str(item["updated_at"]) for item in latest_stage_children),
+        (str(item["updated_at"]) for item in current_stage_children),
         default="",
     )
     has_later_parent_run = latest_stage_finished and any(
@@ -2686,7 +2852,7 @@ def load_workflow_snapshot(
         parent_issue_id=str(parent["id"]),
         parent_identifier=parent_key,
         has_human_approval_wait=has_human_wait,
-        has_malformed_state=False,
+        has_malformed_state=malformed_current_stage,
         latest_stage_finished=latest_stage_finished,
         has_later_parent_run=has_later_parent_run,
         active_parent_has_no_executable_successor=(
@@ -2696,6 +2862,7 @@ def load_workflow_snapshot(
         ),
         children=tuple(snapshots),
         workflow_version=int(workflow_version),
+        current_stage=current_stage,
     )
 
 
@@ -2810,6 +2977,196 @@ def watch_projects(
     )
 
 
+def _repair_completion_provenance_problem(
+    metadata: dict[str, str],
+    detail: dict[str, object],
+    parent_metadata: dict[str, str],
+    parent_identifier: str,
+    current_stage: int,
+    current_attempt: int,
+) -> str | None:
+    observed_keys = {
+        key for key in metadata if key.startswith("eventra.repair.")
+    }
+    if observed_keys != REPAIR_PROVENANCE_KEYS:
+        return "repair completion lacks complete executor provenance"
+    try:
+        evidence_uuids = json.loads(
+            metadata["eventra.repair.failure_evidence_uuids"]
+        )
+        creation_action = metadata["eventra.repair.creation_action"]
+        action_stage, source_stage = _repair_action_stage_identity(
+            creation_action
+        )
+    except (KeyError, RuntimeError, json.JSONDecodeError, TypeError, ValueError):
+        return "repair completion executor provenance is malformed"
+    repository = metadata["eventra.repair.repository"]
+    pull_request = metadata["eventra.repair.pull_request"]
+    authorization_uuid = metadata["eventra.repair.authorizing_comment_uuid"]
+    round_text = metadata["eventra.repair.round"]
+    digest = metadata["eventra.repair.failure_bundle_digest"]
+    try:
+        pull_request_repository = _repository_for_pr(pull_request)
+    except (TypeError, ValueError):
+        return "repair completion executor provenance is malformed"
+    action_parts = creation_action.split(":")
+    expected_scope = {
+        "frontend-only": "frontend",
+        "backend-only": "backend",
+        "cross-stack": "cross-stack",
+    }.get(parent_metadata.get("eventra.workflow.classification"))
+    parent_candidates = {
+        "frontend": parent_metadata.get("eventra.workflow.frontend_sha", "-"),
+        "backend": parent_metadata.get("eventra.workflow.backend_sha", "-"),
+    }
+    action_candidates = {
+        "frontend": action_parts[5],
+        "backend": action_parts[6],
+    }
+    sha_keys = {
+        key
+        for key in ("frontend", "backend")
+        if f"eventra.phase.sha.{key}" in metadata
+    }
+    if (
+        metadata.get("eventra.workflow.version") != "2"
+        or metadata.get("eventra.phase.kind") != "repair"
+        or metadata.get("eventra.phase.attempt") != str(current_attempt)
+        or detail["stage"] != current_stage
+        or detail["assignee_type"] != "agent"
+        or creation_action != parent_metadata.get("eventra.workflow.last_action")
+        or action_parts[1] != parent_identifier
+        or action_parts[3] != str(current_attempt)
+        or action_parts[4] != expected_scope
+        or action_candidates != parent_candidates
+        or action_stage != current_stage
+        or source_stage != current_stage - 1
+        or len(action_parts) not in {13, 15}
+        or digest != action_parts[12]
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or not isinstance(evidence_uuids, list)
+        or not evidence_uuids
+        or evidence_uuids != sorted(evidence_uuids)
+        or len(evidence_uuids) != len(set(evidence_uuids))
+        or any(not _is_uuid(item) for item in evidence_uuids)
+        or metadata["eventra.repair.failure_evidence_uuids"]
+        != _canonical_json(evidence_uuids)
+        or repository not in REPAIR_ASSIGNEES
+        or sha_keys != {repository}
+        or action_candidates[repository]
+        != metadata.get(f"eventra.phase.sha.{repository}")
+        or SHA_PATTERN.fullmatch(
+            metadata.get(f"eventra.phase.sha.{repository}", "")
+        )
+        is None
+        or pull_request_repository != repository
+        or metadata.get("eventra.phase.pr") != pull_request
+        or not round_text.isdigit()
+        or int(round_text) != current_attempt
+        or (current_attempt == 3) != bool(authorization_uuid)
+        or (authorization_uuid and not _is_uuid(authorization_uuid))
+        or (current_attempt == 3 and len(action_parts) != 15)
+        or (
+            current_attempt == 3
+            and action_parts[14] != authorization_uuid
+        )
+        or (current_attempt in {1, 2} and len(action_parts) != 13)
+        or (
+            current_attempt == 3
+            and authorization_uuid
+            != parent_metadata.get(REPAIR_AUTHORIZATION_CONSUMED_KEY, "")
+        )
+    ):
+        return "repair completion executor provenance conflicts"
+    return None
+
+
+def _finish_phase_authority_problem(
+    runner: MulticaRunner,
+    detail: dict[str, object],
+    metadata: dict[str, str],
+    value: PhaseCompletion,
+) -> str | None:
+    parent_id = str(detail["parent_issue_id"])
+    raw_parent = runner.run(
+        ["issue", "get", parent_id, "--output", "json"]
+    )
+    if (
+        not isinstance(raw_parent, dict)
+        or type(raw_parent.get("identifier")) is not str
+    ):
+        return "authoritative parent detail is malformed"
+    try:
+        parent = parse_issue_detail(raw_parent, str(raw_parent["identifier"]))
+        children = parse_issue_children(
+            runner.run(
+                [
+                    "issue",
+                    "children",
+                    str(parent["identifier"]),
+                    "--output",
+                    "json",
+                ]
+            ),
+            str(parent["id"]),
+        )
+        parent_metadata = parse_issue_metadata(
+            runner.run(
+                [
+                    "issue",
+                    "metadata",
+                    "list",
+                    str(parent["identifier"]),
+                    "--output",
+                    "json",
+                ]
+            )
+        )
+        if parent_metadata.get("eventra.workflow.version") == "1":
+            return "version 1 workflow requires explicit migration"
+        parent_workflow = _parent_metadata(parent_metadata)
+    except RuntimeError:
+        return "authoritative parent or child relationship is malformed"
+    next_stage = int(parent_workflow["next_stage"])
+    attempt = int(parent_workflow["attempt"])
+    if (
+        parent["parent_issue_id"] is not None
+        or parent["stage"] is not None
+        or parent["status"] not in {"todo", "in_progress", "in_review"}
+        or parent_workflow["workflow_version"] != 2
+        or next_stage < 2
+        or attempt not in {0, 1, 2, 3}
+        or parent_workflow["repair_reservation"] is not None
+    ):
+        return "parent is not a mutable current workflow authority"
+    current_stage = next_stage - 1
+    matches = [
+        child
+        for child in children
+        if child["id"] == detail["id"]
+        and child["identifier"] == detail["identifier"]
+    ]
+    if (
+        len(matches) != 1
+        or matches[0] != detail
+        or detail["stage"] != current_stage
+        or value.attempt != attempt
+    ):
+        return "phase completion is not for the exact current child"
+    if value.kind == "repair":
+        return _repair_completion_provenance_problem(
+            metadata,
+            detail,
+            parent_metadata,
+            str(parent["identifier"]),
+            current_stage,
+            attempt,
+        )
+    if any(key.startswith("eventra.repair.") for key in metadata):
+        return "non-repair completion carries repair provenance"
+    return None
+
+
 def finish_phase(
     runner: MulticaRunner,
     issue_key: str,
@@ -2834,6 +3191,14 @@ def finish_phase(
     }
     if detail["status"] == "done":
         if controlled_before == wanted:
+            authority_problem = _finish_phase_authority_problem(
+                runner,
+                detail,
+                before,
+                value,
+            )
+            if authority_problem is not None:
+                raise RuntimeError(authority_problem)
             return PhaseResult(
                 str(detail["id"]), issue_key, "done", value.kind, value.result, 0
             )
@@ -2850,20 +3215,14 @@ def finish_phase(
         raise RuntimeError("phase issue is not mutable")
     if controlled_before.get("eventra.workflow.version") == "1":
         raise RuntimeError("version 1 workflow requires explicit migration")
-    parent_metadata = parse_issue_metadata(
-        runner.run(
-            [
-                "issue",
-                "metadata",
-                "list",
-                str(detail["parent_issue_id"]),
-                "--output",
-                "json",
-            ]
-        )
+    authority_problem = _finish_phase_authority_problem(
+        runner,
+        detail,
+        before,
+        value,
     )
-    if parent_metadata.get("eventra.workflow.version") != "2":
-        raise RuntimeError("version 1 workflow requires explicit migration")
+    if authority_problem is not None:
+        raise RuntimeError(authority_problem)
     if any(
         key not in wanted or wanted[key] != item
         for key, item in controlled_before.items()
