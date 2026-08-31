@@ -1556,7 +1556,7 @@ class ParentDecisionTests(unittest.TestCase):
             attempt=1,
             last_action=decision.action_key,
             next_stage=4,
-            children=(implementation, *gates, repair),
+            children=(*source.children, repair),
             candidate_frontend_sha=(
                 replacement_sha if parent_copied else FRONTEND_SHA
             ),
@@ -1648,6 +1648,12 @@ class ParentDecisionTests(unittest.TestCase):
                 backend_sha=backend_sha,
                 evidence_comment="00000000-0000-4000-8000-000000000094",
             ),
+            phase(
+                "PRO-78", source_stage, "integration_qa",
+                attempt=source_attempt,
+                backend_sha=backend_sha,
+                evidence_comment="00000000-0000-4000-8000-000000000097",
+            ),
         )
         source_prs = (
             frontend_pr(),
@@ -1737,7 +1743,7 @@ class ParentDecisionTests(unittest.TestCase):
             attempt=repair_round,
             last_action=action,
             next_stage=repair_stage + 1,
-            children=(*implementation, *gates, *repairs),
+            children=(*source.children, *repairs),
             candidate_frontend_sha=(
                 FRONTEND_SHA
                 if parent_frontend_sha is None
@@ -2738,7 +2744,7 @@ class ParentDecisionTests(unittest.TestCase):
                 attempt=1,
                 last_action=repair_decision.action_key,
                 next_stage=4,
-                children=(*source_children, repair),
+                children=(*source.children, repair),
                 candidate_frontend_sha=replacement_sha,
                 pull_requests=(
                     replace(pull_requests[0], head_sha=replacement_sha),
@@ -2864,7 +2870,7 @@ class ParentDecisionTests(unittest.TestCase):
             attempt=1,
             last_action=repair_decision.action_key,
             next_stage=4,
-            children=(*source_children, *repairs),
+            children=(*source.children, *repairs),
             candidate_frontend_sha=replacement_frontend,
             candidate_backend_sha=replacement_backend,
             pull_requests=(
@@ -4266,6 +4272,15 @@ class FakeRepairRunner:
 
 
 class RepairExecutionTests(unittest.TestCase):
+    SOURCE_GATE_FORGERIES = (
+        "creation_action",
+        "phase_target",
+        "phase_role",
+        "assignee_type",
+        "project_id",
+        "candidate_sha",
+    )
+
     def test_parser_requires_the_exact_expected_repair_action(self):
         args = build_workflow_parser().parse_args(
             [
@@ -4294,6 +4309,101 @@ class RepairExecutionTests(unittest.TestCase):
         decision = decide_parent_action(snapshot)
         self.assertEqual(decision.kind, "create_repair_stage")
         return runner, github, decision
+
+    @staticmethod
+    def _forge_source_gate_identity(runner, face):
+        source_reviews = [
+            child
+            for child in runner.children
+            if runner.metadata[child["identifier"]].get("eventra.phase.kind")
+            == "review"
+        ]
+        source = max(source_reviews, key=lambda child: child["stage"])
+        metadata = runner.metadata[source["identifier"]]
+        if face == "creation_action":
+            metadata["eventra.phase.creation_action"] = "forged-source-action"
+        elif face == "phase_target":
+            metadata["eventra.phase.target"] = "repository:frontend"
+        elif face == "phase_role":
+            metadata["eventra.phase.role"] = "integration_qa"
+        elif face == "assignee_type":
+            source["assignee_type"] = "member"
+        elif face == "project_id":
+            source["project_id"] = "00000000-0000-4000-8000-000000000098"
+        elif face == "candidate_sha":
+            metadata["eventra.phase.sha.backend"] = "e" * 40
+        else:
+            raise AssertionError(f"unknown source Gate forgery: {face}")
+
+    def test_planner_rejects_forged_historical_source_gate_identity_all_rounds(self):
+        for attempt in (0, 1, 2):
+            for face in self.SOURCE_GATE_FORGERIES:
+                with self.subTest(repair_round=attempt + 1, face=face):
+                    runner, github, decision = self._planned(attempt=attempt)
+                    created = execute_parent_repair(
+                        runner,
+                        github,
+                        "PRO-65",
+                        expected_action_key=decision.action_key,
+                    )
+                    self.assertEqual(created.next_action, "repair", created.reason)
+                    self._forge_source_gate_identity(runner, face)
+                    before = len(runner.mutation_calls)
+
+                    planned = decide_parent_action(
+                        load_parent_snapshot(runner, github, "PRO-65")
+                    )
+
+                    self.assertEqual(planned.kind, "block_parent", planned.reason)
+                    self.assertEqual(len(runner.mutation_calls), before)
+
+    def test_reservation_rejects_forged_historical_source_gate_identity_all_rounds(self):
+        for attempt in (0, 1, 2):
+            for face in self.SOURCE_GATE_FORGERIES:
+                with self.subTest(repair_round=attempt + 1, face=face):
+                    runner, github, decision = self._planned(attempt=attempt)
+                    snapshot = load_parent_snapshot(runner, github, "PRO-65")
+                    reservation = _build_repair_reservation(snapshot, decision)
+                    self._forge_source_gate_identity(runner, face)
+                    fresh = load_parent_snapshot(runner, github, "PRO-65")
+                    before = len(runner.mutation_calls)
+
+                    with self.assertRaisesRegex(
+                        RuntimeError, "source Gate identity"
+                    ):
+                        workflow_module._validate_repair_reservation(
+                            fresh,
+                            reservation,
+                            decision.action_key,
+                        )
+
+                    self.assertEqual(len(runner.mutation_calls), before)
+
+    def test_replay_rejects_forged_historical_source_gate_identity_all_rounds(self):
+        for attempt in (0, 1, 2):
+            for face in self.SOURCE_GATE_FORGERIES:
+                with self.subTest(repair_round=attempt + 1, face=face):
+                    runner, github, decision = self._planned(attempt=attempt)
+                    created = execute_parent_repair(
+                        runner,
+                        github,
+                        "PRO-65",
+                        expected_action_key=decision.action_key,
+                    )
+                    self.assertEqual(created.next_action, "repair", created.reason)
+                    self._forge_source_gate_identity(runner, face)
+                    before = len(runner.mutation_calls)
+
+                    replay = execute_parent_repair(
+                        runner,
+                        github,
+                        "PRO-65",
+                        expected_action_key=decision.action_key,
+                    )
+
+                    self.assertEqual(replay.next_action, "block", replay.reason)
+                    self.assertEqual(replay.mutation_count, 0)
+                    self.assertEqual(len(runner.mutation_calls), before)
 
     @staticmethod
     def _retarget_latest_child(

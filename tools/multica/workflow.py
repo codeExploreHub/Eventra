@@ -717,9 +717,6 @@ def _gate_coverage(
             and len(observed) == len(set(observed))
             and set(observed) == legacy_expected
         )
-    if len(expected) > 1:
-        expected_identities.add(("integration_qa", "suite:integration"))
-    observed: list[tuple[str, str]] = []
     expected_action = _action_key(
         replace(
             snapshot,
@@ -729,6 +726,31 @@ def _gate_coverage(
         "create_gate_stage",
         snapshot.attempt,
     )
+    return (
+        snapshot.last_action == expected_action
+        and _strict_gate_identity_matches(
+            snapshot,
+            phases,
+            expected_action=expected_action,
+        )
+    )
+
+
+def _strict_gate_identity_matches(
+    snapshot: ParentSnapshot,
+    phases: tuple[PhaseSnapshot, ...],
+    *,
+    expected_action: str,
+) -> bool:
+    expected = _expected_repositories(snapshot)
+    expected_identities = {
+        (kind, repository)
+        for kind in ("review", "qa")
+        for repository in expected
+    }
+    if len(expected) > 1:
+        expected_identities.add(("integration_qa", "suite:integration"))
+    observed: list[tuple[str, str]] = []
     role_assignees: dict[str, set[str]] = {
         "independent_reviewer": set(),
         "integration_qa": set(),
@@ -737,7 +759,11 @@ def _gate_coverage(
         repository: set() for repository in expected
     }
     integration_projects: set[str] = set()
-    if snapshot.last_action != expected_action:
+    if (
+        not phases
+        or len({item.stage for item in phases}) != 1
+        or not _phase_shas_match(snapshot, phases)
+    ):
         return False
     for item in phases:
         repositories = tuple(
@@ -804,6 +830,24 @@ def _gate_coverage(
         bool(observed)
         and len(observed) == len(set(observed))
         and set(observed) == expected_identities
+    )
+
+
+def _historical_gate_identity_matches(
+    snapshot: ParentSnapshot,
+    phases: tuple[PhaseSnapshot, ...],
+) -> bool:
+    if not phases:
+        return False
+    expected_action = _action_key(
+        replace(snapshot, next_stage=phases[0].stage, last_action=None),
+        "create_gate_stage",
+        snapshot.attempt,
+    )
+    return _strict_gate_identity_matches(
+        snapshot,
+        phases,
+        expected_action=expected_action,
     )
 
 
@@ -1169,8 +1213,9 @@ def _current_repair_provenance_problem(
         if (
             not source_phases
             or any(item.status != "done" for item in source_phases)
-            or not _gate_coverage(source_snapshot, source_phases)
-            or not _phase_shas_match(source_snapshot, source_phases)
+            or not _historical_gate_identity_matches(
+                source_snapshot, source_phases
+            )
         ):
             return "current repair source gate membership is incomplete"
         bundle = _failure_bundle(source_snapshot, source_phases)
@@ -2234,6 +2279,8 @@ def _validate_repair_reservation(
         ),
         source_candidates,
     )
+    if not _historical_gate_identity_matches(source_snapshot, source_phases):
+        raise RuntimeError("repair source Gate identity is not authoritative")
     try:
         fresh_bundle = _failure_bundle(source_snapshot, source_phases)
     except ValueError:
@@ -2926,6 +2973,8 @@ def _verified_replayed_repair_children(
     source_phases = tuple(
         item for item in snapshot.children if item.stage == source_stage
     )
+    if not _historical_gate_identity_matches(source_snapshot, source_phases):
+        raise RuntimeError("recorded repair source Gate identity conflicts")
     try:
         bundle = _failure_bundle(source_snapshot, source_phases)
     except ValueError:
