@@ -318,11 +318,11 @@ scan, deterministic planning, and bounded curation. The intended command
 surface is:
 
 ```text
-python3 -B -m tools.multica.knowledge context --repository frontend|backend --task-type TYPE --sha KEY=FULL_SHA [--path PATH ...]
+python3 -B -m tools.multica.knowledge context --task-id ISSUE --repository frontend|backend --task-type TYPE --sha KEY=FULL_SHA [--path PATH ...]
 python3 -B -m tools.multica.knowledge candidate --input CANDIDATE_JSON_FILE
-python3 -B -m tools.multica.knowledge scan
-python3 -B -m tools.multica.knowledge plan
-python3 -B -m tools.multica.knowledge curate --apply
+python3 -B -m tools.multica.knowledge scan --project-id ID --backend-project-id ID
+python3 -B -m tools.multica.knowledge plan --project-id ID --backend-project-id ID
+python3 -B -m tools.multica.knowledge curate --project-id ID --backend-project-id ID --apply
 python3 -B -m tools.multica.knowledge verify
 ```
 
