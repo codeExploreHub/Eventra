@@ -162,13 +162,21 @@ knowledge store. Each entry contains:
 - applicable repository paths and task types;
 - status: `active` or `deprecated`;
 - replacement identifier when deprecated;
-- source Issue, evidence comment, and exact candidate SHA map;
+- provenance kind: `delivery_evidence` or `bootstrap_design`;
+- for delivery evidence, source Issue, evidence comment, and exact candidate SHA
+  map;
+- for the initial bootstrap only, this design path and its Git commit SHA;
 - last verified commit SHA and date; and
 - content digest.
 
 Index verification fails on duplicate identifiers, missing files, invalid
 paths, broken replacement links, digest mismatch, or a cross-repository entry
 without a canonical shared source.
+
+`bootstrap_design` is allowed only for the initial seed entries created by this
+pilot and must point to this reviewed design document and commit. New or
+updated operational knowledge after rollout must use `delivery_evidence`; the
+Curator cannot use bootstrap provenance to bypass Issue evidence.
 
 ## Retrieval and Context Receipt
 
@@ -310,15 +318,19 @@ scan, deterministic planning, and bounded curation. The intended command
 surface is:
 
 ```text
+python3 -B -m tools.multica.knowledge context --repository frontend|backend --task-type TYPE --sha KEY=FULL_SHA [--path PATH ...]
+python3 -B -m tools.multica.knowledge candidate --input CANDIDATE_JSON_FILE
 python3 -B -m tools.multica.knowledge scan
 python3 -B -m tools.multica.knowledge plan
 python3 -B -m tools.multica.knowledge curate --apply
 python3 -B -m tools.multica.knowledge verify
 ```
 
-`scan`, `plan`, and `verify` are read-only. `curate --apply` performs only the
-single planned mutation chain and verifies every authoritative acknowledgement
-by rereading it.
+`context`, `candidate`, `scan`, `plan`, and `verify` are read-only.
+`candidate` validates, canonicalizes, and prints the digest-bearing JSON block
+that an Agent places in its normal evidence comment. `curate --apply` performs
+only the single planned mutation chain and verifies every authoritative
+acknowledgement by rereading it.
 
 ### Multiple operational automations
 
