@@ -1037,6 +1037,33 @@ def _current_repair_provenance_problem(
     observed_heads = {
         item.repository: item.head_sha for item in snapshot.pull_requests
     }
+    if (
+        len(snapshot.pull_requests) != len(source_candidates)
+        or set(observed_heads) != set(source_candidates)
+    ):
+        return "current managed pull-request identity set is incomplete"
+    allowed_partial_parent_values: dict[str, set[str]] = {
+        repository: {source_sha}
+        for repository, source_sha in source_candidates.items()
+    }
+    for repository, source_sha in source_candidates.items():
+        item = observed.get(repository)
+        head_sha = observed_heads[repository]
+        if item is None:
+            if head_sha != source_sha:
+                return "unaffected managed pull-request head changed during repair"
+            continue
+        phase_sha = (
+            item.frontend_sha
+            if repository == "frontend"
+            else item.backend_sha
+        )
+        if item.status == "done" and item.result == "pass":
+            if head_sha != phase_sha:
+                return "completed repair replacement does not match its current head"
+            allowed_partial_parent_values[repository].add(str(phase_sha))
+        elif item.status == "done" and head_sha != source_sha:
+            return "nonpassing repair changed its managed pull-request head"
     if all_repairs_passed:
         if observed_heads != replacement_candidates:
             return "current managed pull-request heads do not match completed repair replacements"
@@ -1044,8 +1071,12 @@ def _current_repair_provenance_problem(
             return "completed repair replacement awaits parent candidate metadata copy"
         if parent_candidates != replacement_candidates:
             return "parent candidate metadata does not match completed repair replacements"
-    elif parent_candidates != source_candidates:
-        return "parent candidate metadata changed before the repair Stage completed"
+    else:
+        if set(parent_candidates) != set(source_candidates) or any(
+            parent_candidates[repository] not in allowed_values
+            for repository, allowed_values in allowed_partial_parent_values.items()
+        ):
+            return "parent candidate metadata changed before its repair completed"
     return None
 
 
@@ -1090,7 +1121,10 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
         latest = tuple(item for item in snapshot.children if item.stage == latest_stage)
     else:
         latest = ()
-    if latest and {item.kind for item in latest} == {"repair"}:
+    current_repair_stage = bool(
+        latest and {item.kind for item in latest} == {"repair"}
+    )
+    if current_repair_stage:
         repair_problem = _current_repair_provenance_problem(snapshot, latest)
         if repair_problem is not None:
             return ParentDecision("block_parent", None, repair_problem)
@@ -1098,7 +1132,7 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
         "frontend": snapshot.candidate_frontend_sha,
         "backend": snapshot.candidate_backend_sha,
     }
-    if any(
+    if not current_repair_stage and any(
         pull_request.head_sha != expected_heads.get(pull_request.repository)
         for pull_request in snapshot.pull_requests
     ):

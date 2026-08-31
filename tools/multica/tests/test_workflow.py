@@ -1067,6 +1067,353 @@ class ParentDecisionTests(unittest.TestCase):
             pull_requests=(frontend_pr(head_sha=replacement_sha),),
         )
 
+    def _partial_cross_stack_repair_snapshot(
+        self,
+        *,
+        repair_round=1,
+        frontend_done=True,
+        backend_owned=True,
+        backend_done=False,
+        frontend_head=None,
+        backend_head=None,
+        parent_frontend_sha=None,
+        parent_backend_sha=None,
+    ):
+        backend_sha = "b" * 40
+        frontend_replacement = "c" * 40
+        backend_replacement = "d" * 40
+        backend_pr = "https://github.com/codeExploreHub/Eventra-Backend/pull/7"
+        frontend_project = "00000000-0000-4000-8000-000000000040"
+        backend_project = "00000000-0000-4000-8000-000000000041"
+        frontend_owner = "00000000-0000-4000-8000-000000000042"
+        backend_owner = "00000000-0000-4000-8000-000000000043"
+        frontend_failure = "00000000-0000-4000-8000-000000000091"
+        backend_evidence = "00000000-0000-4000-8000-000000000092"
+        source_attempt = repair_round - 1
+        source_stage = repair_round * 2
+        repair_stage = source_stage + 1
+        authorization_uuid = (
+            "00000000-0000-4000-8000-000000000099"
+            if repair_round == 3
+            else ""
+        )
+        implementation = (
+            phase(
+                "PRO-70", 1, "implementation",
+                project_id=frontend_project,
+                pr_url=FRONTEND_PR,
+                assignee_id=frontend_owner,
+            ),
+            phase(
+                "PRO-71", 1, "implementation",
+                frontend_sha=None,
+                backend_sha=backend_sha,
+                project_id=backend_project,
+                pr_url=backend_pr,
+                assignee_id=backend_owner,
+            ),
+        )
+        gates = (
+            phase(
+                "PRO-72", source_stage, "review",
+                result="fail",
+                attempt=source_attempt,
+                evidence_comment=frontend_failure,
+                responsible_repositories=("frontend",),
+                evidence_comment_url=(
+                    f"https://multica.example/comments/{frontend_failure}"
+                ),
+            ),
+            phase(
+                "PRO-73", source_stage, "review",
+                result="fail" if backend_owned else "pass",
+                attempt=source_attempt,
+                frontend_sha=None,
+                backend_sha=backend_sha,
+                evidence_comment=backend_evidence,
+                responsible_repositories=("backend",) if backend_owned else (),
+                evidence_comment_url=(
+                    f"https://multica.example/comments/{backend_evidence}"
+                    if backend_owned
+                    else None
+                ),
+            ),
+            phase(
+                "PRO-74", source_stage, "qa",
+                attempt=source_attempt,
+                evidence_comment="00000000-0000-4000-8000-000000000093",
+            ),
+            phase(
+                "PRO-75", source_stage, "qa",
+                attempt=source_attempt,
+                frontend_sha=None,
+                backend_sha=backend_sha,
+                evidence_comment="00000000-0000-4000-8000-000000000094",
+            ),
+        )
+        source_prs = (
+            frontend_pr(),
+            PullRequestSnapshot(
+                "backend", backend_pr, backend_sha, "open", True, True,
+            ),
+        )
+        source = parent_snapshot(
+            classification="cross-stack",
+            attempt=source_attempt,
+            candidate_backend_sha=backend_sha,
+            children=(*implementation, *gates),
+            pull_requests=source_prs,
+            next_stage=repair_stage,
+        )
+        bundle = _failure_bundle(source, gates)
+        action = _action_key(
+            source,
+            "create_repair_stage",
+            repair_round,
+            bundle["digest"],
+            authorization_uuid or None,
+            source_stage,
+        )
+        source_candidates = (
+            ("backend", backend_sha),
+            ("frontend", FRONTEND_SHA),
+        )
+        repairs = [
+            phase(
+                "PRO-76", repair_stage, "repair",
+                result="pass" if frontend_done else None,
+                attempt=repair_round,
+                status="done" if frontend_done else "in_progress",
+                frontend_sha=(
+                    frontend_replacement if frontend_done else FRONTEND_SHA
+                ),
+                project_id=frontend_project,
+                pr_url=FRONTEND_PR,
+                assignee_id=frontend_owner,
+                creation_action=action,
+                failure_bundle_digest=bundle["digest"],
+                failure_evidence_uuids=(frontend_failure,),
+                authorizing_comment_uuid=authorization_uuid,
+                repair_repository="frontend",
+                repair_pull_request=FRONTEND_PR,
+                repair_round=repair_round,
+                repair_source_candidates=source_candidates,
+            )
+        ]
+        if backend_owned:
+            repairs.append(
+                phase(
+                    "PRO-77", repair_stage, "repair",
+                    result="pass" if backend_done else None,
+                    attempt=repair_round,
+                    status="done" if backend_done else "in_progress",
+                    frontend_sha=None,
+                    backend_sha=(
+                        backend_replacement if backend_done else backend_sha
+                    ),
+                    project_id=backend_project,
+                    pr_url=backend_pr,
+                    assignee_id=backend_owner,
+                    creation_action=action,
+                    failure_bundle_digest=bundle["digest"],
+                    failure_evidence_uuids=(backend_evidence,),
+                    authorizing_comment_uuid=authorization_uuid,
+                    repair_repository="backend",
+                    repair_pull_request=backend_pr,
+                    repair_round=repair_round,
+                    repair_source_candidates=source_candidates,
+                )
+            )
+        return replace(
+            source,
+            attempt=repair_round,
+            last_action=action,
+            next_stage=repair_stage + 1,
+            children=(*implementation, *gates, *repairs),
+            candidate_frontend_sha=(
+                FRONTEND_SHA
+                if parent_frontend_sha is None
+                else parent_frontend_sha
+            ),
+            candidate_backend_sha=(
+                backend_sha if parent_backend_sha is None else parent_backend_sha
+            ),
+            pull_requests=(
+                frontend_pr(
+                    head_sha=(
+                        frontend_replacement
+                        if frontend_head is None
+                        else frontend_head
+                    )
+                ),
+                replace(
+                    source_prs[1],
+                    head_sha=(backend_sha if backend_head is None else backend_head),
+                ),
+            ),
+            consumed_authorization_uuid=authorization_uuid,
+        )
+
+    def test_partial_repair_requires_completed_output_to_equal_current_head(self):
+        valid = self._partial_cross_stack_repair_snapshot()
+
+        self.assertEqual(decide_parent_action(valid).kind, "noop")
+
+    def test_partial_repair_blocks_completed_output_not_matching_current_head(self):
+        valid = self._partial_cross_stack_repair_snapshot()
+
+        for stale_or_wrong in (FRONTEND_SHA, "e" * 40):
+            with self.subTest(frontend_head=stale_or_wrong):
+                changed = replace(
+                    valid,
+                    pull_requests=(
+                        replace(valid.pull_requests[0], head_sha=stale_or_wrong),
+                        valid.pull_requests[1],
+                    ),
+                )
+
+                self.assertEqual(
+                    decide_parent_action(changed).kind,
+                    "block_parent",
+                )
+
+    def test_partial_repair_allows_active_head_motion_but_not_early_adoption(self):
+        for repair_round in (1, 2, 3):
+            for active_head in ("b" * 40, "e" * 40, "f" * 40):
+                with self.subTest(
+                    repair_round=repair_round,
+                    active_head=active_head,
+                ):
+                    snapshot = self._partial_cross_stack_repair_snapshot(
+                        repair_round=repair_round,
+                        backend_head=active_head,
+                    )
+
+                    self.assertEqual(decide_parent_action(snapshot).kind, "noop")
+
+        partial_copy = self._partial_cross_stack_repair_snapshot(
+            backend_head="e" * 40,
+            parent_frontend_sha="c" * 40,
+        )
+        self.assertEqual(decide_parent_action(partial_copy).kind, "noop")
+        for label, changed in {
+            "unknown completed output": replace(
+                partial_copy,
+                candidate_frontend_sha="e" * 40,
+            ),
+            "active owner adopted": replace(
+                partial_copy,
+                candidate_backend_sha="e" * 40,
+            ),
+        }.items():
+            with self.subTest(label=label):
+                self.assertEqual(decide_parent_action(changed).kind, "block_parent")
+
+    def test_partial_one_owner_repair_ignores_owner_motion_but_blocks_unaffected_drift(self):
+        active = self._partial_cross_stack_repair_snapshot(
+            frontend_done=False,
+            backend_owned=False,
+            frontend_head="e" * 40,
+        )
+
+        self.assertEqual(decide_parent_action(active).kind, "noop")
+        unaffected_drift = replace(
+            active,
+            pull_requests=(
+                active.pull_requests[0],
+                replace(active.pull_requests[1], head_sha="f" * 40),
+            ),
+        )
+        self.assertEqual(
+            decide_parent_action(unaffected_drift).kind,
+            "block_parent",
+        )
+
+    def test_partial_repair_multiset_and_terminal_controls_remain_fail_closed(self):
+        partial = self._partial_cross_stack_repair_snapshot()
+        current = partial.children[-2:]
+        missing_owner = replace(
+            partial,
+            children=partial.children[:-1],
+        )
+        duplicate_owner = replace(
+            partial,
+            children=(*partial.children, replace(current[0], issue_key="PRO-78")),
+        )
+        failed_owner = replace(
+            partial,
+            children=(
+                *partial.children[:-1],
+                replace(current[1], status="done", result="fail"),
+            ),
+            pull_requests=(
+                partial.pull_requests[0],
+                replace(partial.pull_requests[1], head_sha="b" * 40),
+            ),
+        )
+        for label, changed in {
+            "missing owner": missing_owner,
+            "duplicate owner": duplicate_owner,
+            "terminal failure": failed_owner,
+        }.items():
+            with self.subTest(label=label):
+                self.assertEqual(decide_parent_action(changed).kind, "block_parent")
+
+        completed = self._partial_cross_stack_repair_snapshot(
+            backend_done=True,
+            backend_head="d" * 40,
+            parent_frontend_sha="c" * 40,
+            parent_backend_sha="d" * 40,
+        )
+        self.assertEqual(decide_parent_action(completed).kind, "create_gate_stage")
+
+    def test_nonrepair_stages_keep_the_generic_parent_head_drift_boundary(self):
+        drifted_pr = frontend_pr(head_sha="e" * 40)
+        cases = {
+            "implementation": replace(
+                parent_snapshot(),
+                pull_requests=(drifted_pr,),
+            ),
+            "gate": parent_snapshot(
+                children=(
+                    phase(
+                        "PRO-80", 2, "review",
+                        evidence_comment=(
+                            "00000000-0000-4000-8000-000000000080"
+                        ),
+                    ),
+                    phase(
+                        "PRO-81", 2, "qa",
+                        evidence_comment=(
+                            "00000000-0000-4000-8000-000000000081"
+                        ),
+                    ),
+                ),
+                pull_requests=(drifted_pr,),
+                next_stage=3,
+            ),
+            "smoke": parent_snapshot(
+                merge_state="merged",
+                children=(
+                    phase(
+                        "PRO-82", 4, "smoke",
+                        evidence_comment=(
+                            "00000000-0000-4000-8000-000000000082"
+                        ),
+                    ),
+                ),
+                pull_requests=(drifted_pr,),
+                next_stage=5,
+            ),
+        }
+
+        for label, snapshot in cases.items():
+            with self.subTest(label=label):
+                decision = decide_parent_action(snapshot)
+
+                self.assertEqual(decision.kind, "block_parent")
+                self.assertIn("out-of-band", decision.reason)
+
     def test_current_repair_pass_requires_complete_authoritative_provenance(self):
         valid = self._authoritative_current_repair_snapshot()
         current = valid.children[-1]
