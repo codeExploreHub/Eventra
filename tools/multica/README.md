@@ -193,8 +193,8 @@ Do not create repair children manually. The helper freshly rereads and replans,
 then reserves `eventra.workflow.repair_reservation`, creates owner children in
 backlog, and persists/rereads `eventra.repair.creation_action`,
 `eventra.repair.failure_bundle_digest`, sorted failure evidence UUIDs, exact
-stage/round, existing managed PR, and
-`eventra.repair.authorizing_comment_uuid`. It commits parent attempt,
+stage/round, existing managed PR, `eventra.repair.authorizing_comment_uuid`, and
+the canonical immutable `eventra.repair.source_candidates` rejected-SHA map. It commits parent attempt,
 `next_stage`, last action, and consumed authorization provenance, then starts
 the assigned agent only for the exact children. Each child receives a
 deterministic repair handoff containing the bound parent/action/bundle, source
@@ -203,6 +203,16 @@ assigned canonical evidence. The reservation is cleared last. `mutation_count`
 reports authoritatively observed effects, including committed effects after a
 lost acknowledgement. Exact retries resume or no-op, while conflicts and
 partial mismatches block visibly.
+
+A version-2 repair PASS must replace its owned rejected SHA; an unchanged SHA
+is not a successful repair. `finish-phase` may change only that child's owned
+`eventra.phase.sha.*` once and preserves every `eventra.repair.*` field exactly.
+After all repair owners pass, Delivery Lead copies the exact completed
+replacement map into the parent candidate metadata, leaving untouched
+repositories at their source values, and invokes `plan-parent` again. Planning
+before this copy blocks with an explicit wait; it never adopts a child SHA.
+Fresh gates require both the copied parent candidates and authoritative managed
+PR heads to equal the completed replacements.
 This Eventra-local adapter is safe only under the provisioned single serialized
 Delivery Lead (`max_concurrent_tasks=1`); it is not generic CAS or transaction
 safety.

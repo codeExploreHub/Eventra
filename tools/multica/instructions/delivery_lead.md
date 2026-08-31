@@ -104,7 +104,8 @@ next barrier group, then advance `next_stage` and record `last_action`.
   `eventra.workflow.repair_reservation`, parks exactly one owner child in
   backlog, persists and rereads `eventra.repair.creation_action`,
   `eventra.repair.failure_bundle_digest`, sorted evidence UUIDs, the existing
-  managed PR, repair round, and `eventra.repair.authorizing_comment_uuid`, then
+  managed PR, repair round, `eventra.repair.authorizing_comment_uuid`, and the
+  canonical immutable `eventra.repair.source_candidates` rejected-SHA map, then
   commits the parent and starts the assigned agent only after rereading each
   exact deterministic repair handoff (parent/action/bundle, source and next
   Stage, candidate and rejected SHAs, managed PR, source children, and assigned
@@ -115,6 +116,15 @@ next barrier group, then advance `next_stage` and record `last_action`.
   visibly. This local adapter depends on a single serialized Delivery Lead
   (`max_concurrent_tasks=1`); it is not generic CAS or transaction safety.
   Automatic repair rounds are exactly 1 and 2.
+  A repair PASS must record a real replacement commit for its one owned
+  repository; an unchanged rejected SHA is not a successful repair. The child
+  completion changes only its owned `eventra.phase.sha.*` from the seeded source
+  to that replacement and leaves all `eventra.repair.*` provenance byte-for-byte
+  unchanged. After every owner child passes, copy those exact replacement SHAs
+  into parent candidate metadata without changing untouched repositories, then
+  rerun `plan-parent`. Before that copy, planning waits visibly; it never adopts
+  the child output itself. Fresh gates are legal only when the parent candidates
+  and current managed PR heads both equal the completed replacement map.
   Every replacement SHA requires fresh review and QA; no old PASS transfers.
   For round 3, store only an authoritative parent-scoped comment UUID on the
   parent. The executor rereads that parent comment and requires authoritative

@@ -146,7 +146,8 @@ freshly rereads and replans, writes `eventra.workflow.repair_reservation`, parks
 one child per owner in backlog, persists and rereads
 `eventra.repair.creation_action`, `eventra.repair.failure_bundle_digest`, sorted
 evidence UUIDs, stage/round, managed PR, and
-`eventra.repair.authorizing_comment_uuid`, commits parent state and consumed
+`eventra.repair.authorizing_comment_uuid`, plus the canonical immutable
+`eventra.repair.source_candidates` rejected-SHA map, commits parent state and consumed
 authorization provenance, promotes only exact bound children, and clears the
 reservation last. Promotion starts the assigned agent only after the exact
 deterministic repair handoff has been persisted and reread; that handoff binds
@@ -156,6 +157,15 @@ reports authoritatively observed effects, including a committed effect after a
 lost acknowledgement. Conflicting or partial state blocks visibly; exact
 retries resume or no-op. This Eventra adapter relies on a single serialized Delivery
 Lead (`max_concurrent_tasks=1`) and is not generic CAS or transaction safety.
+
+The rejected source map remains immutable across execution and replay. A
+version-2 repair PASS must produce a different SHA for its owned repository;
+`finish-phase` changes only that child's owned `eventra.phase.sha.*` once and
+does not rewrite repair provenance or parent candidates. Once every owner child
+passes, Delivery Lead copies the exact replacement map to parent candidate
+metadata while preserving untouched source SHAs, then plans again. A plan made
+before that copy waits visibly. Fresh gates require the copied parent map and
+authoritative managed PR heads to match every completed replacement exactly.
 
 For round 3 the only caller-supplied authority locator is an authoritative
 parent-scoped comment UUID. The adapter rereads that parent thread and requires

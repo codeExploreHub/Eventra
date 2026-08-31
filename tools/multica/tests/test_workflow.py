@@ -402,7 +402,10 @@ class PhaseCompletionTests(unittest.TestCase):
             + ":-:next-stage:3:source-stage:2:bundle:"
             + digest
         )
-        repair = implementation_completion(kind="repair", attempt=1)
+        repair = replace(
+            implementation_completion(kind="repair", attempt=1),
+            frontend_sha="c" * 40,
+        )
         provenance = {
             "eventra.workflow.version": "2",
             "eventra.phase.kind": "repair",
@@ -417,6 +420,11 @@ class PhaseCompletionTests(unittest.TestCase):
             "eventra.repair.repository": "frontend",
             "eventra.repair.pull_request": FRONTEND_PR,
             "eventra.repair.round": "1",
+            "eventra.repair.source_candidates": json.dumps(
+                {"frontend": FRONTEND_SHA},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
         }
         repair_keys = tuple(
             key for key in provenance if key.startswith("eventra.repair.")
@@ -465,6 +473,70 @@ class PhaseCompletionTests(unittest.TestCase):
             {key: provenance[key] for key in repair_keys},
         )
 
+    def test_finish_phase_replaces_seeded_repair_sha_once_without_rewriting_provenance(self):
+        replacement_sha = "c" * 40
+        digest = "d" * 64
+        source_uuid = "00000000-0000-4000-8000-000000000071"
+        action = (
+            "2:PRO-35:create_repair_stage:1:frontend:"
+            + FRONTEND_SHA
+            + ":-:next-stage:3:source-stage:2:bundle:"
+            + digest
+        )
+        runner = FakeWorkflowRunner()
+        runner.issue["stage"] = 3
+        runner.parent_metadata.update(
+            {
+                "eventra.workflow.next_stage": "4",
+                "eventra.workflow.attempt": "1",
+                "eventra.workflow.last_action": action,
+            }
+        )
+        provenance = {
+            "eventra.repair.creation_action": action,
+            "eventra.repair.failure_bundle_digest": digest,
+            "eventra.repair.failure_evidence_uuids": f'["{source_uuid}"]',
+            "eventra.repair.authorizing_comment_uuid": "",
+            "eventra.repair.repository": "frontend",
+            "eventra.repair.pull_request": FRONTEND_PR,
+            "eventra.repair.round": "1",
+            "eventra.repair.source_candidates": json.dumps(
+                {"frontend": FRONTEND_SHA},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        }
+        runner.metadata.update(
+            {
+                "eventra.workflow.version": "2",
+                "eventra.phase.kind": "repair",
+                "eventra.phase.attempt": "1",
+                "eventra.phase.failure_repositories": "[]",
+                "eventra.phase.sha.frontend": FRONTEND_SHA,
+                "eventra.phase.pr": FRONTEND_PR,
+                **provenance,
+            }
+        )
+
+        result = finish_phase(
+            runner,
+            "PRO-36",
+            replace(
+                implementation_completion(kind="repair", attempt=1),
+                frontend_sha=replacement_sha,
+            ),
+        )
+
+        self.assertEqual(result.status, "done")
+        self.assertEqual(
+            runner.metadata["eventra.phase.sha.frontend"],
+            replacement_sha,
+        )
+        self.assertEqual(
+            {key: runner.metadata[key] for key in provenance},
+            provenance,
+        )
+
     def test_finish_phase_rejects_conflicting_current_repair_provenance(self):
         digest = "d" * 64
         source_uuid = "00000000-0000-4000-8000-000000000071"
@@ -488,6 +560,11 @@ class PhaseCompletionTests(unittest.TestCase):
             "eventra.repair.repository": "frontend",
             "eventra.repair.pull_request": FRONTEND_PR,
             "eventra.repair.round": "1",
+            "eventra.repair.source_candidates": json.dumps(
+                {"frontend": FRONTEND_SHA},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
         }
         corruptions = {
             "creation action": {
@@ -511,6 +588,23 @@ class PhaseCompletionTests(unittest.TestCase):
                 ),
             },
             "candidate SHA": {"eventra.phase.sha.frontend": "e" * 40},
+            "malformed source candidates": {
+                "eventra.repair.source_candidates": "not-json",
+            },
+            "wrong source candidates": {
+                "eventra.repair.source_candidates": json.dumps(
+                    {"frontend": "e" * 40},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            },
+            "extra source candidate": {
+                "eventra.repair.source_candidates": json.dumps(
+                    {"backend": "b" * 40, "frontend": FRONTEND_SHA},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            },
         }
         for label, changes in corruptions.items():
             with self.subTest(label=label):
@@ -530,7 +624,10 @@ class PhaseCompletionTests(unittest.TestCase):
                     finish_phase(
                         runner,
                         "PRO-36",
-                        implementation_completion(kind="repair", attempt=1),
+                        replace(
+                            implementation_completion(kind="repair", attempt=1),
+                            frontend_sha="c" * 40,
+                        ),
                     )
 
                 self.assertEqual(runner.mutation_count, 0)
@@ -563,10 +660,76 @@ class PhaseCompletionTests(unittest.TestCase):
                     finish_phase(
                         runner,
                         "PRO-36",
-                        implementation_completion(kind="repair", attempt=1),
+                        replace(
+                            implementation_completion(kind="repair", attempt=1),
+                            frontend_sha="c" * 40,
+                        ),
                     )
 
                 self.assertEqual(runner.mutation_count, 0)
+
+    def test_repair_pass_rejects_noop_sha_and_terminal_replay_is_exact(self):
+        replacement_sha = "c" * 40
+        runner = FakeWorkflowRunner()
+        runner.issue["stage"] = 3
+        digest = "d" * 64
+        action = (
+            "2:PRO-35:create_repair_stage:1:frontend:"
+            + FRONTEND_SHA
+            + ":-:next-stage:3:source-stage:2:bundle:"
+            + digest
+        )
+        runner.parent_metadata.update(
+            {
+                "eventra.workflow.next_stage": "4",
+                "eventra.workflow.attempt": "1",
+                "eventra.workflow.last_action": action,
+            }
+        )
+        runner.metadata.update(
+            {
+                "eventra.workflow.version": "2",
+                "eventra.phase.kind": "repair",
+                "eventra.phase.attempt": "1",
+                "eventra.phase.failure_repositories": "[]",
+                "eventra.phase.sha.frontend": FRONTEND_SHA,
+                "eventra.phase.pr": FRONTEND_PR,
+                "eventra.repair.creation_action": action,
+                "eventra.repair.failure_bundle_digest": digest,
+                "eventra.repair.failure_evidence_uuids": (
+                    '["00000000-0000-4000-8000-000000000071"]'
+                ),
+                "eventra.repair.authorizing_comment_uuid": "",
+                "eventra.repair.repository": "frontend",
+                "eventra.repair.pull_request": FRONTEND_PR,
+                "eventra.repair.round": "1",
+                "eventra.repair.source_candidates": json.dumps(
+                    {"frontend": FRONTEND_SHA},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
+        )
+        noop = implementation_completion(kind="repair", attempt=1)
+
+        with self.assertRaisesRegex(RuntimeError, "replacement SHA"):
+            finish_phase(runner, "PRO-36", noop)
+        self.assertEqual(runner.mutation_count, 0)
+
+        replacement = replace(noop, frontend_sha=replacement_sha)
+        finish_phase(runner, "PRO-36", replacement)
+        before_replay = runner.mutation_count
+
+        replay = finish_phase(runner, "PRO-36", replacement)
+        self.assertEqual(replay.mutation_count, 0)
+        self.assertEqual(runner.mutation_count, before_replay)
+        with self.assertRaisesRegex(RuntimeError, "terminal phase metadata conflicts"):
+            finish_phase(
+                runner,
+                "PRO-36",
+                replace(replacement, frontend_sha="e" * 40),
+            )
+        self.assertEqual(runner.mutation_count, before_replay)
 
     def test_historical_terminal_replay_cannot_claim_current_completion(self):
         runner = FakeWorkflowRunner()
@@ -776,6 +939,7 @@ def phase(
     repair_repository="",
     repair_pull_request="",
     repair_round=0,
+    repair_source_candidates=(),
     workflow_version=2,
 ):
     return PhaseSnapshot(
@@ -800,6 +964,7 @@ def phase(
         repair_repository=repair_repository,
         repair_pull_request=repair_pull_request,
         repair_round=repair_round,
+        repair_source_candidates=repair_source_candidates,
         workflow_version=workflow_version,
     )
 
@@ -834,7 +999,8 @@ def parent_snapshot(**overrides):
 
 
 class ParentDecisionTests(unittest.TestCase):
-    def _authoritative_current_repair_snapshot(self):
+    def _authoritative_current_repair_snapshot(self, *, parent_copied=True):
+        replacement_sha = "c" * 40
         project_id = "00000000-0000-4000-8000-000000000040"
         assignee_id = "00000000-0000-4000-8000-000000000042"
         review_uuid = "00000000-0000-4000-8000-000000000071"
@@ -886,6 +1052,8 @@ class ParentDecisionTests(unittest.TestCase):
             repair_repository="frontend",
             repair_pull_request=FRONTEND_PR,
             repair_round=1,
+            repair_source_candidates=(("frontend", FRONTEND_SHA),),
+            frontend_sha=replacement_sha,
         )
         return replace(
             source,
@@ -893,6 +1061,10 @@ class ParentDecisionTests(unittest.TestCase):
             last_action=decision.action_key,
             next_stage=4,
             children=(implementation, *gates, repair),
+            candidate_frontend_sha=(
+                replacement_sha if parent_copied else FRONTEND_SHA
+            ),
+            pull_requests=(frontend_pr(head_sha=replacement_sha),),
         )
 
     def test_current_repair_pass_requires_complete_authoritative_provenance(self):
@@ -907,6 +1079,7 @@ class ParentDecisionTests(unittest.TestCase):
                 repair_repository="",
                 repair_pull_request="",
                 repair_round=0,
+                repair_source_candidates=(),
             ),
             "workflow version": replace(current, workflow_version=1),
             "creation action": replace(current, creation_action="different-action"),
@@ -920,6 +1093,21 @@ class ParentDecisionTests(unittest.TestCase):
                 ),
             ),
             "round": replace(current, repair_round=2),
+            "source candidates missing": replace(
+                current,
+                repair_source_candidates=(),
+            ),
+            "source candidates wrong": replace(
+                current,
+                repair_source_candidates=(("frontend", "e" * 40),),
+            ),
+            "source candidates extra": replace(
+                current,
+                repair_source_candidates=(
+                    ("backend", "b" * 40),
+                    ("frontend", FRONTEND_SHA),
+                ),
+            ),
             "managed phase PR": replace(current, pr_url=""),
             "project identity": replace(current, project_id=""),
             "assignee identity": replace(current, assignee_id=""),
@@ -943,6 +1131,41 @@ class ParentDecisionTests(unittest.TestCase):
             decide_parent_action(valid).kind,
             "create_gate_stage",
         )
+
+    def test_completed_repair_before_parent_copy_blocks_with_copy_instruction(self):
+        valid = self._authoritative_current_repair_snapshot(parent_copied=False)
+
+        decision = decide_parent_action(valid)
+
+        self.assertEqual(decision.kind, "block_parent")
+        self.assertIn("parent candidate", decision.reason)
+
+    def test_completed_repair_after_parent_copy_gates_the_replacement(self):
+        valid = self._authoritative_current_repair_snapshot()
+
+        decision = decide_parent_action(valid)
+
+        self.assertEqual(decision.kind, "create_gate_stage")
+
+    def test_completed_repair_requires_current_pr_head_and_exact_parent_copy(self):
+        valid = self._authoritative_current_repair_snapshot()
+        cases = {
+            "managed PR drift": replace(
+                valid,
+                pull_requests=(frontend_pr(head_sha="e" * 40),),
+            ),
+            "wrong parent copy": replace(
+                valid,
+                candidate_frontend_sha="e" * 40,
+            ),
+        }
+
+        for label, snapshot in cases.items():
+            with self.subTest(label=label):
+                decision = decide_parent_action(snapshot)
+
+                self.assertEqual(decision.kind, "block_parent")
+                self.assertIsNone(decision.action_key)
     def test_cross_stack_repair_owner_uses_its_managed_pr_project(self):
         backend_sha = "b" * 40
         frontend_project = "00000000-0000-4000-8000-000000000040"
@@ -1370,6 +1593,7 @@ class ParentDecisionTests(unittest.TestCase):
         repair_decision = decide_parent_action(source)
         self.assertEqual(repair_decision.kind, "create_repair_stage")
         bundle = repair_decision.failure_bundle
+        replacement_sha = "c" * 40
         repair = phase(
             "PRO-42", 3, "repair", attempt=1,
             project_id=frontend_project,
@@ -1381,6 +1605,11 @@ class ParentDecisionTests(unittest.TestCase):
             repair_repository="frontend",
             repair_pull_request=FRONTEND_PR,
             repair_round=1,
+            repair_source_candidates=(
+                ("backend", backend_sha),
+                ("frontend", FRONTEND_SHA),
+            ),
+            frontend_sha=replacement_sha,
         )
         decision = decide_parent_action(
             replace(
@@ -1389,9 +1618,157 @@ class ParentDecisionTests(unittest.TestCase):
                 last_action=repair_decision.action_key,
                 next_stage=4,
                 children=(*source_children, repair),
+                candidate_frontend_sha=replacement_sha,
+                pull_requests=(
+                    replace(pull_requests[0], head_sha=replacement_sha),
+                    pull_requests[1],
+                ),
             )
         )
         self.assertEqual(decision.kind, "create_gate_stage")
+
+    def test_cross_stack_multi_owner_replacements_share_one_source_map(self):
+        backend_sha = "b" * 40
+        replacement_frontend = "c" * 40
+        replacement_backend = "d" * 40
+        backend_pr = "https://github.com/codeExploreHub/Eventra-Backend/pull/7"
+        frontend_project = "00000000-0000-4000-8000-000000000040"
+        backend_project = "00000000-0000-4000-8000-000000000041"
+        frontend_owner = "00000000-0000-4000-8000-000000000042"
+        backend_owner = "00000000-0000-4000-8000-000000000043"
+        frontend_failure = "00000000-0000-4000-8000-000000000091"
+        backend_failure = "00000000-0000-4000-8000-000000000092"
+        source_children = (
+            phase(
+                "PRO-70", 1, "implementation",
+                project_id=frontend_project,
+                pr_url=FRONTEND_PR,
+                assignee_id=frontend_owner,
+            ),
+            phase(
+                "PRO-71", 1, "implementation",
+                frontend_sha=None,
+                backend_sha=backend_sha,
+                project_id=backend_project,
+                pr_url=backend_pr,
+                assignee_id=backend_owner,
+            ),
+            phase(
+                "PRO-72", 2, "review", result="fail",
+                evidence_comment=frontend_failure,
+                responsible_repositories=("frontend",),
+                evidence_comment_url=(
+                    f"https://multica.example/comments/{frontend_failure}"
+                ),
+            ),
+            phase(
+                "PRO-73", 2, "review", result="fail",
+                frontend_sha=None,
+                backend_sha=backend_sha,
+                evidence_comment=backend_failure,
+                responsible_repositories=("backend",),
+                evidence_comment_url=(
+                    f"https://multica.example/comments/{backend_failure}"
+                ),
+            ),
+            phase(
+                "PRO-74", 2, "qa",
+                evidence_comment="00000000-0000-4000-8000-000000000093",
+            ),
+            phase(
+                "PRO-75", 2, "qa",
+                frontend_sha=None,
+                backend_sha=backend_sha,
+                evidence_comment="00000000-0000-4000-8000-000000000094",
+            ),
+        )
+        source_prs = (
+            frontend_pr(),
+            PullRequestSnapshot(
+                "backend", backend_pr, backend_sha, "open", True, True,
+            ),
+        )
+        source = parent_snapshot(
+            classification="cross-stack",
+            candidate_backend_sha=backend_sha,
+            children=source_children,
+            pull_requests=source_prs,
+            next_stage=3,
+        )
+        repair_decision = decide_parent_action(source)
+        self.assertEqual(repair_decision.kind, "create_repair_stage")
+        bundle = repair_decision.failure_bundle
+        source_map = (
+            ("backend", backend_sha),
+            ("frontend", FRONTEND_SHA),
+        )
+        repairs = (
+            phase(
+                "PRO-76", 3, "repair", attempt=1,
+                frontend_sha=replacement_frontend,
+                project_id=frontend_project,
+                pr_url=FRONTEND_PR,
+                assignee_id=frontend_owner,
+                creation_action=repair_decision.action_key,
+                failure_bundle_digest=bundle["digest"],
+                failure_evidence_uuids=(frontend_failure,),
+                repair_repository="frontend",
+                repair_pull_request=FRONTEND_PR,
+                repair_round=1,
+                repair_source_candidates=source_map,
+            ),
+            phase(
+                "PRO-77", 3, "repair", attempt=1,
+                frontend_sha=None,
+                backend_sha=replacement_backend,
+                project_id=backend_project,
+                pr_url=backend_pr,
+                assignee_id=backend_owner,
+                creation_action=repair_decision.action_key,
+                failure_bundle_digest=bundle["digest"],
+                failure_evidence_uuids=(backend_failure,),
+                repair_repository="backend",
+                repair_pull_request=backend_pr,
+                repair_round=1,
+                repair_source_candidates=source_map,
+            ),
+        )
+        completed = replace(
+            source,
+            attempt=1,
+            last_action=repair_decision.action_key,
+            next_stage=4,
+            children=(*source_children, *repairs),
+            candidate_frontend_sha=replacement_frontend,
+            candidate_backend_sha=replacement_backend,
+            pull_requests=(
+                frontend_pr(head_sha=replacement_frontend),
+                replace(source_prs[1], head_sha=replacement_backend),
+            ),
+        )
+
+        self.assertEqual(decide_parent_action(completed).kind, "create_gate_stage")
+        for label, changed in {
+            "one managed head drift": replace(
+                completed,
+                pull_requests=(
+                    completed.pull_requests[0],
+                    replace(completed.pull_requests[1], head_sha="e" * 40),
+                ),
+            ),
+            "sibling source map conflict": replace(
+                completed,
+                children=(
+                    *completed.children[:-1],
+                    replace(
+                        completed.children[-1],
+                        repair_source_candidates=(("backend", backend_sha),),
+                    ),
+                ),
+            ),
+        }.items():
+            with self.subTest(label=label):
+                self.assertEqual(decide_parent_action(changed).kind, "block_parent")
 
     def test_second_failed_complete_repair_cycle_blocks_without_third(self):
         children = (
@@ -2502,7 +2879,7 @@ class FakeRepairRunner:
         self.calls.append(call)
         if call[:2] == ("issue", "get"):
             identifier = call[2]
-            if identifier == "PRO-65":
+            if identifier in {"PRO-65", PARENT_ID}:
                 return copy.deepcopy(self.parent)
             return copy.deepcopy(
                 next(child for child in self.children if child["identifier"] == identifier)
@@ -2588,6 +2965,11 @@ class FakeRepairRunner:
             if child["status"] != status:
                 child["status"] = status
                 self.committed_mutations += 1
+            if status == "done":
+                for run in self.runs.get(identifier, []):
+                    if run["status"] in {"queued", "dispatched", "running"}:
+                        run["status"] = "completed"
+                        run["completed_at"] = "2026-08-25T09:30:00Z"
             if "--no-start" not in call and not self.suppress_status_run:
                 runs = self.runs.setdefault(identifier, [])
                 if not any(run["status"] in {"queued", "dispatched", "running"} for run in runs):
@@ -2690,6 +3072,14 @@ class RepairExecutionTests(unittest.TestCase):
             FakeRepairRunner.AUTH_UUID,
         )
         self.assertEqual(metadata["eventra.repair.pull_request"], runner.BACKEND_PR)
+        self.assertEqual(
+            metadata["eventra.repair.source_candidates"],
+            json.dumps(
+                {"backend": runner.BACKEND_SHA},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
         create_call = next(
             call for call in runner.calls if call[:2] == ("issue", "create")
         )
@@ -2724,6 +3114,101 @@ class RepairExecutionTests(unittest.TestCase):
                     ],
                     "",
                 )
+
+    def test_rounds_finish_with_replacements_wait_for_lead_copy_then_gate_and_replay(self):
+        for source_attempt, replacement_sha in zip(
+            (0, 1, 2),
+            ("c" * 40, "d" * 40, "e" * 40),
+            strict=True,
+        ):
+            with self.subTest(repair_round=source_attempt + 1):
+                runner, github, decision = self._planned(attempt=source_attempt)
+                executed = execute_parent_repair(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+                self.assertEqual(executed.next_action, "repair")
+                stage = {0: 3, 1: 5, 2: 7}[source_attempt]
+                child = next(item for item in runner.children if item["stage"] == stage)
+                child_key = str(child["identifier"])
+                immutable_before = {
+                    key: value
+                    for key, value in runner.metadata[child_key].items()
+                    if key.startswith("eventra.repair.")
+                }
+                completion = PhaseCompletion(
+                    kind="repair",
+                    result="pass",
+                    attempt=source_attempt + 1,
+                    evidence_comment=COMMENT_ID,
+                    frontend_sha=None,
+                    backend_sha=replacement_sha,
+                    pr_url=runner.BACKEND_PR,
+                )
+
+                finished = finish_phase(runner, child_key, completion)
+
+                self.assertEqual(finished.status, "done")
+                self.assertEqual(
+                    runner.metadata[child_key]["eventra.phase.sha.backend"],
+                    replacement_sha,
+                )
+                self.assertEqual(
+                    {
+                        key: value
+                        for key, value in runner.metadata[child_key].items()
+                        if key.startswith("eventra.repair.")
+                    },
+                    immutable_before,
+                )
+                self.assertEqual(
+                    runner.metadata["PRO-65"]["eventra.workflow.backend_sha"],
+                    runner.BACKEND_SHA,
+                )
+
+                github.head_sha = replacement_sha
+                before_copy = decide_parent_action(
+                    load_parent_snapshot(runner, github, "PRO-65")
+                )
+                self.assertEqual(before_copy.kind, "block_parent")
+                self.assertIn("parent candidate", before_copy.reason)
+
+                before_pre_copy_replay = len(runner.mutation_calls)
+                pre_copy_replay = execute_parent_repair(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+                self.assertEqual(
+                    pre_copy_replay.next_action,
+                    "noop",
+                    pre_copy_replay.reason,
+                )
+                self.assertEqual(
+                    len(runner.mutation_calls),
+                    before_pre_copy_replay,
+                )
+
+                runner.metadata["PRO-65"][
+                    "eventra.workflow.backend_sha"
+                ] = replacement_sha
+                after_copy = decide_parent_action(
+                    load_parent_snapshot(runner, github, "PRO-65")
+                )
+                self.assertEqual(after_copy.kind, "create_gate_stage")
+
+                before_replay = len(runner.mutation_calls)
+                replay = execute_parent_repair(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+                self.assertEqual(replay.next_action, "noop", replay.reason)
+                self.assertEqual(len(runner.mutation_calls), before_replay)
 
     def test_executor_recovers_exact_reservation_after_partial_failure(self):
         runner, github, decision = self._planned()
@@ -2916,6 +3401,15 @@ class RepairExecutionTests(unittest.TestCase):
             "action_key"
         ].replace(":next-stage:7:", ":next-stage:99:")
         malformed.append(wrong_next_action)
+        missing_source_candidates = copy.deepcopy(reservation)
+        missing_source_candidates.pop("source_candidates")
+        malformed.append(missing_source_candidates)
+        wrong_source_candidates = copy.deepcopy(reservation)
+        wrong_source_candidates["source_candidates"] = {"backend": "e" * 40}
+        malformed.append(wrong_source_candidates)
+        extra_source_candidate = copy.deepcopy(reservation)
+        extra_source_candidate["source_candidates"]["frontend"] = FRONTEND_SHA
+        malformed.append(extra_source_candidate)
 
         for value in malformed:
             with self.subTest(
@@ -2987,6 +3481,17 @@ class RepairExecutionTests(unittest.TestCase):
             ),
             "changed bundle digest": lambda issue, metadata: metadata.__setitem__(
                 "eventra.repair.failure_bundle_digest", "f" * 64
+            ),
+            "missing source candidates": lambda issue, metadata: metadata.pop(
+                "eventra.repair.source_candidates"
+            ),
+            "changed source candidates": lambda issue, metadata: metadata.__setitem__(
+                "eventra.repair.source_candidates",
+                json.dumps(
+                    {"backend": "e" * 40},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
             ),
             "changed title": lambda issue, metadata: issue.__setitem__(
                 "title", "forged repair handoff"
@@ -3231,6 +3736,11 @@ class ParentSnapshotReadTests(unittest.TestCase):
             "eventra.repair.repository": "backend",
             "eventra.repair.pull_request": FakeRepairRunner.BACKEND_PR,
             "eventra.repair.round": "1",
+            "eventra.repair.source_candidates": json.dumps(
+                {"backend": FakeRepairRunner.BACKEND_SHA},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
         }
         for missing in provenance:
             with self.subTest(missing=missing):
@@ -3250,6 +3760,69 @@ class ParentSnapshotReadTests(unittest.TestCase):
                     RuntimeError,
                     "repair provenance",
                 ):
+                    load_parent_snapshot(
+                        runner,
+                        FakeRepairGitHubRunner(),
+                        "PRO-65",
+                    )
+
+    def test_loaded_repair_source_candidates_are_canonical_complete_and_action_bound(self):
+        runner = FakeRepairRunner(attempt=1)
+        repair = next(child for child in runner.children if child["stage"] == 3)
+        repair_key = str(repair["identifier"])
+        digest = "d" * 64
+        action = (
+            "2:PRO-65:create_repair_stage:1:backend:-:"
+            + FakeRepairRunner.BACKEND_SHA
+            + ":next-stage:3:source-stage:2:bundle:"
+            + digest
+        )
+        complete = {
+            "eventra.repair.creation_action": action,
+            "eventra.repair.failure_bundle_digest": digest,
+            "eventra.repair.failure_evidence_uuids": (
+                '["00000000-0000-4000-8000-000000000071"]'
+            ),
+            "eventra.repair.authorizing_comment_uuid": "",
+            "eventra.repair.repository": "backend",
+            "eventra.repair.pull_request": FakeRepairRunner.BACKEND_PR,
+            "eventra.repair.round": "1",
+            "eventra.repair.source_candidates": json.dumps(
+                {"backend": FakeRepairRunner.BACKEND_SHA},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        }
+        cases = {
+            "malformed": "not-json",
+            "empty": "{}",
+            "partial or extra": json.dumps(
+                {
+                    "backend": FakeRepairRunner.BACKEND_SHA,
+                    "frontend": FRONTEND_SHA,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "wrong source": json.dumps(
+                {"backend": "e" * 40},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "noncanonical": json.dumps(
+                {"backend": FakeRepairRunner.BACKEND_SHA},
+            ),
+        }
+
+        for label, source_candidates in cases.items():
+            with self.subTest(label=label):
+                runner.metadata[repair_key] = {
+                    **runner.metadata[repair_key],
+                    **complete,
+                    "eventra.repair.source_candidates": source_candidates,
+                }
+
+                with self.assertRaisesRegex(RuntimeError, "repair provenance"):
                     load_parent_snapshot(
                         runner,
                         FakeRepairGitHubRunner(),

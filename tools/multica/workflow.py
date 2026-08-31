@@ -69,6 +69,7 @@ REPAIR_PROVENANCE_KEYS = frozenset(
         "eventra.repair.repository",
         "eventra.repair.pull_request",
         "eventra.repair.round",
+        "eventra.repair.source_candidates",
     }
 )
 
@@ -125,6 +126,7 @@ class PhaseSnapshot:
     repair_repository: str = ""
     repair_pull_request: str = ""
     repair_round: int = 0
+    repair_source_candidates: tuple[tuple[str, str], ...] = ()
     pr_url: str = ""
     assignee_id: str = ""
     assignee_type: str = "agent"
@@ -499,6 +501,60 @@ def _repair_action_stage_identity(value: str) -> tuple[int, int]:
     return int(parts[8]), int(parts[10])
 
 
+def _repair_action_source_candidates(value: str) -> dict[str, str]:
+    _repair_action_stage_identity(value)
+    parts = value.split(":")
+    candidates = {
+        repository: candidate
+        for repository, candidate in zip(
+            ("frontend", "backend"),
+            parts[5:7],
+            strict=True,
+        )
+        if candidate != "-"
+    }
+    expected = {
+        "frontend": {"frontend"},
+        "backend": {"backend"},
+        "cross-stack": {"frontend", "backend"},
+    }[parts[4]]
+    if set(candidates) != expected:
+        raise RuntimeError("malformed repair action source candidates")
+    return dict(sorted(candidates.items()))
+
+
+def _decode_source_candidates(value: str) -> dict[str, str]:
+    try:
+        decoded = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        raise RuntimeError("malformed repair source candidates") from None
+    if (
+        not isinstance(decoded, dict)
+        or not decoded
+        or value != _canonical_json(decoded)
+        or set(decoded) - set(REPAIR_ASSIGNEES)
+        or any(
+            type(repository) is not str
+            or type(sha) is not str
+            or SHA_PATTERN.fullmatch(sha) is None
+            for repository, sha in decoded.items()
+        )
+    ):
+        raise RuntimeError("malformed repair source candidates")
+    return dict(sorted(decoded.items()))
+
+
+def _snapshot_with_candidates(
+    snapshot: ParentSnapshot,
+    candidates: dict[str, str],
+) -> ParentSnapshot:
+    return replace(
+        snapshot,
+        candidate_frontend_sha=candidates.get("frontend"),
+        candidate_backend_sha=candidates.get("backend"),
+    )
+
+
 def _parent_decision(
     snapshot: ParentSnapshot,
     kind: str,
@@ -852,6 +908,9 @@ def _current_repair_provenance_problem(
     creation_actions = {item.creation_action for item in phases}
     digests = {item.failure_bundle_digest for item in phases}
     authorizations = {item.authorizing_comment_uuid for item in phases}
+    source_candidate_sets = {
+        item.repair_source_candidates for item in phases
+    }
     if (
         rounds != {snapshot.attempt}
         or snapshot.attempt not in {1, 2, 3}
@@ -859,6 +918,8 @@ def _current_repair_provenance_problem(
         or len(digests) != 1
         or re.fullmatch(r"[0-9a-f]{64}", next(iter(digests), "")) is None
         or len(authorizations) != 1
+        or len(source_candidate_sets) != 1
+        or not next(iter(source_candidate_sets), ())
     ):
         return "current repair provenance is incomplete or conflicting"
     authorization_uuid = next(iter(authorizations))
@@ -874,21 +935,30 @@ def _current_repair_provenance_problem(
         action_next_stage, source_stage = _repair_action_stage_identity(
             snapshot.last_action
         )
+        action_source_candidates = _repair_action_source_candidates(
+            snapshot.last_action
+        )
     except RuntimeError:
         return "current repair creation action is malformed"
+    source_candidates = dict(next(iter(source_candidate_sets)))
+    if action_source_candidates != source_candidates:
+        return "current repair source candidate provenance is conflicting"
     if action_next_stage != stage or source_stage != stage - 1:
         return "current repair creation action has the wrong Stage identity"
     source_phases = tuple(
         item for item in snapshot.children if item.stage == source_stage
     )
-    source_snapshot = replace(
-        snapshot,
-        attempt=snapshot.attempt - 1,
-        next_stage=stage,
-        last_action=None,
-        authorization_comment_uuid="",
-        authorizing_comment=None,
-        repair_reservation=None,
+    source_snapshot = _snapshot_with_candidates(
+        replace(
+            snapshot,
+            attempt=snapshot.attempt - 1,
+            next_stage=stage,
+            last_action=None,
+            authorization_comment_uuid="",
+            authorizing_comment=None,
+            repair_reservation=None,
+        ),
+        source_candidates,
     )
     try:
         if (
@@ -917,6 +987,8 @@ def _current_repair_provenance_problem(
         str(spec["repository"]): spec for spec in specs
     }
     observed: dict[str, PhaseSnapshot] = {}
+    replacement_candidates = dict(source_candidates)
+    all_repairs_passed = True
     for item in phases:
         repository = item.repair_repository
         if repository in observed or repository not in expected_specs:
@@ -933,13 +1005,8 @@ def _current_repair_provenance_problem(
         if (
             item.workflow_version != 2
             or item.repair_round != snapshot.attempt
+            or dict(item.repair_source_candidates) != source_candidates
             or phase_repositories != {repository}
-            or (
-                item.frontend_sha
-                if repository == "frontend"
-                else item.backend_sha
-            )
-            != spec["candidate_sha"]
             or item.pr_url != spec["pull_request"]
             or item.repair_pull_request != spec["pull_request"]
             or item.project_id != spec["project_id"]
@@ -950,9 +1017,35 @@ def _current_repair_provenance_problem(
             or not item.failure_evidence_uuids
         ):
             return "current repair child provenance is incomplete or conflicting"
+        phase_sha = (
+            item.frontend_sha
+            if repository == "frontend"
+            else item.backend_sha
+        )
+        if item.status == "done" and item.result == "pass":
+            if phase_sha == source_candidates[repository]:
+                return "completed repair PASS did not produce a replacement SHA"
+            replacement_candidates[repository] = str(phase_sha)
+        else:
+            all_repairs_passed = False
+            if phase_sha != source_candidates[repository]:
+                return "nonpassing or active repair changed its seeded source SHA"
         observed[repository] = item
     if set(observed) != set(expected_specs):
         return "current repair child multiset is incomplete or conflicting"
+    parent_candidates = _candidate_sha_map(snapshot)
+    observed_heads = {
+        item.repository: item.head_sha for item in snapshot.pull_requests
+    }
+    if all_repairs_passed:
+        if observed_heads != replacement_candidates:
+            return "current managed pull-request heads do not match completed repair replacements"
+        if parent_candidates == source_candidates:
+            return "completed repair replacement awaits parent candidate metadata copy"
+        if parent_candidates != replacement_candidates:
+            return "parent candidate metadata does not match completed repair replacements"
+    elif parent_candidates != source_candidates:
+        return "parent candidate metadata changed before the repair Stage completed"
     return None
 
 
@@ -992,6 +1085,15 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
             "block_parent",
             "cross-repository merge is partial",
         )
+    if snapshot.children:
+        latest_stage = max(item.stage for item in snapshot.children)
+        latest = tuple(item for item in snapshot.children if item.stage == latest_stage)
+    else:
+        latest = ()
+    if latest and {item.kind for item in latest} == {"repair"}:
+        repair_problem = _current_repair_provenance_problem(snapshot, latest)
+        if repair_problem is not None:
+            return ParentDecision("block_parent", None, repair_problem)
     expected_heads = {
         "frontend": snapshot.candidate_frontend_sha,
         "backend": snapshot.candidate_backend_sha,
@@ -1005,12 +1107,6 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
             "block_parent",
             "out-of-band pull-request head change",
         )
-
-    if snapshot.children:
-        latest_stage = max(item.stage for item in snapshot.children)
-        latest = tuple(item for item in snapshot.children if item.stage == latest_stage)
-    else:
-        latest = ()
 
     if snapshot.merge_state == "merged":
         if not _attempt_history_is_consistent(snapshot):
@@ -1037,10 +1133,6 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
 
     if not latest:
         return ParentDecision("noop", None, "parent has no completed stage")
-    if {item.kind for item in latest} == {"repair"}:
-        repair_problem = _current_repair_provenance_problem(snapshot, latest)
-        if repair_problem is not None:
-            return ParentDecision("block_parent", None, repair_problem)
     if any(item.status != "done" for item in latest):
         return ParentDecision("noop", None, "latest stage is still active")
     if not _attempt_history_is_consistent(snapshot):
@@ -1340,6 +1432,7 @@ def _decode_repair_reservation(value: str) -> dict[str, object]:
             "prior_consumed_authorization_uuid",
             "repair_round",
             "source_attempt",
+            "source_candidates",
             "child_specs",
         }
     ):
@@ -1353,6 +1446,7 @@ def _decode_repair_reservation(value: str) -> dict[str, object]:
     prior_consumed = decoded["prior_consumed_authorization_uuid"]
     repair_round = decoded["repair_round"]
     source_attempt = decoded["source_attempt"]
+    source_candidates = decoded["source_candidates"]
     specs = decoded["child_specs"]
     if (
         type(action_key) is not str
@@ -1373,12 +1467,20 @@ def _decode_repair_reservation(value: str) -> dict[str, object]:
         or (authorization_uuid and not _is_uuid(authorization_uuid))
         or (prior_consumed and not _is_uuid(prior_consumed))
         or not isinstance(bundle, dict)
+        or not isinstance(source_candidates, dict)
         or not isinstance(specs, list)
         or not specs
     ):
         raise RuntimeError("malformed repair reservation")
     digest = bundle.get("digest")
     source_stage = bundle.get("source_stage_ordinal")
+    try:
+        action_source_candidates = _repair_action_source_candidates(action_key)
+        decoded_source_candidates = _decode_source_candidates(
+            _canonical_json(source_candidates)
+        )
+    except RuntimeError:
+        raise RuntimeError("malformed repair reservation") from None
     if (
         type(digest) is not str
         or re.fullmatch(r"[0-9a-f]{64}", digest) is None
@@ -1386,6 +1488,8 @@ def _decode_repair_reservation(value: str) -> dict[str, object]:
         or bundle.get("repair_round") != repair_round
         or type(source_stage) is not int
         or source_stage < 1
+        or bundle.get("candidate_shas") != decoded_source_candidates
+        or decoded_source_candidates != action_source_candidates
     ):
         raise RuntimeError("malformed repair reservation")
     try:
@@ -1426,6 +1530,7 @@ def _decode_repair_reservation(value: str) -> dict[str, object]:
             or not _is_uuid(spec["assignee_id"])
             or type(spec["candidate_sha"]) is not str
             or SHA_PATTERN.fullmatch(spec["candidate_sha"]) is None
+            or spec["candidate_sha"] != decoded_source_candidates.get(repository)
             or type(spec["project_id"]) is not str
             or not _is_uuid(spec["project_id"])
             or type(spec["pull_request"]) is not str
@@ -1470,11 +1575,16 @@ def _phase_snapshot(
     repair_repository = metadata.get("eventra.repair.repository", "")
     repair_pull_request = metadata.get("eventra.repair.pull_request", "")
     repair_round_text = metadata.get("eventra.repair.round", "0")
+    source_candidates_text = metadata.get(
+        "eventra.repair.source_candidates",
+        "{}",
+    )
     evidence_uuids_text = metadata.get(
         "eventra.repair.failure_evidence_uuids",
         "[]",
     )
     failure_evidence_uuids: tuple[str, ...] = ()
+    repair_source_candidates: tuple[tuple[str, str], ...] = ()
     if version == "2":
         try:
             decoded_repositories = json.loads(failure_repositories)
@@ -1502,7 +1612,13 @@ def _phase_snapshot(
     if provenance_present:
         try:
             decoded_evidence_uuids = json.loads(evidence_uuids_text)
-        except (json.JSONDecodeError, TypeError):
+            decoded_source_candidates = _decode_source_candidates(
+                source_candidates_text
+            )
+            action_source_candidates = _repair_action_source_candidates(
+                creation_action
+            )
+        except (json.JSONDecodeError, TypeError, RuntimeError):
             raise RuntimeError("malformed child repair provenance") from None
         if (
             not REPAIR_PROVENANCE_KEYS <= set(metadata)
@@ -1520,12 +1636,15 @@ def _phase_snapshot(
                 and not _is_uuid(authorizing_comment_uuid)
             )
             or repair_repository not in REPAIR_ASSIGNEES
+            or repair_repository not in decoded_source_candidates
+            or decoded_source_candidates != action_source_candidates
             or _repository_for_pr(repair_pull_request) != repair_repository
             or not repair_round_text.isdigit()
             or int(repair_round_text) != int(attempt_text)
         ):
             raise RuntimeError("malformed child repair provenance")
         failure_evidence_uuids = tuple(decoded_evidence_uuids)
+        repair_source_candidates = tuple(decoded_source_candidates.items())
     if (
         version not in {"1", "2"}
         or (kind != "unknown" and kind not in PHASE_KINDS)
@@ -1574,6 +1693,7 @@ def _phase_snapshot(
         repair_repository=repair_repository,
         repair_pull_request=repair_pull_request,
         repair_round=int(repair_round_text),
+        repair_source_candidates=repair_source_candidates,
         pr_url=phase_pr_url,
         assignee_id=str(issue["assignee_id"]),
         assignee_type=str(issue["assignee_type"]),
@@ -1851,6 +1971,7 @@ def _build_repair_reservation(
         ),
         "repair_round": repair_round,
         "source_attempt": snapshot.attempt,
+        "source_candidates": dict(bundle["candidate_shas"]),
     }
     encoded = _canonical_json(reservation)
     if len(encoded.encode("utf-8")) > MAX_REPAIR_RESERVATION_BYTES:
@@ -1862,6 +1983,8 @@ def _validate_repair_reservation(
     snapshot: ParentSnapshot,
     reservation: dict[str, object],
     expected_action_key: str,
+    *,
+    committed_children: dict[str, PhaseSnapshot] | None = None,
 ) -> None:
     if (
         reservation["action_key"] != expected_action_key
@@ -1874,6 +1997,7 @@ def _validate_repair_reservation(
     previous_last_action = str(reservation["previous_last_action"])
     authorization_uuid = str(reservation["authorizing_comment_uuid"])
     prior_consumed = str(reservation["prior_consumed_authorization_uuid"])
+    source_candidates = dict(reservation["source_candidates"])
     bundle = reservation["failure_bundle"]
     if not isinstance(bundle, dict):
         raise RuntimeError("malformed repair reservation")
@@ -1892,11 +2016,14 @@ def _validate_repair_reservation(
     source_phases = tuple(
         item for item in snapshot.children if item.stage == source_stage
     )
-    source_snapshot = replace(
-        snapshot,
-        attempt=source_attempt,
-        next_stage=next_stage,
-        repair_reservation=None,
+    source_snapshot = _snapshot_with_candidates(
+        replace(
+            snapshot,
+            attempt=source_attempt,
+            next_stage=next_stage,
+            repair_reservation=None,
+        ),
+        source_candidates,
     )
     try:
         fresh_bundle = _failure_bundle(source_snapshot, source_phases)
@@ -1914,7 +2041,7 @@ def _validate_repair_reservation(
     )
     if computed_key != expected_action_key:
         raise RuntimeError("reserved repair action identity no longer matches")
-    if _repair_child_specs(snapshot, bundle) != reservation["child_specs"]:
+    if _repair_child_specs(source_snapshot, bundle) != reservation["child_specs"]:
         raise RuntimeError("reserved repair routing no longer matches")
     if repair_round == 3:
         if snapshot.attempt == source_attempt or (
@@ -1926,7 +2053,36 @@ def _validate_repair_reservation(
             raise RuntimeError("reserved repair authorization was not consumed")
     elif authorization_uuid:
         raise RuntimeError("automatic repair cannot carry authorization")
-    expected_heads = dict(bundle["candidate_shas"])
+    expected_heads = dict(source_candidates)
+    allowed_parent_candidates = (source_candidates,)
+    if committed_children is not None:
+        expected_repositories = {
+            str(spec["repository"]) for spec in reservation["child_specs"]
+        }
+        if set(committed_children) != expected_repositories:
+            raise RuntimeError("recorded repair child multiset changed")
+        all_repairs_passed = True
+        for repository, child in committed_children.items():
+            if child.status == "done" and child.result == "pass":
+                replacement_sha = (
+                    child.frontend_sha
+                    if repository == "frontend"
+                    else child.backend_sha
+                )
+                if (
+                    replacement_sha is None
+                    or replacement_sha == source_candidates[repository]
+                ):
+                    raise RuntimeError(
+                        "recorded repair PASS lacks its exact replacement"
+                    )
+                expected_heads[repository] = replacement_sha
+            else:
+                all_repairs_passed = False
+        if all_repairs_passed:
+            allowed_parent_candidates = (source_candidates, expected_heads)
+    if _candidate_sha_map(snapshot) not in allowed_parent_candidates:
+        raise RuntimeError("reserved repair parent candidates changed")
     observed_heads = {
         item.repository: item.head_sha for item in snapshot.pull_requests
     }
@@ -1958,6 +2114,9 @@ def _repair_child_metadata(
         "eventra.repair.repository": repository,
         "eventra.repair.pull_request": str(spec["pull_request"]),
         "eventra.repair.round": str(reservation["repair_round"]),
+        "eventra.repair.source_candidates": _canonical_json(
+            reservation["source_candidates"]
+        ),
     }
     result[f"eventra.phase.sha.{repository}"] = str(spec["candidate_sha"])
     return result
@@ -2199,6 +2358,17 @@ def _repair_children_for_reservation(
                 if key not in metadata:
                     raise RuntimeError("reserved repair child completion is incomplete")
                 exact_metadata[key] = metadata[key]
+            if metadata["eventra.phase.result"] == "pass":
+                replacement_key = f"eventra.phase.sha.{repository}"
+                replacement_sha = metadata.get(replacement_key, "")
+                if (
+                    SHA_PATTERN.fullmatch(replacement_sha) is None
+                    or replacement_sha == spec["candidate_sha"]
+                ):
+                    raise RuntimeError(
+                        "reserved repair child PASS lacks a replacement SHA"
+                    )
+                exact_metadata[replacement_key] = replacement_sha
         detail, title, description = _repair_issue_detail(runner, child.issue_key)
         if (
             controlled != exact_metadata
@@ -2509,9 +2679,14 @@ def _verified_replayed_repair_children(
         raise RuntimeError("recorded repair action identity conflicts") from None
     rounds = {item.repair_round for item in matching}
     authorizations = {item.authorizing_comment_uuid for item in matching}
+    source_candidate_sets = {
+        item.repair_source_candidates for item in matching
+    }
     if (
         len(rounds) != 1
         or len(authorizations) != 1
+        or len(source_candidate_sets) != 1
+        or not next(iter(source_candidate_sets), ())
         or stage != action_next_stage
         or action_next_stage != source_stage + 1
         or snapshot.attempt != next(iter(rounds))
@@ -2520,19 +2695,25 @@ def _verified_replayed_repair_children(
         raise RuntimeError("recorded repair child set conflicts")
     repair_round = next(iter(rounds))
     authorization_uuid = next(iter(authorizations))
+    source_candidates = dict(next(iter(source_candidate_sets)))
+    if _repair_action_source_candidates(expected_action_key) != source_candidates:
+        raise RuntimeError("recorded repair source candidate identity conflicts")
     if repair_round == 3:
         if authorization_uuid != snapshot.consumed_authorization_uuid:
             raise RuntimeError("recorded round-three authorization conflicts")
     elif authorization_uuid:
         raise RuntimeError("recorded automatic repair carries authorization")
-    source_snapshot = replace(
-        snapshot,
-        attempt=repair_round - 1,
-        next_stage=action_next_stage,
-        last_action=None,
-        authorization_comment_uuid="",
-        authorizing_comment=None,
-        repair_reservation=None,
+    source_snapshot = _snapshot_with_candidates(
+        replace(
+            snapshot,
+            attempt=repair_round - 1,
+            next_stage=action_next_stage,
+            last_action=None,
+            authorization_comment_uuid="",
+            authorizing_comment=None,
+            repair_reservation=None,
+        ),
+        source_candidates,
     )
     source_phases = tuple(
         item for item in snapshot.children if item.stage == source_stage
@@ -2564,11 +2745,17 @@ def _verified_replayed_repair_children(
                 "prior_consumed_authorization_uuid": "",
                 "repair_round": repair_round,
                 "source_attempt": repair_round - 1,
+                "source_candidates": source_candidates,
             }
         )
     )
-    _validate_repair_reservation(snapshot, reservation, expected_action_key)
     children = _repair_children_for_reservation(runner, snapshot, reservation)
+    _validate_repair_reservation(
+        snapshot,
+        reservation,
+        expected_action_key,
+        committed_children=children,
+    )
     expected_repositories = {
         str(spec["repository"]) for spec in reservation["child_specs"]
     }
@@ -2984,6 +3171,7 @@ def _repair_completion_provenance_problem(
     parent_identifier: str,
     current_stage: int,
     current_attempt: int,
+    value: PhaseCompletion,
 ) -> str | None:
     observed_keys = {
         key for key in metadata if key.startswith("eventra.repair.")
@@ -2997,6 +3185,12 @@ def _repair_completion_provenance_problem(
         creation_action = metadata["eventra.repair.creation_action"]
         action_stage, source_stage = _repair_action_stage_identity(
             creation_action
+        )
+        action_source_candidates = _repair_action_source_candidates(
+            creation_action
+        )
+        source_candidates = _decode_source_candidates(
+            metadata["eventra.repair.source_candidates"]
         )
     except (KeyError, RuntimeError, json.JSONDecodeError, TypeError, ValueError):
         return "repair completion executor provenance is malformed"
@@ -3016,12 +3210,26 @@ def _repair_completion_provenance_problem(
         "cross-stack": "cross-stack",
     }.get(parent_metadata.get("eventra.workflow.classification"))
     parent_candidates = {
-        "frontend": parent_metadata.get("eventra.workflow.frontend_sha", "-"),
-        "backend": parent_metadata.get("eventra.workflow.backend_sha", "-"),
+        repository: sha
+        for repository, sha in (
+            (
+                "frontend",
+                parent_metadata.get("eventra.workflow.frontend_sha", "-"),
+            ),
+            (
+                "backend",
+                parent_metadata.get("eventra.workflow.backend_sha", "-"),
+            ),
+        )
+        if sha != "-"
     }
-    action_candidates = {
-        "frontend": action_parts[5],
-        "backend": action_parts[6],
+    requested_candidates = {
+        repository: sha
+        for repository, sha in (
+            ("frontend", value.frontend_sha),
+            ("backend", value.backend_sha),
+        )
+        if sha is not None
     }
     sha_keys = {
         key
@@ -3038,7 +3246,7 @@ def _repair_completion_provenance_problem(
         or action_parts[1] != parent_identifier
         or action_parts[3] != str(current_attempt)
         or action_parts[4] != expected_scope
-        or action_candidates != parent_candidates
+        or action_source_candidates != source_candidates
         or action_stage != current_stage
         or source_stage != current_stage - 1
         or len(action_parts) not in {13, 15}
@@ -3052,9 +3260,10 @@ def _repair_completion_provenance_problem(
         or metadata["eventra.repair.failure_evidence_uuids"]
         != _canonical_json(evidence_uuids)
         or repository not in REPAIR_ASSIGNEES
+        or repository not in source_candidates
         or sha_keys != {repository}
-        or action_candidates[repository]
-        != metadata.get(f"eventra.phase.sha.{repository}")
+        or set(requested_candidates) != {repository}
+        or value.pr_url != pull_request
         or SHA_PATTERN.fullmatch(
             metadata.get(f"eventra.phase.sha.{repository}", "")
         )
@@ -3078,6 +3287,28 @@ def _repair_completion_provenance_problem(
         )
     ):
         return "repair completion executor provenance conflicts"
+    source_sha = source_candidates[repository]
+    phase_sha = metadata[f"eventra.phase.sha.{repository}"]
+    requested_sha = requested_candidates[repository]
+    if value.result != "pass":
+        if (
+            phase_sha != source_sha
+            or requested_sha != source_sha
+            or parent_candidates != source_candidates
+        ):
+            return "nonpassing repair completion cannot replace its seeded SHA"
+        return None
+    if requested_sha == source_sha:
+        return "repair PASS requires a replacement SHA"
+    if detail["status"] == "done":
+        if (
+            phase_sha != requested_sha
+            or set(parent_candidates) != set(source_candidates)
+            or parent_candidates[repository] not in {source_sha, requested_sha}
+        ):
+            return "terminal repair replacement conflicts with current authority"
+    elif phase_sha != source_sha or parent_candidates != source_candidates:
+        return "repair replacement requires the seeded source and parent candidates"
     return None
 
 
@@ -3161,6 +3392,7 @@ def _finish_phase_authority_problem(
             str(parent["identifier"]),
             current_stage,
             attempt,
+            value,
         )
     if any(key.startswith("eventra.repair.") for key in metadata):
         return "non-repair completion carries repair provenance"
@@ -3223,8 +3455,14 @@ def finish_phase(
     )
     if authority_problem is not None:
         raise RuntimeError(authority_problem)
+    allowed_replacement_key = (
+        f"eventra.phase.sha.{before['eventra.repair.repository']}"
+        if value.kind == "repair" and value.result == "pass"
+        else None
+    )
     if any(
-        key not in wanted or wanted[key] != item
+        key not in wanted
+        or (wanted[key] != item and key != allowed_replacement_key)
         for key, item in controlled_before.items()
     ):
         raise RuntimeError("phase metadata conflicts with request")
