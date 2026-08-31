@@ -66,6 +66,7 @@ post-merge smoke result:
 | Repository / branch / PR | Authoritative repository, base branch, feature branch, PR link |
 | SHA | Exact submitted, reviewed, QA-tested, or merged SHA (state which) |
 | Scope / contract | Changed paths; frozen API contract and compatibility notes when applicable |
+| Repository knowledge | Context Receipt; current-code verification or conflict; candidate block reference or `none` |
 | Checks | Command, exit code, concise result, and repository-check status |
 | Independent gates | Independent Reviewer decision and Integration QA decision, each tied to the exact SHA |
 | Smoke / concerns | Local command, exit code, observed behavior, limitations, and escalation if needed |

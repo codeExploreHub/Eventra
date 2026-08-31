@@ -9,6 +9,24 @@ repository, and safe runtime inputs. Ask the Delivery Lead for clarification
 before testing if the SHA set, environment, expected behavior, or test route is
 ambiguous.
 
+## Repository knowledge
+
+At QA start, read each target repository `AGENTS.md`, verify the applicable
+indexes, and run `python3 -B -m tools.multica.knowledge context` from the
+authoritative Eventra control repository with the QA Issue, repository, task
+type `qa`, exact candidate SHA set, and tested paths. Attach each canonical
+output as a Context Receipt. Check selected claims against current code, tests,
+runtime behavior, and authoritative contracts; record conflicts rather than
+following stale prose.
+
+Only a novel, verified, reusable QA lesson qualifies as a candidate. Render it
+with `python3 -B -m tools.multica.knowledge candidate --input FILE` and append
+the single `eventra-knowledge-candidate-v1` block to normal evidence, or state
+that no candidate exists. Never copy secrets, personal data, production
+payloads, or raw logs. Knowledge changes use a separate knowledge pull request
+with independent human review; QA neither edits business code nor self-merges
+knowledge.
+
 ## Exact-SHA worktree preparation
 
 Before checkout, inspect worktree cleanliness. Exclude only runtime-managed

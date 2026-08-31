@@ -9,6 +9,15 @@ The only authoritative resource in this Project is
 `/Users/didi/Eventra-workspace/Eventra-Backend`, attached as a Multica worktree.
 Never use `/Users/didi/Eventra-workspace/Eventra/Backend`.
 
+At task start, retrieve path-scoped backend knowledge from
+`docs/agent-knowledge/index.yaml` and frontend-owned shared knowledge with
+`tools.multica.knowledge context` from the authoritative Eventra control
+repository. Record the Context Receipt, check material claims against current
+code and contracts, and report conflicts. A novel, verified, reusable fact may
+be proposed only as a validated `eventra-knowledge-candidate-v1` block. It does
+not block delivery and must use a separate knowledge pull request with human
+review.
+
 Every backend child links its parent Issue, records the frozen API contract when
 applicable, and returns its branch, pull request, exact SHA, changed paths, test
 commands with exit codes, and known concerns to the Delivery Lead. Independent

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import re
@@ -14,7 +15,14 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import yaml
 
-from tools.multica.knowledge_contracts import ContextReceipt, KnowledgeIndexEntry
+from tools.multica.knowledge_contracts import (
+    ContextReceipt,
+    KnowledgeCandidate,
+    KnowledgeIndexEntry,
+    candidate_digest,
+    candidate_json,
+    parse_candidate_json,
+)
 
 
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -25,6 +33,11 @@ _REPOSITORIES = frozenset({"frontend", "backend"})
 _SCOPES = frozenset({"frontend", "backend", "cross_repo"})
 _BOOTSTRAP_DESIGN_PATH = "docs/superpowers/specs/2026-08-31-eventra-repository-knowledge-loop-design.md"
 _BOOTSTRAP_DESIGN_COMMIT = "32a150dfa"
+_CANDIDATE_FENCE = "eventra-knowledge-candidate-v1"
+_CANDIDATE_BLOCK = re.compile(
+    rf"(?m)^```{re.escape(_CANDIDATE_FENCE)}\n(?P<body>.*?)\n```[ \t]*$",
+    re.DOTALL,
+)
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -246,15 +259,32 @@ def verify_indexes(frontend_root: Path | str, backend_root: Path | str) -> tuple
     return tuple(sorted(entries, key=lambda item: item.knowledge_id))
 
 
+@functools.lru_cache(maxsize=256)
+def _glob_pattern(pattern: str) -> re.Pattern[str]:
+    pieces = ["^"]
+    index = 0
+    while index < len(pattern):
+        if pattern.startswith("**/", index):
+            pieces.append("(?:.*/)?")
+            index += 3
+        elif pattern.startswith("**", index):
+            pieces.append(".*")
+            index += 2
+        elif pattern[index] == "*":
+            pieces.append("[^/]*")
+            index += 1
+        elif pattern[index] == "?":
+            pieces.append("[^/]")
+            index += 1
+        else:
+            pieces.append(re.escape(pattern[index]))
+            index += 1
+    pieces.append("$")
+    return re.compile("".join(pieces))
+
+
 def _path_matches(path: str, pattern: str) -> bool:
-    pure = PurePosixPath(path)
-    if pure.match(pattern):
-        return True
-    while "**/" in pattern:
-        pattern = pattern.replace("**/", "", 1)
-        if pure.match(pattern):
-            return True
-    return False
+    return _glob_pattern(pattern).fullmatch(path) is not None
 
 
 def _match_reason(entry: KnowledgeIndexEntry, repository: str, task_type: str, paths: Sequence[str]) -> str | None:
@@ -284,15 +314,26 @@ def build_context_receipt(
     candidate_shas: Mapping[str, str],
     entries: Iterable[KnowledgeIndexEntry],
     repository_paths: Sequence[str],
+    verified_ids: Sequence[str] = (),
+    conflicts: Sequence[str] = (),
 ) -> str:
     """Return one compact canonical Context Receipt JSON object."""
     selected = select_knowledge(entries, repository, task_type, repository_paths)
     shas = _sha_map(dict(candidate_shas), nonempty=True)
-    verified = tuple(
+    selected_ids = {item.knowledge_id for item in selected}
+    if (
+        len(verified_ids) != len(set(verified_ids))
+        or set(verified_ids) - selected_ids
+        or not all(isinstance(item, str) and item for item in conflicts)
+    ):
+        raise ValueError("invalid context receipt")
+    verified_set = set(verified_ids)
+    verified_set.update(
         item.knowledge_id
         for item in selected
         if any(candidate_sha == item.last_verified_sha for _, candidate_sha in shas)
     )
+    verified = tuple(item.knowledge_id for item in selected if item.knowledge_id in verified_set)
     receipt = ContextReceipt(
         schema_version=1,
         task_id=_string(task_id),
@@ -303,13 +344,48 @@ def build_context_receipt(
         knowledge_digests=tuple((item.knowledge_id, item.content_digest) for item in selected),
         match_reasons=tuple((item.knowledge_id, _match_reason(item, repository, task_type, repository_paths) or "") for item in selected),
         verified_ids=verified,
-        conflicts=(),
+        conflicts=tuple(conflicts),
     )
     payload = asdict(receipt)
     payload["candidate_shas"] = dict(receipt.candidate_shas)
     payload["knowledge_digests"] = dict(receipt.knowledge_digests)
     payload["match_reasons"] = dict(receipt.match_reasons)
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _candidate_from_input(text: str) -> KnowledgeCandidate:
+    try:
+        value = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        raise ValueError("invalid knowledge candidate") from None
+    if not isinstance(value, dict):
+        raise ValueError("invalid knowledge candidate")
+    if "digest" not in value:
+        value = dict(value)
+        value["digest"] = candidate_digest(value)
+    candidate = parse_candidate_json(json.dumps(value, ensure_ascii=False))
+    if "```" in candidate_json(candidate):
+        raise ValueError("invalid knowledge candidate")
+    return candidate
+
+
+def render_candidate_block(text: str) -> str:
+    """Validate candidate JSON and render its one canonical evidence block."""
+    value = _candidate_from_input(text)
+    return f"```{_CANDIDATE_FENCE}\n{candidate_json(value)}\n```"
+
+
+def extract_candidate_blocks(text: str) -> tuple[KnowledgeCandidate, ...]:
+    """Extract exactly one non-nested versioned candidate from evidence."""
+    if not isinstance(text, str) or text.count(f"```{_CANDIDATE_FENCE}") != 1:
+        raise ValueError("invalid knowledge candidate")
+    matches = tuple(_CANDIDATE_BLOCK.finditer(text))
+    if len(matches) != 1:
+        raise ValueError("invalid knowledge candidate")
+    body = matches[0].group("body")
+    if "```" in body:
+        raise ValueError("invalid knowledge candidate")
+    return (_candidate_from_input(body),)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -326,6 +402,10 @@ def _parser() -> argparse.ArgumentParser:
     context.add_argument("--task-type", required=True)
     context.add_argument("--sha", action="append", default=[], metavar="REPOSITORY=SHA")
     context.add_argument("--path", action="append", default=[], dest="paths")
+    context.add_argument("--verified-id", action="append", default=[], dest="verified_ids")
+    context.add_argument("--conflict", action="append", default=[], dest="conflicts")
+    candidate = subparsers.add_parser("candidate")
+    candidate.add_argument("--input", required=True, type=Path)
     return parser
 
 
@@ -344,11 +424,29 @@ def _parse_shas(values: Sequence[str]) -> dict[str, str]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "candidate":
+        try:
+            source = args.input.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            raise ValueError("invalid knowledge candidate") from None
+        print(render_candidate_block(source))
+        return 0
     entries = verify_indexes(args.frontend_root, args.backend_root)
     if args.command == "verify":
         print(json.dumps({"count": len(entries), "knowledge_ids": [item.knowledge_id for item in entries]}, separators=(",", ":"), sort_keys=True))
         return 0
-    print(build_context_receipt(args.task_id, args.repository, args.task_type, _parse_shas(args.sha), entries, args.paths))
+    print(
+        build_context_receipt(
+            args.task_id,
+            args.repository,
+            args.task_type,
+            _parse_shas(args.sha),
+            entries,
+            args.paths,
+            verified_ids=args.verified_ids,
+            conflicts=args.conflicts,
+        )
+    )
     return 0
 
 

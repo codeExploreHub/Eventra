@@ -10,11 +10,14 @@ import yaml
 
 from tools.multica.knowledge import (
     build_context_receipt,
+    extract_candidate_blocks,
     load_index,
     main,
+    render_candidate_block,
     select_knowledge,
     verify_indexes,
 )
+from tools.multica.knowledge_contracts import candidate_digest
 
 
 SHA = "a" * 40
@@ -147,6 +150,28 @@ class KnowledgeIndexTests(unittest.TestCase):
         result = select_knowledge(entries, "frontend", "qa", ("app/page.tsx",))
         self.assertEqual([item.knowledge_id for item in result], ["frontend-architecture", "frontend-testing"])
 
+    def test_recursive_glob_matches_zero_or_more_path_segments(self):
+        nested_doc = self.doc.parent / "architecture.md"
+        nested_doc.write_text("# Architecture\n", encoding="utf-8")
+        nested = entry(
+            nested_doc.relative_to(self.root),
+            knowledge_id="frontend-architecture",
+            repository_paths=["src/**"],
+        )
+        tsx = entry(
+            self.doc.relative_to(self.root),
+            repository_paths=["app/**/*.tsx"],
+        )
+        entries = load_index(self.write_index([nested, tsx]), self.root)
+        self.assertEqual(
+            [item.knowledge_id for item in select_knowledge(entries, "frontend", "qa", ("src/lib/api.js",))],
+            ["frontend-architecture"],
+        )
+        self.assertEqual(
+            [item.knowledge_id for item in select_knowledge(entries, "frontend", "qa", ("app/page.tsx",))],
+            ["frontend-testing"],
+        )
+
     def test_receipt_is_canonical_and_records_reasons(self):
         entries = load_index(self.write_index([entry(self.doc.relative_to(self.root))]), self.root)
         receipt = build_context_receipt("PRO-100", "frontend", "qa", {"frontend": SHA}, entries, ("app/page.tsx",))
@@ -155,6 +180,35 @@ class KnowledgeIndexTests(unittest.TestCase):
         self.assertEqual(payload["candidate_shas"], {"frontend": SHA})
         self.assertEqual(payload["match_reasons"], {"frontend-testing": "repository+task_type+path"})
         self.assertEqual(receipt, json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True))
+
+    def test_receipt_records_explicit_current_code_verification_and_conflict(self):
+        entries = load_index(self.write_index([entry(self.doc.relative_to(self.root))]), self.root)
+        receipt = build_context_receipt(
+            "PRO-100",
+            "frontend",
+            "qa",
+            {"frontend": "c" * 40},
+            entries,
+            ("app/page.tsx",),
+            verified_ids=("frontend-testing",),
+            conflicts=("frontend-testing: command changed; current code wins",),
+        )
+        payload = json.loads(receipt)
+        self.assertEqual(payload["verified_ids"], ["frontend-testing"])
+        self.assertEqual(payload["conflicts"], ["frontend-testing: command changed; current code wins"])
+
+    def test_receipt_rejects_verification_for_unselected_entry(self):
+        entries = load_index(self.write_index([entry(self.doc.relative_to(self.root))]), self.root)
+        with self.assertRaisesRegex(ValueError, "invalid context receipt"):
+            build_context_receipt(
+                "PRO-100",
+                "frontend",
+                "qa",
+                {"frontend": SHA},
+                entries,
+                ("app/page.tsx",),
+                verified_ids=("unknown",),
+            )
 
     def test_verify_indexes_loads_frontend_local_shared_and_backend_local(self):
         frontend = self.root / "frontend"
@@ -198,6 +252,73 @@ class KnowledgeIndexTests(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["count"], 2)
         self.assertEqual(payload["knowledge_ids"], ["backend-map", "frontend-testing"])
+
+
+def candidate_input(**overrides):
+    value = {
+        "schema_version": 1,
+        "evidence": {
+            "project_id": "project-frontend",
+            "parent_identifier": "PRO-100",
+            "child_identifier": "PRO-101",
+            "comment_uuid": "00000000-0000-4000-8000-000000000100",
+            "comment_url": "https://multica.example/issues/PRO-101/comments/00000000-0000-4000-8000-000000000100",
+        },
+        "candidate_shas": {"frontend": "a" * 40},
+        "target_scope": "frontend",
+        "target_repository": "frontend",
+        "knowledge_type": "invariant",
+        "claim": "The API base remains configurable.",
+        "task_types": ["implementation"],
+        "repository_paths": ["src/**"],
+        "verification_refs": ["npm run test:local-contract"],
+        "sensitivity": "public_repo",
+        "related_knowledge_ids": ["frontend-invariants"],
+        "submitted_role": "frontend_engineer",
+        "submitted_at": "2026-08-31T12:00:00+08:00",
+    }
+    value.update(overrides)
+    return value
+
+
+class KnowledgeCandidateCliTests(unittest.TestCase):
+    def test_candidate_cli_adds_digest_and_prints_one_canonical_block(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "candidate.json"
+            path.write_text(json.dumps(candidate_input()), encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(main(["candidate", "--input", str(path)]), 0)
+        rendered = output.getvalue().strip()
+        self.assertTrue(rendered.startswith("```eventra-knowledge-candidate-v1\n"))
+        self.assertTrue(rendered.endswith("\n```"))
+        candidates = extract_candidate_blocks(rendered)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].digest, candidate_digest(candidate_input()))
+
+    def test_render_round_trip_is_canonical(self):
+        value = candidate_input()
+        value["digest"] = candidate_digest(value)
+        rendered = render_candidate_block(json.dumps(value, indent=2))
+        parsed = extract_candidate_blocks("Evidence follows.\n\n" + rendered)
+        self.assertEqual(parsed[0].claim, value["claim"])
+        self.assertEqual(rendered, render_candidate_block(rendered.split("\n", 1)[1].rsplit("\n", 1)[0]))
+
+    def test_rejects_nested_multiple_or_malformed_candidate_blocks_without_echo(self):
+        value = candidate_input()
+        value["digest"] = candidate_digest(value)
+        valid = render_candidate_block(json.dumps(value))
+        cases = (
+            valid + "\n" + valid,
+            "```eventra-knowledge-candidate-v1\n```json\n{}\n```\n```",
+            "```eventra-knowledge-candidate-v1\nnot-json\n```",
+            "```eventra-knowledge-candidate-v1\n{}",
+        )
+        for evidence in cases:
+            with self.subTest(evidence=evidence[:20]):
+                with self.assertRaisesRegex(ValueError, "invalid knowledge candidate") as caught:
+                    extract_candidate_blocks(evidence)
+                self.assertNotIn(value["claim"], str(caught.exception))
 
 
 if __name__ == "__main__":

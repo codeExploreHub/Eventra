@@ -144,6 +144,33 @@ keeps one pull request per repository, and records exact reviewed and tested
 commit SHAs. A partial two-repository merge stops immediately and requires
 human escalation; it does not trigger rollback or deployment.
 
+Every execution role retrieves indexed knowledge before acting. Run the
+read-only context command from the authoritative Eventra control repository,
+supplying one `--sha REPOSITORY=FULL_SHA` per affected repository and one or
+more assigned paths:
+
+```text
+python3 -B -m tools.multica.knowledge context --task-id PRO-N --repository frontend --task-type implementation --sha frontend=FULL_SHA --path src/PATH
+```
+
+Attach the canonical JSON output as the Context Receipt and verify material
+claims against current code, tests, or an authoritative contract. Rerun with
+one `--verified-id KNOWLEDGE_ID` per checked entry and `--conflict TEXT` for
+each stale or contradictory claim; current code and exact-SHA evidence win.
+If a novel,
+verified, reusable, public-repository-safe fact emerges, place its JSON in a
+temporary untracked file and render the only accepted evidence format:
+
+```text
+python3 -B -m tools.multica.knowledge candidate --input CANDIDATE_JSON_FILE
+```
+
+The output is one `eventra-knowledge-candidate-v1` block. Delete the temporary
+input after posting normal evidence. Do not include credentials, personal data,
+production payloads, or raw logs. Candidates never block delivery and never
+authorize incidental knowledge edits; accepted changes use a separate
+knowledge pull request with human review and no Curator self-merge.
+
 Cross-stack gates respect the one-worktree Project boundary. Reviewer tasks run
 once per Project and are combined by Delivery Lead. QA verifies the backend SHA
 in the backend Project, then Backend Engineer keeps that verified SHA running

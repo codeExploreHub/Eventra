@@ -4,6 +4,46 @@ from pathlib import Path
 
 
 class OperatorDocsTests(unittest.TestCase):
+    def test_roles_require_repository_knowledge_receipts_and_candidates(self):
+        instructions = Path("tools/multica/instructions")
+        for name in (
+            "frontend_engineer.md",
+            "backend_engineer.md",
+            "integration_qa.md",
+            "independent_reviewer.md",
+        ):
+            rendered = (instructions / name).read_text()
+            normalized = " ".join(rendered.split())
+            with self.subTest(role=name):
+                self.assertIn("Context Receipt", normalized)
+                self.assertIn("tools.multica.knowledge context", normalized)
+                self.assertIn("current code", normalized)
+                self.assertIn("eventra-knowledge-candidate-v1", normalized)
+                self.assertIn("separate knowledge pull request", normalized)
+                self.assertIn("raw logs", normalized)
+
+        lead = (instructions / "delivery_lead.md").read_text()
+        for fragment in (
+            "eventra.knowledge.version=1",
+            "eventra.knowledge.status=none",
+            "eventra.knowledge.status=pending",
+            "does not wait for curation",
+        ):
+            self.assertIn(fragment, lead)
+
+        for path in (
+            Path("AGENTS.md"),
+            Path("/Users/didi/Eventra-workspace/Eventra-Backend/.worktrees/eventra-knowledge-loop/AGENTS.md"),
+        ):
+            rendered = path.read_text()
+            normalized = " ".join(rendered.split())
+            with self.subTest(path=path):
+                self.assertIn("docs/agent-knowledge/index.yaml", normalized)
+                self.assertIn("Context Receipt", normalized)
+                self.assertIn("current code", normalized)
+                self.assertIn("Knowledge Candidate", normalized)
+                self.assertIn("separate knowledge pull request", normalized)
+
     def test_every_execution_role_uses_terminal_phase_helper(self):
         instructions = Path("tools/multica/instructions")
         for name in (

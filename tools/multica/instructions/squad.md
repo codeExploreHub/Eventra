@@ -13,6 +13,17 @@ All parent Issues and frontend children belong to **Eventra Local Development**.
 Backend children belong to **Eventra Backend Local Development** and must link
 back to their parent. Both Projects use this same Squad.
 
+## Repository knowledge protocol
+
+Every delivery, review, and QA task starts with path-scoped indexed retrieval
+and returns a Context Receipt tied to its exact SHA set. Agents verify material
+claims against current code, tests, or authoritative contracts and report
+conflicts. Novel, verified, reusable findings may be returned only as one
+validated `eventra-knowledge-candidate-v1` evidence block; credentials,
+personal data, production payloads, and raw logs are forbidden. Business work
+never edits canonical knowledge incidentally. Knowledge curation is
+asynchronous and uses a separate knowledge pull request with human review.
+
 For cross-repository work, Freeze the interface contract before implementation.
 Only run frontend and backend work in parallel when the contract is frozen and neither child has a real dependency on the other. Otherwise, sequence work by dependency and hand off the producing exact SHA with its contract evidence before the dependent child starts.
 
