@@ -21,6 +21,8 @@ from tools.multica.provision import (
 class FakeRunner:
     """Stateful fake whose argv grammar is frozen independently from production."""
 
+    RESOLVED_SKILL_REF = "b36e0829c6d0140e93cfef2ca599b1b07d4a7797"
+
     IMPORTED_NAMES_BY_URL = {
         "https://github.com/vercel-labs/agent-skills/tree/main/skills/react-best-practices":
             "vercel-react-best-practices",
@@ -198,6 +200,7 @@ class FakeRunner:
                     url, url.rstrip("/").rsplit("/", 1)[-1]
                 ),
                 url,
+                resolve_ref=True,
             )
             self.skills[skill_id] = item
             response = {
@@ -511,14 +514,22 @@ class FakeRunner:
         return copy.deepcopy({key: value for key, value in item.items() if key != excluded})
 
     @staticmethod
-    def _skill_detail(skill_id, name, source_url):
+    def _skill_detail(skill_id, name, source_url, *, resolve_ref=False):
         url_parts = source_url.split("/")
+        ref = url_parts[6]
+        if resolve_ref and not (
+            len(ref) == 40
+            and all(character in "0123456789abcdef" for character in ref)
+        ):
+            ref = FakeRunner.RESOLVED_SKILL_REF
+            url_parts[6] = ref
+            source_url = "/".join(url_parts)
         return {
             "config": {
                 "origin": {
                     "owner": url_parts[3],
                     "path": "/".join(url_parts[7:]),
-                    "ref": url_parts[6],
+                    "ref": ref,
                     "repo": url_parts[4],
                     "source_url": source_url,
                     "type": "github",
@@ -1198,6 +1209,82 @@ class ProvisionerTests(unittest.TestCase):
         self.assertEqual(result.skill_ids[source.key], skill_id)
         self.assertTrue(any(call["command"] == ("skill", "get") and call["positionals"] == [skill_id] for call in self.runner.calls))
         self.assertFalse(any(call["command"] == ("skill", "import") and source.url in call["args"] for call in self.runner.calls))
+
+    def test_fresh_branch_import_persists_resolved_commit_and_then_reuses_stable_id(self):
+        commit = "b36e0829c6d0140e93cfef2ca599b1b07d4a7797"
+
+        first = self.provisioner.reconcile(
+            self.config,
+            apply=True,
+            backend_env=self.backend_env,
+        )
+        target_id = first.skill_ids["using-superpowers"]
+        self.assertEqual(
+            self.runner.skills[target_id]["config"]["origin"],
+            {
+                "type": "github",
+                "owner": "obra",
+                "repo": "superpowers",
+                "ref": commit,
+                "path": "skills/using-superpowers",
+                "source_url": (
+                    "https://github.com/obra/superpowers/tree/"
+                    f"{commit}/skills/using-superpowers"
+                ),
+            },
+        )
+        import_count = sum(
+            call["command"] == ("skill", "import")
+            for call in self.runner.calls
+        )
+        before = self.runner.mutation_count
+
+        second = self.provisioner.reconcile(
+            self.config,
+            apply=True,
+            backend_env=None,
+        )
+
+        self.assertEqual(second.skill_ids["using-superpowers"], target_id)
+        self.assertEqual(second.mutation_count, 0)
+        self.assertEqual(self.runner.mutation_count, before)
+        self.assertEqual(
+            sum(
+                call["command"] == ("skill", "import")
+                for call in self.runner.calls
+            ),
+            import_count,
+        )
+        self.assertEqual(
+            [
+                item["id"]
+                for item in self.runner.skills.values()
+                if item["name"] == "using-superpowers"
+            ],
+            [target_id],
+        )
+
+    def test_fresh_pinned_commit_import_persists_exact_commit(self):
+        commit = "b36e0829c6d0140e93cfef2ca599b1b07d4a7797"
+        source = self.config.skills["using-superpowers"]
+        pinned_url = (
+            "https://github.com/obra/superpowers/tree/"
+            f"{commit}/skills/using-superpowers"
+        )
+        skills = dict(self.config.skills)
+        skills[source.key] = replace(source, url=pinned_url)
+
+        result = self.provisioner.reconcile(
+            replace(self.config, skills=skills),
+            apply=True,
+            backend_env=self.backend_env,
+        )
+
+        origin = self.runner.skills[
+            result.skill_ids["using-superpowers"]
+        ]["config"]["origin"]
+        self.assertEqual(origin["ref"], commit)
+        self.assertEqual(origin["source_url"], pinned_url)
 
     def test_resolved_commit_skill_origin_is_reused_without_skill_mutation_or_duplicate(self):
         commit = "b36e0829c6d0140e93cfef2ca599b1b07d4a7797"
