@@ -2486,6 +2486,187 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
             failure_bundle_digest=bundle.digest,
         )
 
+    def complete_terminal_repair_without_successor(
+        self,
+        repair_round: int,
+    ) -> tuple[dict[str, WorkflowChild], dict[str, str]]:
+        self.store.states.clear()
+        self.store.completions.clear()
+        self.store.events.clear()
+        self.store.read_counts.clear()
+        self.store.completion_drift_after_parent_reread = None
+        api_completion = self.seed_active_parallel_repair(repair_round)
+        first = self.workflow.record_phase_completion(api_completion)
+        self.assertEqual(first.completed_child_status, "done")
+        state = self.store.states["PRO-200"]
+        repair_children = {
+            child.repository_key: child
+            for child in state.children
+            if child.phase == "repair"
+        }
+        bundle_digest = repair_children["api"].failure_bundle_digest
+        with patch.object(
+            self.workflow,
+            "_dispatch",
+            side_effect=lambda current, decision, repair=False: (
+                self.workflow._result(current, "wait", "successor held for test")
+            ),
+        ):
+            second = self.workflow.record_phase_completion(
+                completion_for(
+                    "web",
+                    parent="PRO-200",
+                    phase="repair",
+                    attempt=repair_round,
+                    sha=OTHER_SHA,
+                    failure_bundle_digest=bundle_digest,
+                )
+            )
+        self.assertEqual(second.completed_child_status, "done")
+        state = self.store.states["PRO-200"]
+        repair_children = {
+            child.repository_key: child
+            for child in state.children
+            if child.phase == "repair"
+        }
+        source = dict(repair_children["api"].creation_candidate_shas)
+        authorization_uuid = repair_children["api"].authorizing_comment_uuid
+        candidates = dict(source)
+        completion_actions: dict[str, str] = {}
+        for repository, candidate in (
+            ("api", REPLACEMENT_SHA),
+            ("web", OTHER_SHA),
+        ):
+            candidates[repository] = candidate
+            completion_actions[repository] = coordinator_action_key(
+                workflow_version=2,
+                instance_key=self.manifest.instance.key,
+                parent_identifier="PRO-200",
+                stage_kind=f"repair:{repository}",
+                stage_ordinal=repair_children[repository].stage_ordinal,
+                attempt=repair_round,
+                affected_repositories=frozenset(source),
+                candidate_shas=candidates,
+                contract_hashes={},
+                failure_bundle_digest=bundle_digest,
+                authorizing_comment_uuid=authorization_uuid,
+            )
+        self.store.read_counts["PRO-200"] = 0
+        self.store.read_state_override_by_count.clear()
+        self.store.completion_drift_after_parent_reread = None
+        self.store.events.clear()
+        return repair_children, completion_actions
+
+    def test_terminal_repair_wave_authority_precedes_fresh_gate_dispatch(self):
+        for repair_round in (1, 2, 3):
+            for corruption in (
+                "missing action",
+                "forged action",
+                "missing evidence",
+                "forged evidence",
+                "partial evidence",
+            ):
+                with self.subTest(
+                    repair_round=repair_round,
+                    corruption=corruption,
+                ):
+                    children, actions = (
+                        self.complete_terminal_repair_without_successor(
+                            repair_round
+                        )
+                    )
+                    state = self.store.states["PRO-200"]
+                    api_key = (
+                        "PRO-200",
+                        children["api"].evidence_comment_uuid,
+                    )
+                    web_key = (
+                        "PRO-200",
+                        children["web"].evidence_comment_uuid,
+                    )
+                    if corruption == "missing action":
+                        self.store.states["PRO-200"] = replace(
+                            state,
+                            applied_action_keys=(
+                                state.applied_action_keys - {actions["api"]}
+                            ),
+                        )
+                    elif corruption == "forged action":
+                        self.store.states["PRO-200"] = replace(
+                            state,
+                            applied_action_keys=(
+                                state.applied_action_keys
+                                - {actions["api"]}
+                                | {"stage:" + "f" * 64}
+                            ),
+                        )
+                    elif corruption == "missing evidence":
+                        del self.store.completions[api_key]
+                    elif corruption == "partial evidence":
+                        del self.store.completions[web_key]
+                    else:
+                        self.store.completions[api_key] = replace(
+                            self.store.completions[api_key],
+                            evidence_comment_url=(
+                                "https://example.test/evidence/forged"
+                            ),
+                        )
+
+                    result = self.workflow.resume_parent("PRO-200")
+
+                    self.assertEqual(result.next_action, "block", result.reason)
+                    self.assertEqual(result.mutation_count, 0)
+                    self.assertFalse(
+                        any(event[0] == "create" for event in self.store.events)
+                    )
+
+    def test_terminal_repair_wave_authority_is_stable_around_parent_fan_in(self):
+        for repair_round in (1, 2, 3):
+            for corruption in ("evidence", "parent"):
+                with self.subTest(
+                    repair_round=repair_round,
+                    corruption=corruption,
+                ):
+                    children, _ = (
+                        self.complete_terminal_repair_without_successor(
+                            repair_round
+                        )
+                    )
+                    if corruption == "evidence":
+                        self.store.completion_drift_after_parent_reread = (
+                            children["api"].evidence_comment_uuid
+                        )
+                    else:
+                        state = self.store.states["PRO-200"]
+                        assert isinstance(state.metadata, ParentMetadata)
+                        self.store.read_state_override_by_count[2] = replace(
+                            state,
+                            metadata=replace(
+                                state.metadata,
+                                stage_ordinal=state.metadata.stage_ordinal + 1,
+                            ),
+                        )
+
+                    result = self.workflow.resume_parent("PRO-200")
+
+                    self.assertEqual(result.next_action, "block", result.reason)
+                    self.assertEqual(result.mutation_count, 0)
+                    self.assertFalse(
+                        any(event[0] == "create" for event in self.store.events)
+                    )
+
+    def test_terminal_repair_authoritative_wave_dispatches_fresh_gates(self):
+        for repair_round in (1, 2, 3):
+            with self.subTest(repair_round=repair_round):
+                self.complete_terminal_repair_without_successor(repair_round)
+
+                result = self.workflow.resume_parent("PRO-200")
+
+                self.assertEqual(result.next_action, "dispatch", result.reason)
+                self.assertTrue(
+                    any(event[0] == "create" for event in self.store.events)
+                )
+
     def test_repair_completion_revalidates_parent_before_first_evidence_write(self):
         for repair_round in (1, 2, 3):
             for drift in (
@@ -3363,6 +3544,18 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
             applied_action_keys=state.applied_action_keys
             | source_actions
             | {api_completion_action},
+        )
+        self.store.completions[("PRO-200", api_evidence)] = PhaseCompletion(
+            parent_identifier="PRO-200",
+            repository_key="api",
+            phase="repair",
+            result="pass",
+            attempt=1,
+            candidate_sha=REPLACEMENT_SHA,
+            pull_request_url=pull_request_targets()["api"].url,
+            evidence_comment_uuid=api_evidence,
+            evidence_comment_url=f"https://example.test/evidence/{api_evidence}",
+            failure_bundle_digest=bundle_digest,
         )
 
         result = self.workflow.record_phase_completion(
