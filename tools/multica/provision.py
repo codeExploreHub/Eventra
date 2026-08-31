@@ -603,9 +603,13 @@ class Provisioner:
             and state.agent_envs[role] == canonical
             for role in ENV_RECIPIENTS
         )
-        if apply and not all_recipients_match:
-            raise ValueError(
-                "backend environment is required before applying agent changes"
+        if not all_recipients_match:
+            if apply:
+                raise ValueError(
+                    "backend environment is required before applying agent changes"
+                )
+            return None, (
+                PlanPrecondition("backend_environment", "requires_reuse"),
             )
         return dict(canonical), ()
 

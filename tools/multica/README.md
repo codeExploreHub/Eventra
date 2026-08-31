@@ -61,10 +61,14 @@ dry-run response.
 When no explicit environment authority is available, dry-run does not invent
 environment mutations. It returns `actions: []`, `summary.blocked: true`, and
 one sanitized `backend_environment` precondition: `requires_input` when no
-valid recipient environment exists, or `conflict` when existing valid
-recipient environments disagree. If one or more existing valid recipient
-environments agree, that value is used only as an in-memory comparison
-authority and dry-run plans updates solely for missing or different recipients.
+valid recipient environment exists, `conflict` when existing valid recipient
+environments disagree, or `requires_reuse` when a valid environment could be
+reused but the recipients are not already equal. Default mode never renders an
+executable environment action from inferred authority. Rerun dry-run with
+`--reuse-backend-env` to choose Backend Engineer explicitly, review the exact
+recipient update, and use that same environment-authority mode for apply. When
+both recipients already have the same valid environment, default dry-run may
+report a normal converged plan without choosing reuse.
 
 ```bash
 python3 -m tools.multica.provision --runtime-id RUNTIME_ID --daemon-id DAEMON_ID --apply

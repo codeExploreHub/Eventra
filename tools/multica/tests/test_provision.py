@@ -924,7 +924,7 @@ class ProvisionerTests(unittest.TestCase):
         self.assertEqual(applied.mutation_count, 38)
         self.assertEqual(actual_operations, planned_operations)
 
-    def test_dry_run_infers_one_valid_recipient_env_without_false_updates(self):
+    def test_default_mode_requires_explicit_reuse_for_single_recipient_authority(self):
         first = self.provisioner.reconcile(
             self.config, apply=True, backend_env=self.backend_env
         )
@@ -937,15 +937,31 @@ class ProvisionerTests(unittest.TestCase):
             self.config, apply=False, backend_env=None
         )
         plan = self._assert_plan(result)
-        self.assertEqual(
-            [(item.operation, item.key, item.changes) for item in plan.actions],
-            [("agent.env.set", "integration_qa", {"environment": "missing"})],
-        )
+        self._assert_env_precondition(plan, "requires_reuse")
         self.assertEqual(self.runner.mutation_count, 0)
         rendered = json.dumps(plan.to_dict(), sort_keys=True)
         for secret in (*self.backend_env.keys(), *self.backend_env.values()):
             self.assertNotIn(secret, rendered)
 
+        self.runner.calls.clear()
+        with self.assertRaisesRegex(ValueError, "backend environment"):
+            self.provisioner.reconcile(
+                self.config,
+                apply=True,
+                backend_env=None,
+            )
+        self.assertEqual(self.runner.mutation_count, 0)
+
+        explicit = self.provisioner.reconcile(
+            self.config,
+            apply=False,
+            backend_env=copy.deepcopy(self.runner.envs[backend_id]),
+        )
+        explicit_plan = self._assert_plan(explicit)
+        self.assertEqual(
+            [(item.operation, item.key, item.changes) for item in explicit_plan.actions],
+            [("agent.env.set", "integration_qa", {"environment": "missing"})],
+        )
         self.runner.calls.clear()
         applied = self.provisioner.reconcile(
             self.config,
@@ -1250,7 +1266,7 @@ class ProvisionerTests(unittest.TestCase):
         result = self.provisioner.reconcile(
             self.config,
             apply=False,
-            backend_env=None,
+            backend_env=self.backend_env,
         )
         plan = self._assert_plan(result)
         binding = next(
