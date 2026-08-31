@@ -2561,6 +2561,195 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
         self.store.events.clear()
         return repair_children, completion_actions
 
+    def seed_partial_fresh_gate_after_repair(
+        self,
+        *,
+        repair_round: int,
+    ) -> tuple[dict[str, WorkflowChild], dict[str, str]]:
+        children, actions = self.complete_terminal_repair_without_successor(
+            repair_round
+        )
+        state = self.store.states["PRO-200"]
+        for repository in ("api", "web"):
+            self.github.heads[repository] = state.snapshot.candidate_shas[repository]
+        self.store.partial_create_limits = [1]
+        partial = self.workflow.resume_parent("PRO-200")
+        self.assertEqual(partial.next_action, "uncertain", partial.reason)
+        state = self.store.states["PRO-200"]
+        assert isinstance(state.metadata, ParentMetadata)
+        current = tuple(
+            child
+            for child in state.children
+            if child.stage_ordinal == state.metadata.stage_ordinal
+            and child.attempt == repair_round
+        )
+        self.assertEqual(len(current), 1)
+        self.assertEqual(current[0].phase, "review")
+        self.store.events.clear()
+        self.store.read_counts["PRO-200"] = 0
+        return children, actions
+
+    def test_partial_fresh_gate_rechecks_terminal_repair_wave_every_retry(self):
+        corruptions = (
+            "missing completion",
+            "missing completion action",
+            "failure partition",
+            "source bundle",
+            "source evidence",
+            "evidence drift",
+            "parent drift",
+        )
+        for repair_round in (1, 2, 3):
+            for corruption in corruptions:
+                with self.subTest(
+                    repair_round=repair_round,
+                    corruption=corruption,
+                ):
+                    self.setUp()
+                    children, actions = self.seed_partial_fresh_gate_after_repair(
+                        repair_round=repair_round
+                    )
+                    child = children["api"]
+                    completion_key = ("PRO-200", child.evidence_comment_uuid)
+                    state = self.store.states["PRO-200"]
+                    if corruption == "missing completion":
+                        del self.store.completions[completion_key]
+                    elif corruption == "missing completion action":
+                        self.store.states["PRO-200"] = replace(
+                            state,
+                            applied_action_keys=(
+                                state.applied_action_keys - {actions["api"]}
+                            ),
+                        )
+                    elif corruption == "failure partition":
+                        self.store.states["PRO-200"] = replace(
+                            state,
+                            children=tuple(
+                                replace(item, failure_evidence_uuids=())
+                                if item.identifier == child.identifier
+                                else item
+                                for item in state.children
+                            ),
+                        )
+                    elif corruption == "source bundle":
+                        self.store.states["PRO-200"] = replace(
+                            state,
+                            children=tuple(
+                                replace(item, failure_bundle_digest="f" * 64)
+                                if item.identifier == child.identifier
+                                else item
+                                for item in state.children
+                            ),
+                        )
+                    elif corruption == "source evidence":
+                        source_gate = next(
+                            item
+                            for item in state.children
+                            if item.stage_ordinal == child.stage_ordinal - 1
+                            and item.phase == "review"
+                        )
+                        del self.store.completions[
+                            ("PRO-200", source_gate.evidence_comment_uuid)
+                        ]
+                    elif corruption == "evidence drift":
+                        self.store.completion_drift_after_parent_reread = (
+                            child.evidence_comment_uuid
+                        )
+                    else:
+                        self.store.parent_drift_after_completion_read = "metadata"
+
+                    result = self.workflow.resume_parent("PRO-200")
+
+                    self.assertEqual(result.next_action, "block", result.reason)
+                    self.assertEqual(result.mutation_count, 0)
+                    self.assertFalse(
+                        any(event[0] == "create" for event in self.store.events)
+                    )
+
+    def test_partial_fresh_gate_with_stable_terminal_repair_wave_converges(self):
+        for repair_round in (1, 2, 3):
+            with self.subTest(repair_round=repair_round):
+                self.setUp()
+                self.seed_partial_fresh_gate_after_repair(
+                    repair_round=repair_round
+                )
+
+                result = self.workflow.resume_parent("PRO-200")
+
+                self.assertEqual(result.next_action, "dispatch", result.reason)
+                creates = [
+                    event for event in self.store.events if event[0] == "create"
+                ]
+                self.assertEqual(len(creates), 1)
+                self.assertEqual(len(creates[0][2]), 4)
+
+    def test_repeated_partial_fresh_gate_revalidates_repair_wave(self):
+        children, _ = self.seed_partial_fresh_gate_after_repair(repair_round=2)
+        self.store.partial_create_limits = [0]
+        still_partial = self.workflow.resume_parent("PRO-200")
+        self.assertEqual(still_partial.next_action, "uncertain", still_partial.reason)
+        del self.store.completions[
+            ("PRO-200", children["api"].evidence_comment_uuid)
+        ]
+        self.store.events.clear()
+
+        result = self.workflow.resume_parent("PRO-200")
+
+        self.assertEqual(result.next_action, "block", result.reason)
+        self.assertEqual(result.mutation_count, 0)
+        self.assertFalse(any(event[0] == "create" for event in self.store.events))
+
+    def test_complete_fresh_gate_finalize_revalidates_repair_wave(self):
+        children, _ = self.seed_partial_fresh_gate_after_repair(repair_round=2)
+        converged = self.workflow.resume_parent("PRO-200")
+        self.assertEqual(converged.next_action, "dispatch", converged.reason)
+        state = self.store.states["PRO-200"]
+        assert isinstance(state.metadata, ParentMetadata)
+        self.store.states["PRO-200"] = replace(
+            state,
+            applied_action_keys=(
+                state.applied_action_keys - {state.metadata.last_action}
+            ),
+        )
+        del self.store.completions[
+            ("PRO-200", children["api"].evidence_comment_uuid)
+        ]
+        self.store.events.clear()
+
+        result = self.workflow.resume_parent("PRO-200")
+
+        self.assertEqual(result.next_action, "block", result.reason)
+        self.assertEqual(result.mutation_count, 0)
+        self.assertFalse(any(event[0] == "create" for event in self.store.events))
+
+    def test_partial_fresh_gate_rejects_mixed_exact_predecessor(self):
+        children, _ = self.seed_partial_fresh_gate_after_repair(repair_round=2)
+        state = self.store.states["PRO-200"]
+        web = children["web"]
+        self.store.states["PRO-200"] = replace(
+            state,
+            children=tuple(
+                replace(
+                    item,
+                    phase="implementation",
+                    failure_bundle_digest="",
+                    failure_evidence_uuids=(),
+                    authorizing_comment_uuid="",
+                    responsible_repositories=(),
+                )
+                if item.identifier == web.identifier
+                else item
+                for item in state.children
+            ),
+        )
+        self.store.events.clear()
+
+        result = self.workflow.resume_parent("PRO-200")
+
+        self.assertEqual(result.next_action, "block", result.reason)
+        self.assertEqual(result.mutation_count, 0)
+        self.assertFalse(any(event[0] == "create" for event in self.store.events))
+
     def test_terminal_repair_wave_authority_precedes_fresh_gate_dispatch(self):
         for repair_round in (1, 2, 3):
             for corruption in (
