@@ -670,6 +670,20 @@ class ProvisionerTests(unittest.TestCase):
             runtime_id=self.config.runtime_id, visibility="workspace", max_concurrent_tasks=1,
         )
 
+    def test_provisioned_integration_qa_instructions_distinguish_child_types(self):
+        result = self.provisioner.reconcile(
+            self.config,
+            apply=True,
+            backend_env=self.backend_env,
+        )
+        rendered = self.runner.agents[result.agent_ids["integration_qa"]][
+            "instructions"
+        ]
+        self.assertIn("`--kind qa`", rendered)
+        self.assertIn("exactly one repository SHA", rendered)
+        self.assertIn("`--kind integration_qa`", rendered)
+        self.assertIn("full candidate SHA set", rendered)
+
     def _dry_run_cli_output(self, runner):
         stdout = io.StringIO()
         with (

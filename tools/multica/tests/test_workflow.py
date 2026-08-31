@@ -818,22 +818,66 @@ class PhaseCompletionTests(unittest.TestCase):
             phase("PRO-39", 2, "qa", frontend_sha=None, backend_sha=backend_sha, evidence_comment="00000000-0000-4000-8000-000000000034"),
             phase("PRO-40", 2, "integration_qa", backend_sha=backend_sha, evidence_comment="00000000-0000-4000-8000-000000000035"),
         )
-        completions = {
-            "PRO-37": PhaseCompletion(
+        completions = (
+            ("PRO-37", PhaseCompletion(
                 "qa", "pass", 0,
                 "00000000-0000-4000-8000-000000000032",
                 FRONTEND_SHA, None, None,
-            ),
-            "PRO-40": PhaseCompletion(
+            )),
+            ("PRO-37", PhaseCompletion(
+                "qa", "fail", 0,
+                "00000000-0000-4000-8000-000000000032",
+                FRONTEND_SHA, None, None,
+                ("frontend",),
+                "https://multica.example.test/comments/37",
+            )),
+            ("PRO-39", PhaseCompletion(
+                "qa", "pass", 0,
+                "00000000-0000-4000-8000-000000000034",
+                None, backend_sha, None,
+            )),
+            ("PRO-39", PhaseCompletion(
+                "qa", "fail", 0,
+                "00000000-0000-4000-8000-000000000034",
+                None, backend_sha, None,
+                ("backend",),
+                "https://multica.example.test/comments/39",
+            )),
+            ("PRO-40", PhaseCompletion(
                 "integration_qa", "pass", 0,
                 "00000000-0000-4000-8000-000000000035",
                 FRONTEND_SHA, backend_sha, None,
-            ),
-        }
-        for target_key, completion in completions.items():
+            )),
+            ("PRO-40", PhaseCompletion(
+                "integration_qa", "fail", 0,
+                "00000000-0000-4000-8000-000000000035",
+                FRONTEND_SHA, backend_sha, None,
+                ("frontend",),
+                "https://multica.example.test/comments/40",
+            )),
+        )
+        for target_key, completion in completions:
             with self.subTest(kind=completion.kind):
                 children = tuple(
-                    replace(item, result=None, status="in_review")
+                    replace(
+                        item,
+                        result=(
+                            None
+                            if completion.result == "pass"
+                            else completion.result
+                        ),
+                        responsible_repositories=(
+                            ()
+                            if completion.result == "pass"
+                            else completion.responsible_repositories
+                        ),
+                        evidence_comment_url=(
+                            None
+                            if completion.result == "pass"
+                            else completion.evidence_comment_url
+                        ),
+                        status="in_review",
+                    )
                     if item.issue_key == target_key
                     else item
                     for item in templates

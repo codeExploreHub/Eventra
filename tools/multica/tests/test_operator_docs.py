@@ -1,9 +1,74 @@
 import re
+import shlex
 import unittest
 from pathlib import Path
 
+from tools.multica.workflow import (
+    PhaseCompletion,
+    build_phase_metadata,
+    build_workflow_parser,
+)
+
 
 class OperatorDocsTests(unittest.TestCase):
+    def test_integration_qa_documents_parseable_repository_and_suite_completions(self):
+        rendered = Path("tools/multica/instructions/integration_qa.md").read_text()
+        commands = [
+            line
+            for line in rendered.splitlines()
+            if line.startswith(
+                "python3 -B -m tools.multica.workflow finish-phase "
+            )
+        ]
+        parsed = []
+        for line in commands:
+            argv = shlex.split(line)[4:]
+            replacements = {
+                "PRO-N": "PRO-99",
+                "N": "1",
+                "FULL_SHA": "a" * 40,
+                "COMMENT_UUID": "00000000-0000-4000-8000-000000000099",
+                "HTTPS_URL": "https://multica.example.test/comments/99",
+                "pass|fail|blocked": "pass",
+            }
+            argv = [replacements.get(value, value) for value in argv]
+            args = build_workflow_parser().parse_args(argv)
+            completion = PhaseCompletion(
+                kind=args.kind,
+                result=args.result,
+                attempt=args.attempt,
+                evidence_comment=args.evidence_comment,
+                frontend_sha=args.frontend_sha,
+                backend_sha=args.backend_sha,
+                pr_url=args.pr,
+                responsible_repositories=tuple(args.responsible_repository),
+                evidence_comment_url=args.evidence_comment_url,
+            )
+            build_phase_metadata(completion)
+            parsed.append(completion)
+
+        identities = {
+            (
+                item.kind,
+                item.result,
+                item.frontend_sha is not None,
+                item.backend_sha is not None,
+                item.responsible_repositories,
+                item.evidence_comment_url is not None,
+            )
+            for item in parsed
+        }
+        expected = {
+            ("qa", "pass", True, False, (), False),
+            ("qa", "fail", True, False, ("frontend",), True),
+            ("qa", "pass", False, True, (), False),
+            ("qa", "fail", False, True, ("backend",), True),
+            ("integration_qa", "pass", True, True, (), False),
+            ("integration_qa", "fail", True, True, ("frontend",), True),
+            ("smoke", "pass", True, True, (), False),
+        }
+        self.assertEqual(identities, expected)
+
     def test_authority_contracts_route_gate_results_only_through_delivery_lead(self):
         instructions = Path("tools/multica/instructions")
         rendered = {

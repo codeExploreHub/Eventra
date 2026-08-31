@@ -36,9 +36,39 @@ to dispatch repair. A passing result applies only to the tested SHA set.
 
 Reread every candidate SHA and test only that immutable set. Post commands,
 exits, observations, and safe artifacts; retain the comment UUID. Use exactly
-one completion form.
+one completion form, selected by the handed-off child kind. Never mix a
+repository QA child's kind or single-repository SHA with an integration-suite
+child's kind or full candidate SHA set.
+
+### Repository QA PASS completion
+
+A repository QA child uses `--kind qa` and exactly one repository SHA: use
+`--frontend-sha` for a frontend child or `--backend-sha` for a backend child.
+It never supplies the other repository SHA or a suite candidate pair.
+
+```text
+python3 -B -m tools.multica.workflow finish-phase PRO-N --kind qa --result pass --attempt N --frontend-sha FULL_SHA --evidence-comment COMMENT_UUID
+python3 -B -m tools.multica.workflow finish-phase PRO-N --kind qa --result pass --attempt N --backend-sha FULL_SHA --evidence-comment COMMENT_UUID
+```
+
+Repository QA PASS declares neither `--evidence-comment-url` nor
+`--responsible-repository`.
+
+### Repository QA non-PASS completion
+
+A repository QA FAIL or BLOCKED uses the same one SHA and names that tested
+repository as its legal repair owner:
+
+```text
+python3 -B -m tools.multica.workflow finish-phase PRO-N --kind qa --result fail --attempt N --frontend-sha FULL_SHA --evidence-comment COMMENT_UUID --evidence-comment-url HTTPS_URL --responsible-repository frontend
+python3 -B -m tools.multica.workflow finish-phase PRO-N --kind qa --result fail --attempt N --backend-sha FULL_SHA --evidence-comment COMMENT_UUID --evidence-comment-url HTTPS_URL --responsible-repository backend
+```
 
 ### PASS gate completion
+
+An integration suite child uses `--kind integration_qa` and the exact full
+candidate SHA set required by that suite. Eventra integration suites currently
+require both the frontend and backend SHA.
 
 ```text
 python3 -B -m tools.multica.workflow finish-phase PRO-N --kind integration_qa --result pass --attempt N --frontend-sha FULL_SHA --backend-sha FULL_SHA --evidence-comment COMMENT_UUID
@@ -53,9 +83,10 @@ PASS declares neither `--evidence-comment-url` nor
 python3 -B -m tools.multica.workflow finish-phase PRO-N --kind integration_qa --result fail --attempt N --frontend-sha FULL_SHA --backend-sha FULL_SHA --evidence-comment COMMENT_UUID --evidence-comment-url HTTPS_URL --responsible-repository frontend
 ```
 
-Omit only the unaffected SHA flag. Every FAIL or BLOCKED gate result uses a
-canonical HTTPS URL and at least one `--responsible-repository` legal owner
-(repeat the flag for every affected owner).
+Every FAIL or BLOCKED gate result uses a canonical HTTPS URL and at least one
+`--responsible-repository` legal owner (repeat the flag for every affected
+owner). An integration-suite command retains its full tested candidate SHA set
+even when only one repository is responsible.
 
 ### Smoke completion
 
