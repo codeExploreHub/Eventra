@@ -431,11 +431,14 @@ class FakeWorkflowStore:
                 else 5
             ),
         )
-        if hydrate_current_gate_passes and any(
-            child.stage_ordinal == metadata.stage_ordinal
-            and child.attempt == snapshot.attempt
-            and child.phase in {"review", "qa", "integration_qa"}
-            for child in children
+        if hydrate_current_gate_passes and (
+            decide_parent_action(self.manifest, snapshot).kind is DecisionKind.MERGE
+            or any(
+                child.stage_ordinal == metadata.stage_ordinal
+                and child.attempt == snapshot.attempt
+                and child.phase in {"review", "qa", "integration_qa"}
+                for child in children
+            )
         ):
             observed = {
                 (child.phase, child.target_key, child.suite_key)
@@ -5576,6 +5579,59 @@ class GenericWorkflowTests(unittest.TestCase):
             [event[1] for event in self.store.events if event[0] == "github-read-pr"],
             ["api", "web"],
         )
+
+    def test_merge_requires_complete_authoritative_current_gate_chain(self):
+        self.store.add_state(
+            "PRO-101", passing_snapshot(), children=(),
+            pull_requests=pull_request_targets(), stage_ordinal=5,
+            hydrate_current_gate_passes=False,
+        )
+        self.store.events.clear()
+
+        result = self.workflow.resume_parent("PRO-101")
+
+        self.assertEqual(result.next_action, "block")
+        self.assertEqual(result.mutation_count, 0)
+        self.assertEqual(self.github.merged, [])
+
+        comment_uuid = str(uuid.UUID("1" * 32))
+        seed = WorkflowChild(
+            "PRO-101-API-REVIEW", "api", "api", "", "review", 5, 0,
+            "done", "review:" + "1" * 64, False,
+            evidence_comment_uuid=comment_uuid,
+            creation_candidate_shas=passing_snapshot().candidate_shas,
+            phase_result="pass",
+            evidence_comment_url=f"https://example.test/evidence/{comment_uuid}",
+        )
+        self.store.add_state(
+            "PRO-101", passing_snapshot(), children=(seed,),
+            pull_requests=pull_request_targets(), stage_ordinal=5,
+        )
+        self.store.events.clear()
+        self.github.merged.clear()
+
+        valid = self.workflow.resume_parent("PRO-101")
+
+        self.assertEqual(valid.next_action, "smoke")
+        self.assertEqual(
+            self.github.merged,
+            [
+                ("codeExploreHub/sample-commerce-api", 12),
+                ("codeExploreHub/sample-commerce-web", 14),
+            ],
+        )
+
+        self.store.add_state(
+            "PRO-101", passing_snapshot(), children=(),
+            pull_requests=pull_request_targets(), stage_ordinal=5,
+            hydrate_current_gate_passes=False,
+        )
+        self.store.events.clear()
+        self.github.merged.clear()
+        direct = self.workflow.execute_merge_plan("PRO-101")
+        self.assertEqual(direct.next_action, "block")
+        self.assertEqual(direct.mutation_count, 0)
+        self.assertEqual(self.github.merged, [])
 
     def test_direct_merge_waits_without_mutation_for_active_current_stage(self):
         active_child = WorkflowChild(
