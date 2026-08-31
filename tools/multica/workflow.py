@@ -3206,6 +3206,7 @@ def _repair_completion_provenance_problem(
     current_stage: int,
     current_attempt: int,
     value: PhaseCompletion,
+    authoritative_repair_snapshot: ParentSnapshot | None = None,
 ) -> str | None:
     observed_keys = {
         key for key in metadata if key.startswith("eventra.repair.")
@@ -3324,16 +3325,35 @@ def _repair_completion_provenance_problem(
     source_sha = source_candidates[repository]
     phase_sha = metadata[f"eventra.phase.sha.{repository}"]
     requested_sha = requested_candidates[repository]
+    authoritative_head = None
+    if authoritative_repair_snapshot is not None:
+        authoritative_head = next(
+            (
+                item.head_sha
+                for item in authoritative_repair_snapshot.pull_requests
+                if item.repository == repository
+            ),
+            None,
+        )
     if value.result != "pass":
         if (
             phase_sha != source_sha
             or requested_sha != source_sha
-            or parent_candidates != source_candidates
+            or (
+                authoritative_repair_snapshot is None
+                and parent_candidates != source_candidates
+            )
+            or parent_candidates.get(repository) != source_sha
         ):
             return "nonpassing repair completion cannot replace its seeded SHA"
         return None
     if requested_sha == source_sha:
         return "repair PASS requires a replacement SHA"
+    if (
+        authoritative_repair_snapshot is not None
+        and authoritative_head != requested_sha
+    ):
+        return "repair replacement does not match its current managed PR head"
     if detail["status"] == "done":
         if (
             phase_sha != requested_sha
@@ -3341,7 +3361,14 @@ def _repair_completion_provenance_problem(
             or parent_candidates[repository] not in {source_sha, requested_sha}
         ):
             return "terminal repair replacement conflicts with current authority"
-    elif phase_sha != source_sha or parent_candidates != source_candidates:
+    elif (
+        phase_sha != source_sha
+        or parent_candidates.get(repository) != source_sha
+        or (
+            authoritative_repair_snapshot is None
+            and parent_candidates != source_candidates
+        )
+    ):
         return "repair replacement requires the seeded source and parent candidates"
     return None
 
@@ -3419,6 +3446,75 @@ def _finish_phase_authority_problem(
     ):
         return "phase completion is not for the exact current child"
     if value.kind == "repair":
+        authoritative_repair_snapshot = None
+        try:
+            source_candidates = _decode_source_candidates(
+                metadata["eventra.repair.source_candidates"]
+            )
+            action_source_candidates = _repair_action_source_candidates(
+                metadata["eventra.repair.creation_action"]
+            )
+        except (KeyError, RuntimeError):
+            source_candidates = {}
+            action_source_candidates = {}
+        parent_candidates = {
+            repository: sha
+            for repository, sha in (
+                (
+                    "frontend",
+                    parent_metadata.get("eventra.workflow.frontend_sha"),
+                ),
+                (
+                    "backend",
+                    parent_metadata.get("eventra.workflow.backend_sha"),
+                ),
+            )
+            if sha is not None
+        }
+        if (
+            source_candidates == action_source_candidates
+            and set(parent_candidates) == set(source_candidates)
+            and parent_candidates != source_candidates
+        ):
+            try:
+                authoritative_repair_snapshot = load_parent_snapshot(
+                    runner,
+                    GitHubRunner(),
+                    str(parent["identifier"]),
+                )
+            except (RuntimeError, TypeError, ValueError):
+                return "authoritative current repair snapshot is malformed"
+            current_repairs = tuple(
+                item
+                for item in authoritative_repair_snapshot.children
+                if item.stage == current_stage
+            )
+            repair_problem = _current_repair_provenance_problem(
+                authoritative_repair_snapshot,
+                current_repairs,
+            )
+            loaded_target = tuple(
+                item
+                for item in current_repairs
+                if item.issue_key == detail["identifier"]
+            )
+            if (
+                authoritative_repair_snapshot.identifier
+                != str(parent["identifier"])
+                or authoritative_repair_snapshot.parent_id != str(parent["id"])
+                or authoritative_repair_snapshot.attempt != attempt
+                or authoritative_repair_snapshot.next_stage != next_stage
+                or authoritative_repair_snapshot.last_action
+                != parent_metadata.get("eventra.workflow.last_action")
+                or _candidate_sha_map(authoritative_repair_snapshot)
+                != parent_candidates
+                or repair_problem is not None
+                or len(loaded_target) != 1
+                or loaded_target[0].status != detail["status"]
+                or loaded_target[0].repair_repository
+                != metadata.get("eventra.repair.repository")
+            ):
+                return "partial repair parent copy is not current and authoritative"
         return _repair_completion_provenance_problem(
             metadata,
             detail,
@@ -3427,6 +3523,7 @@ def _finish_phase_authority_problem(
             current_stage,
             attempt,
             value,
+            authoritative_repair_snapshot,
         )
     if any(key.startswith("eventra.repair.") for key in metadata):
         return "non-repair completion carries repair provenance"

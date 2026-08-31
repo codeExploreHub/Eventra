@@ -181,6 +181,189 @@ class FakeWorkflowRunner:
             raise AssertionError(f"{left!r} != {right!r}")
 
 
+class FakeSnapshotFinishRunner:
+    """Authoritative Multica reads for one snapshot-backed completion."""
+
+    def __init__(self, snapshot, target_key):
+        self.snapshot = snapshot
+        self.target_key = target_key
+        self.parent = raw_issue(
+            id=PARENT_ID,
+            identifier=snapshot.identifier,
+            parent_issue_id=None,
+            stage=None,
+            status=snapshot.parent_status,
+            assignee_type="squad",
+        )
+        self.issues = {}
+        self.metadata = {}
+        for index, item in enumerate(snapshot.children, start=100):
+            issue_id = f"01a00000-0000-7000-8000-{index:012d}"
+            self.issues[item.issue_key] = raw_issue(
+                id=issue_id,
+                identifier=item.issue_key,
+                parent_issue_id=PARENT_ID,
+                stage=item.stage,
+                status=item.status,
+                project_id=item.project_id or PROJECT_ID,
+                assignee_id=item.assignee_id or AGENT_ID,
+                assignee_type=item.assignee_type,
+            )
+            metadata = {
+                "eventra.workflow.version": str(item.workflow_version),
+                "eventra.phase.kind": item.kind,
+                "eventra.phase.attempt": str(item.attempt),
+                "eventra.phase.failure_repositories": json.dumps(
+                    list(item.responsible_repositories),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
+            if item.result is not None:
+                metadata.update(
+                    {
+                        "eventra.phase.result": item.result,
+                        "eventra.phase.evidence_comment": item.evidence_comment,
+                    }
+                )
+            if item.evidence_comment_url is not None:
+                metadata["eventra.phase.evidence_comment_url"] = (
+                    item.evidence_comment_url
+                )
+            if item.frontend_sha is not None:
+                metadata["eventra.phase.sha.frontend"] = item.frontend_sha
+            if item.backend_sha is not None:
+                metadata["eventra.phase.sha.backend"] = item.backend_sha
+            if item.pr_url:
+                metadata["eventra.phase.pr"] = item.pr_url
+            if item.creation_action:
+                metadata.update(
+                    {
+                        "eventra.repair.creation_action": item.creation_action,
+                        "eventra.repair.failure_bundle_digest": (
+                            item.failure_bundle_digest
+                        ),
+                        "eventra.repair.failure_evidence_uuids": json.dumps(
+                            list(item.failure_evidence_uuids),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        "eventra.repair.authorizing_comment_uuid": (
+                            item.authorizing_comment_uuid
+                        ),
+                        "eventra.repair.repository": item.repair_repository,
+                        "eventra.repair.pull_request": item.repair_pull_request,
+                        "eventra.repair.round": str(item.repair_round),
+                        "eventra.repair.source_candidates": json.dumps(
+                            dict(item.repair_source_candidates),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    }
+                )
+            self.metadata[item.issue_key] = metadata
+        self.parent_metadata = {
+            "eventra.workflow.version": str(snapshot.workflow_version),
+            "eventra.workflow.classification": snapshot.classification,
+            "eventra.workflow.next_stage": str(snapshot.next_stage),
+            "eventra.workflow.attempt": str(snapshot.attempt),
+            "eventra.workflow.merge_state": snapshot.merge_state,
+            "eventra.workflow.last_action": snapshot.last_action or "",
+        }
+        if snapshot.candidate_frontend_sha is not None:
+            self.parent_metadata["eventra.workflow.frontend_sha"] = (
+                snapshot.candidate_frontend_sha
+            )
+        if snapshot.candidate_backend_sha is not None:
+            self.parent_metadata["eventra.workflow.backend_sha"] = (
+                snapshot.candidate_backend_sha
+            )
+        if snapshot.consumed_authorization_uuid:
+            self.parent_metadata[
+                workflow_module.REPAIR_AUTHORIZATION_CONSUMED_KEY
+            ] = snapshot.consumed_authorization_uuid
+        self.calls = []
+
+    @property
+    def mutation_count(self):
+        return sum(
+            call[:3] == ("issue", "metadata", "set")
+            or call[:3] == ("issue", "status", self.target_key)
+            for call in self.calls
+        )
+
+    def _children_payload(self):
+        stages = []
+        for stage in sorted({item["stage"] for item in self.issues.values()}):
+            issues = [
+                copy.deepcopy(item)
+                for item in self.issues.values()
+                if item["stage"] == stage
+            ]
+            stages.append(
+                {
+                    "stage": stage,
+                    "total": len(issues),
+                    "done": sum(item["status"] == "done" for item in issues),
+                    "issues": issues,
+                }
+            )
+        return {"stages": stages, "total": len(self.issues), "unstaged": []}
+
+    @staticmethod
+    def _flag(args, name):
+        return args[args.index(name) + 1]
+
+    def run(self, args, *, stdin_json=None):
+        if stdin_json is not None:
+            raise AssertionError("snapshot completion never accepts stdin JSON")
+        call = tuple(args)
+        self.calls.append(call)
+        if call[:2] == ("issue", "get"):
+            identifier = call[2]
+            if identifier in {PARENT_ID, self.snapshot.identifier}:
+                return copy.deepcopy(self.parent)
+            return copy.deepcopy(self.issues[identifier])
+        if call == (
+            "issue", "children", self.snapshot.identifier, "--output", "json"
+        ):
+            return self._children_payload()
+        if call[:3] == ("issue", "metadata", "list"):
+            identifier = call[3]
+            if identifier in {PARENT_ID, self.snapshot.identifier}:
+                return copy.deepcopy(self.parent_metadata)
+            return copy.deepcopy(self.metadata[identifier])
+        if call[:3] == ("issue", "metadata", "set"):
+            identifier = call[3]
+            self.metadata[identifier][self._flag(args, "--key")] = self._flag(
+                args,
+                "--value",
+            )
+            return {"ok": True}
+        if call[:3] == ("issue", "status", self.target_key):
+            self.issues[self.target_key]["status"] = call[3]
+            return copy.deepcopy(self.issues[self.target_key])
+        raise AssertionError(f"unsupported snapshot completion argv: {call!r}")
+
+
+class FakeSnapshotGitHubRunner:
+    def __init__(self, pull_requests):
+        self.pull_requests = {item.url: item for item in pull_requests}
+        self.calls = []
+
+    def run(self, args):
+        self.calls.append(tuple(args))
+        item = self.pull_requests[args[2]]
+        return {
+            "url": item.url,
+            "headRefOid": item.head_sha,
+            "state": item.state.upper(),
+            "mergeable": "MERGEABLE" if item.mergeable else "CONFLICTING",
+            "mergeStateStatus": "CLEAN" if item.checks_pass else "BLOCKED",
+            "statusCheckRollup": [],
+        }
+
+
 def implementation_completion(**overrides):
     values = {
         "kind": "implementation",
@@ -1100,6 +1283,7 @@ class ParentDecisionTests(unittest.TestCase):
         implementation = (
             phase(
                 "PRO-70", 1, "implementation",
+                evidence_comment="00000000-0000-4000-8000-000000000070",
                 project_id=frontend_project,
                 pr_url=FRONTEND_PR,
                 assignee_id=frontend_owner,
@@ -1108,6 +1292,7 @@ class ParentDecisionTests(unittest.TestCase):
                 "PRO-71", 1, "implementation",
                 frontend_sha=None,
                 backend_sha=backend_sha,
+                evidence_comment="00000000-0000-4000-8000-000000000071",
                 project_id=backend_project,
                 pr_url=backend_pr,
                 assignee_id=backend_owner,
@@ -1184,6 +1369,11 @@ class ParentDecisionTests(unittest.TestCase):
                 result="pass" if frontend_done else None,
                 attempt=repair_round,
                 status="done" if frontend_done else "in_progress",
+                evidence_comment=(
+                    "00000000-0000-4000-8000-000000000095"
+                    if frontend_done
+                    else ""
+                ),
                 frontend_sha=(
                     frontend_replacement if frontend_done else FRONTEND_SHA
                 ),
@@ -1207,6 +1397,11 @@ class ParentDecisionTests(unittest.TestCase):
                     result="pass" if backend_done else None,
                     attempt=repair_round,
                     status="done" if backend_done else "in_progress",
+                    evidence_comment=(
+                        "00000000-0000-4000-8000-000000000096"
+                        if backend_done
+                        else ""
+                    ),
                     frontend_sha=None,
                     backend_sha=(
                         backend_replacement if backend_done else backend_sha
@@ -1366,6 +1561,126 @@ class ParentDecisionTests(unittest.TestCase):
             parent_backend_sha="d" * 40,
         )
         self.assertEqual(decide_parent_action(completed).kind, "create_gate_stage")
+
+    def test_partial_parent_copy_composes_with_remaining_sibling_completion(self):
+        for repair_round, backend_replacement in zip(
+            (1, 2, 3),
+            ("d" * 40, "e" * 40, "f" * 40),
+            strict=True,
+        ):
+            with self.subTest(repair_round=repair_round):
+                snapshot = self._partial_cross_stack_repair_snapshot(
+                    repair_round=repair_round,
+                    backend_head=backend_replacement,
+                    parent_frontend_sha="c" * 40,
+                )
+                self.assertEqual(decide_parent_action(snapshot).kind, "noop")
+                runner = FakeSnapshotFinishRunner(snapshot, "PRO-77")
+                github = FakeSnapshotGitHubRunner(snapshot.pull_requests)
+                immutable_before = {
+                    key: value
+                    for key, value in runner.metadata["PRO-77"].items()
+                    if key.startswith("eventra.repair.")
+                }
+
+                with patch.object(
+                    workflow_module,
+                    "GitHubRunner",
+                    return_value=github,
+                ):
+                    result = finish_phase(
+                        runner,
+                        "PRO-77",
+                        PhaseCompletion(
+                            kind="repair",
+                            result="pass",
+                            attempt=repair_round,
+                            evidence_comment=COMMENT_ID,
+                            frontend_sha=None,
+                            backend_sha=backend_replacement,
+                            pr_url=(
+                                "https://github.com/"
+                                "codeExploreHub/Eventra-Backend/pull/7"
+                            ),
+                        ),
+                    )
+
+                self.assertEqual(result.status, "done")
+                self.assertEqual(
+                    runner.metadata["PRO-77"]["eventra.phase.sha.backend"],
+                    backend_replacement,
+                )
+                self.assertEqual(
+                    {
+                        key: value
+                        for key, value in runner.metadata["PRO-77"].items()
+                        if key.startswith("eventra.repair.")
+                    },
+                    immutable_before,
+                )
+
+    def test_partial_parent_copy_completion_rejects_unverified_compositions(self):
+        valid = self._partial_cross_stack_repair_snapshot(
+            backend_head="d" * 40,
+            parent_frontend_sha="c" * 40,
+        )
+        wrong_seed_child = replace(
+            valid.children[-1],
+            backend_sha="e" * 40,
+        )
+        cases = {
+            "invalid completed copy": replace(
+                valid,
+                candidate_frontend_sha="e" * 40,
+            ),
+            "completed child head mismatch": replace(
+                valid,
+                pull_requests=(
+                    replace(valid.pull_requests[0], head_sha=FRONTEND_SHA),
+                    valid.pull_requests[1],
+                ),
+            ),
+            "wrong finishing seed": replace(
+                valid,
+                children=(*valid.children[:-1], wrong_seed_child),
+            ),
+            "active owner adopted": replace(
+                valid,
+                candidate_backend_sha="d" * 40,
+            ),
+        }
+
+        for label, snapshot in cases.items():
+            with self.subTest(label=label):
+                self.assertEqual(
+                    decide_parent_action(snapshot).kind,
+                    "block_parent",
+                )
+                runner = FakeSnapshotFinishRunner(snapshot, "PRO-77")
+                github = FakeSnapshotGitHubRunner(snapshot.pull_requests)
+                with patch.object(
+                    workflow_module,
+                    "GitHubRunner",
+                    return_value=github,
+                ):
+                    with self.assertRaises(RuntimeError):
+                        finish_phase(
+                            runner,
+                            "PRO-77",
+                            PhaseCompletion(
+                                kind="repair",
+                                result="pass",
+                                attempt=1,
+                                evidence_comment=COMMENT_ID,
+                                frontend_sha=None,
+                                backend_sha="d" * 40,
+                                pr_url=(
+                                    "https://github.com/"
+                                    "codeExploreHub/Eventra-Backend/pull/7"
+                                ),
+                            ),
+                        )
+                self.assertEqual(runner.mutation_count, 0)
 
     def test_nonrepair_stages_keep_the_generic_parent_head_drift_boundary(self):
         drifted_pr = frontend_pr(head_sha="e" * 40)
