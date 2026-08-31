@@ -24,6 +24,7 @@ from .contracts import (
     parse_autopilot_list,
 )
 from .eventra_adapter import build_eventra_config
+from .issue_contracts import parse_issue_comments
 from .provision import MulticaRunner
 
 
@@ -139,6 +140,30 @@ def _parse_audit_environment(value: Any, expected_id: str) -> None:
     parse_agent_environment(value, expected_id)
     if set(value) != {"agent_id", "custom_env"}:
         raise RuntimeError("malformed agent environment")
+
+
+def collect_comment_contract_shape(
+    runner: MulticaRunner, issue_identifier: str, comment_uuid: str
+) -> dict[str, Any]:
+    """Read one bounded thread and retain only its versioned JSON shape."""
+
+    value = _read(
+        runner,
+        [
+            "issue", "comment", "list", issue_identifier,
+            "--thread", comment_uuid,
+            "--tail", "30",
+            "--compact",
+            "--output", "json",
+        ],
+    )
+    parsed = parse_issue_comments(value, issue_identifier)
+    if not any(record["id"] == comment_uuid for record in parsed):
+        raise RuntimeError("malformed issue comments")
+    return {
+        "schema_version": 1,
+        "response": _shape(value, target_id=comment_uuid, target_field="id"),
+    }
 
 
 def collect_contract_audit(

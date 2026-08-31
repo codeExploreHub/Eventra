@@ -80,6 +80,7 @@ READ_ONLY_COMMAND_PREFIXES = frozenset(
         ("issue", "children"),
         ("issue", "runs"),
         ("issue", "metadata", "list"),
+        ("issue", "comment", "list"),
     }
 )
 

@@ -5,6 +5,7 @@ import unittest
 
 from tools.multica.issue_contracts import (
     parse_issue_children,
+    parse_issue_comments,
     parse_issue_detail,
     parse_issue_list,
     parse_issue_metadata,
@@ -17,6 +18,8 @@ CHILD_ID = "01a00000-0000-7000-8000-000000000002"
 PROJECT_ID = "00000000-0000-4000-8000-000000000003"
 AGENT_ID = "00000000-0000-4000-8000-000000000004"
 RUN_ID = "01a00000-0000-7000-8000-000000000005"
+COMMENT_ROOT_ID = "01a00000-0000-7000-8000-000000000010"
+COMMENT_REPLY_ID = "01a00000-0000-7000-8000-000000000011"
 
 
 def issue_detail(**overrides):
@@ -108,6 +111,68 @@ def issue_run(**overrides):
     }
     value.update(overrides)
     return value
+
+
+def issue_comments():
+    return [
+        {
+            "author_id": AGENT_ID,
+            "author_type": "agent",
+            "content": "Root evidence body",
+            "created_at": "2026-08-25T08:33:39Z",
+            "id": COMMENT_ROOT_ID,
+            "revision": 1,
+            "type": "comment",
+        },
+        {
+            "author_id": AGENT_ID,
+            "author_type": "member",
+            "content": "Reply evidence body",
+            "created_at": "2026-08-25T08:34:39Z",
+            "id": COMMENT_REPLY_ID,
+            "parent_id": COMMENT_ROOT_ID,
+            "revision": 2,
+            "type": "comment",
+        },
+    ]
+
+
+class IssueCommentContractTests(unittest.TestCase):
+    def test_compact_thread_normalizes_oldest_first_without_mutation(self):
+        value = issue_comments()
+        original = copy.deepcopy(value)
+        parsed = parse_issue_comments(value, "PRO-36")
+        self.assertEqual(value, original)
+        self.assertEqual([item["id"] for item in parsed], [COMMENT_ROOT_ID, COMMENT_REPLY_ID])
+        self.assertEqual(parsed[1]["parent_id"], COMMENT_ROOT_ID)
+        self.assertEqual(parsed[1]["content"], "Reply evidence body")
+
+    def test_rejects_invalid_ids_issue_path_parent_author_body_timestamp_and_order(self):
+        invalid_values = (
+            (issue_comments(), "not-an-issue"),
+            ([dict(issue_comments()[0], id="not-a-uuid")], "PRO-36"),
+            ([dict(issue_comments()[0], extra="unexpected")], "PRO-36"),
+            ([dict(issue_comments()[0], author_id="")], "PRO-36"),
+            ([dict(issue_comments()[0], author_type="system")], "PRO-36"),
+            ([dict(issue_comments()[0], content="")], "PRO-36"),
+            ([dict(issue_comments()[0], created_at="yesterday")], "PRO-36"),
+            ([dict(issue_comments()[0], revision=0)], "PRO-36"),
+            ([dict(issue_comments()[0], type="status")], "PRO-36"),
+            ([issue_comments()[0], dict(issue_comments()[1], id=COMMENT_ROOT_ID)], "PRO-36"),
+            ([issue_comments()[0], dict(issue_comments()[1], parent_id="01a00000-0000-7000-8000-000000000099")], "PRO-36"),
+            ([issue_comments()[1]], "PRO-36"),
+            (list(reversed(issue_comments())), "PRO-36"),
+        )
+        for comments, expected_issue in invalid_values:
+            with self.subTest(expected_issue=expected_issue, comments=len(comments)):
+                with self.assertRaisesRegex(RuntimeError, "malformed issue comments"):
+                    parse_issue_comments(comments, expected_issue)
+
+    def test_rejects_empty_or_non_array_thread(self):
+        for value in ([], {}, None):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(RuntimeError, "malformed issue comments"):
+                    parse_issue_comments(value, "PRO-36")
 
 
 class IssueContractTests(unittest.TestCase):
