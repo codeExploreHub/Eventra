@@ -36,9 +36,11 @@ state, not a static desired inventory. Its stable top-level schema is:
   "actions": [],
   "mode": "dry-run",
   "mutation_count": 0,
+  "preconditions": [],
   "summary": {
     "by_action": {},
     "by_kind": {},
+    "blocked": false,
     "noop": true,
     "total": 0
   }
@@ -56,6 +58,14 @@ preflight found no intended change. A non-empty plan is advisory input for
 review: `--apply` performs its own fresh preflight and is not bound to the prior
 dry-run response.
 
+When no explicit environment authority is available, dry-run does not invent
+environment mutations. It returns `actions: []`, `summary.blocked: true`, and
+one sanitized `backend_environment` precondition: `requires_input` when no
+valid recipient environment exists, or `conflict` when existing valid
+recipient environments disagree. If one or more existing valid recipient
+environments agree, that value is used only as an in-memory comparison
+authority and dry-run plans updates solely for missing or different recipients.
+
 ```bash
 python3 -m tools.multica.provision --runtime-id RUNTIME_ID --daemon-id DAEMON_ID --apply
 ```
@@ -64,9 +74,12 @@ Use `--prompt-backend-env` only when Backend Engineer and Integration QA need
 the local backend environment. It prompts for the secret without echoing it
 and passes it only through those agents' custom environment. Do not put a
 secret in shell history, Issue text, logs, pull-request descriptions, or a
-tracked environment file. Both backend environment modes require `--apply`;
-the dry-run path rejects them before any prompt, environment read, or Multica
-preflight.
+tracked environment file. Prompt mode requires `--apply` and dry-run rejects it
+before any prompt, environment read, or Multica preflight. Dry-run may use
+`--reuse-backend-env`: this is an explicit, read-only choice of the existing
+Backend Engineer environment as comparison authority and never prints its keys
+or values. Use the same environment-authority mode for the reviewed dry-run and
+the later fresh `--apply`; a changed mode requires another dry-run review.
 
 ## Contract recovery runbook
 
@@ -93,7 +106,8 @@ python3 -m tools.multica.contract_audit \
 ```bash
 python3 -m tools.multica.provision \
   --runtime-id RUNTIME_ID \
-  --daemon-id DAEMON_ID
+  --daemon-id DAEMON_ID \
+  --reuse-backend-env
 ```
 
 For the approved Eventra recovery target only, run the following in this exact

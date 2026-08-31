@@ -135,6 +135,7 @@ class ProvisioningPlan:
     """Observed, mutation-free reconciliation plan safe for rendering."""
 
     actions: tuple[ProvisionAction, ...]
+    preconditions: tuple[PlanPrecondition, ...] = ()
 
     @property
     def summary(self) -> dict[str, Any]:
@@ -145,7 +146,8 @@ class ProvisioningPlan:
             by_kind[item.kind] = by_kind.get(item.kind, 0) + 1
         return {
             "total": len(self.actions),
-            "noop": not self.actions,
+            "noop": not self.actions and not self.preconditions,
+            "blocked": bool(self.preconditions),
             "by_action": dict(sorted(by_action.items())),
             "by_kind": dict(sorted(by_kind.items())),
         }
@@ -153,8 +155,20 @@ class ProvisioningPlan:
     def to_dict(self) -> dict[str, Any]:
         return {
             "summary": self.summary,
+            "preconditions": [item.to_dict() for item in self.preconditions],
             "actions": [item.to_dict() for item in self.actions],
         }
+
+
+@dataclass(frozen=True)
+class PlanPrecondition:
+    """One sanitized condition that prevents an executable dry-run plan."""
+
+    kind: str
+    status: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"kind": self.kind, "status": self.status}
 
 
 @dataclass(frozen=True)
@@ -251,10 +265,17 @@ class Provisioner:
         self._validate_backend_env(backend_env)
         desired_skills = self._desired_skills(config)
         state = self._preflight(config, desired_skills)
-        canonical_env = self._validate_env_preconditions(
-            config, state, apply, backend_env
+        self._validate_existing_squad_authority(config, state)
+        canonical_env, env_preconditions = self._resolve_backend_env(
+            state, apply=apply, backend_env=backend_env
         )
-        plan = self._build_plan(config, desired_skills, state, backend_env)
+        plan = self._build_plan(
+            config,
+            desired_skills,
+            state,
+            canonical_env,
+            env_preconditions,
+        )
 
         if not apply:
             return ProvisioningResult(
@@ -550,18 +571,71 @@ class Provisioner:
             raise ValueError("JWT secret must contain at least 64 characters")
 
     @staticmethod
-    def _validate_env_preconditions(
-        config, state, apply, backend_env
-    ) -> dict[str, str] | None:
-        if not apply or backend_env is not None:
-            return None
-        recipient_envs = [state.agent_envs[role] for role in ENV_RECIPIENTS]
-        if (
-            any(not Provisioner._is_valid_backend_env(env) for env in recipient_envs)
-            or recipient_envs[0] != recipient_envs[1]
-        ):
-            raise ValueError("backend environment is required before applying agent changes")
-        return dict(recipient_envs[0])
+    def _resolve_backend_env(state, *, apply, backend_env):
+        if backend_env is not None:
+            return dict(backend_env), ()
+
+        valid_existing = [
+            state.agent_envs[role]
+            for role in sorted(ENV_RECIPIENTS)
+            if Provisioner._is_valid_backend_env(state.agent_envs[role])
+        ]
+        if not valid_existing:
+            if apply:
+                raise ValueError(
+                    "backend environment is required before applying agent changes"
+                )
+            return None, (
+                PlanPrecondition("backend_environment", "requires_input"),
+            )
+        canonical = valid_existing[0]
+        if any(value != canonical for value in valid_existing[1:]):
+            if apply:
+                raise ValueError(
+                    "backend environment is required before applying agent changes"
+                )
+            return None, (
+                PlanPrecondition("backend_environment", "conflict"),
+            )
+
+        all_recipients_match = all(
+            state.agent_details[role] is not None
+            and state.agent_envs[role] == canonical
+            for role in ENV_RECIPIENTS
+        )
+        if apply and not all_recipients_match:
+            raise ValueError(
+                "backend environment is required before applying agent changes"
+            )
+        return dict(canonical), ()
+
+    def _validate_existing_squad_authority(self, config, state) -> None:
+        if state.squad_detail is None:
+            if state.members:
+                raise RuntimeError("unsafe Squad member state")
+            return
+
+        leader_role = config.blueprint.leader_role
+        leader_detail = state.agent_details[leader_role]
+        if leader_detail is not None:
+            leader_id = leader_detail["id"]
+            if state.squad_detail["leader_id"] != leader_id:
+                raise RuntimeError("Squad leader reconciliation failed")
+            self._validate_server_managed_leader(state.members, leader_id)
+
+        by_member = self._validate_members(state.members)
+        current_agents = {
+            detail["id"]: agent.role
+            for agent in config.blueprint.agents
+            if (detail := state.agent_details[agent.role]) is not None
+        }
+        if set(by_member).difference(current_agents):
+            raise RuntimeError("unsafe Squad member state")
+
+        if leader_detail is None:
+            if state.squad_detail["leader_id"] in by_member:
+                raise RuntimeError("unsafe Squad member state")
+            return
 
     @staticmethod
     def _is_valid_backend_env(value: object) -> bool:
@@ -582,7 +656,16 @@ class Provisioner:
             key: source for key, source in config.skills.items() if key in keys
         }
 
-    def _build_plan(self, config, desired_skills, state, backend_env):
+    def _build_plan(
+        self,
+        config,
+        desired_skills,
+        state,
+        canonical_env,
+        preconditions=(),
+    ):
+        if preconditions:
+            return ProvisioningPlan((), tuple(preconditions))
         actions: list[ProvisionAction] = []
 
         def add(action, kind, key, name, resource_id, operation, changes):
@@ -605,16 +688,6 @@ class Provisioner:
                     {"origin": "approved_github", "source": source.url},
                 )
 
-        valid_recipient_envs = [
-            state.agent_envs[role]
-            for role in sorted(ENV_RECIPIENTS)
-            if state.agent_details[role] is not None
-        ]
-        shared_existing_env = (
-            len(valid_recipient_envs) == len(ENV_RECIPIENTS)
-            and all(self._is_valid_backend_env(value) for value in valid_recipient_envs)
-            and valid_recipient_envs[0] == valid_recipient_envs[1]
-        )
         for agent in config.agents:
             detail = state.agent_details[agent.role]
             desired = self._desired_agent(config, agent)
@@ -640,11 +713,7 @@ class Provisioner:
                     )
                 if agent.needs_backend_env:
                     observed_env = state.agent_envs[agent.role]
-                    env_matches = (
-                        observed_env == backend_env
-                        if backend_env is not None
-                        else shared_existing_env
-                    )
+                    env_matches = observed_env == canonical_env
                     if not env_matches:
                         env_state = (
                             "missing"
@@ -1489,6 +1558,9 @@ def _planned_output(result: ProvisioningResult) -> str:
             "mode": "dry-run",
             "mutation_count": result.mutation_count,
             "summary": result.plan.summary,
+            "preconditions": [
+                item.to_dict() for item in result.plan.preconditions
+            ],
             "actions": [item.to_dict() for item in result.plan.actions],
         },
         sort_keys=True,
@@ -1520,10 +1592,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     environment_mode.add_argument("--prompt-backend-env", action="store_true")
     environment_mode.add_argument("--reuse-backend-env", action="store_true")
     args = parser.parse_args(argv)
-    if not args.apply and (
-        args.prompt_backend_env or args.reuse_backend_env
-    ):
-        parser.error("backend environment modes require --apply")
+    if not args.apply and args.prompt_backend_env:
+        parser.error("prompt backend environment mode requires --apply")
     config = build_eventra_config(args.runtime_id, args.daemon_id)
     runner = MulticaRunner()
     backend_env = (

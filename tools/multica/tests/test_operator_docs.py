@@ -147,11 +147,17 @@ class OperatorDocsTests(unittest.TestCase):
             '"mode": "dry-run"',
             '"mutation_count": 0',
             '"summary"',
+            '"preconditions": []',
             '"actions"',
+            '"blocked": false',
             '`action`, `kind`, `key`, `name`, `id`, `operation`, and `changes`',
             'environment state as only `missing`, `set`, or `update`',
             'does not print environment key names or values',
             'An empty `actions` array with `summary.noop: true`',
+            '`requires_input`',
+            '`conflict`',
+            'same environment-authority mode',
+            'Dry-run may use `--reuse-backend-env`',
             'deterministic',
         ):
             with self.subTest(fragment=fragment):
@@ -385,7 +391,8 @@ class OperatorDocsTests(unittest.TestCase):
             audit,
         )
         self.assertEqual(
-            "python3 -m tools.multica.provision --runtime-id RUNTIME_ID --daemon-id DAEMON_ID",
+            "python3 -m tools.multica.provision --runtime-id RUNTIME_ID "
+            "--daemon-id DAEMON_ID --reuse-backend-env",
             dry_run,
         )
 
