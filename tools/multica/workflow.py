@@ -657,22 +657,29 @@ def _attempt_history_is_consistent(snapshot: ParentSnapshot) -> bool:
 
 
 def _gate_coverage(snapshot: ParentSnapshot, phases: tuple[PhaseSnapshot, ...]) -> bool:
-    if {item.kind for item in phases} != {"review", "qa"}:
-        return False
     expected = _expected_repositories(snapshot)
-    return all(
-        {
+    expected_identities = {
+        (kind, repository)
+        for kind in ("review", "qa")
+        for repository in expected
+    }
+    observed: list[tuple[str, str]] = []
+    for item in phases:
+        repositories = tuple(
             repository
-            for item in phases
-            if item.kind == kind
             for repository, sha in (
                 ("frontend", item.frontend_sha),
                 ("backend", item.backend_sha),
             )
             if sha is not None
-        }
-        == expected
-        for kind in ("review", "qa")
+        )
+        if not repositories or item.attempt != snapshot.attempt:
+            return False
+        observed.extend((item.kind, repository) for repository in repositories)
+    return (
+        bool(observed)
+        and len(observed) == len(set(observed))
+        and set(observed) == expected_identities
     )
 
 
@@ -1087,6 +1094,8 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
         not isinstance(snapshot, ParentSnapshot)
         or _scope(snapshot) == "invalid"
         or snapshot.attempt < 0
+        or type(snapshot.next_stage) is not int
+        or snapshot.next_stage < 1
         or snapshot.merge_state not in {"not_ready", "ready", "merged", "partial"}
     ):
         return ParentDecision("block_parent", None, "malformed parent workflow state")
@@ -1116,11 +1125,28 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
             "block_parent",
             "cross-repository merge is partial",
         )
-    if snapshot.children:
-        latest_stage = max(item.stage for item in snapshot.children)
-        latest = tuple(item for item in snapshot.children if item.stage == latest_stage)
-    else:
-        latest = ()
+    current_stage = snapshot.next_stage - 1
+    if any(item.stage > current_stage for item in snapshot.children):
+        return ParentDecision(
+            "block_parent",
+            None,
+            "child Stage is ahead of authoritative parent workflow state",
+        )
+    latest = tuple(
+        item for item in snapshot.children if item.stage == current_stage
+    )
+    if snapshot.children and not latest:
+        return ParentDecision(
+            "block_parent",
+            None,
+            "authoritative current Stage membership is missing",
+        )
+    if any(item.attempt != snapshot.attempt for item in latest):
+        return ParentDecision(
+            "block_parent",
+            None,
+            "authoritative current Stage attempt is conflicting",
+        )
     current_repair_stage = bool(
         latest and {item.kind for item in latest} == {"repair"}
     )

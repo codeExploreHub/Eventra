@@ -1143,8 +1143,14 @@ def parent_snapshot(**overrides):
         "candidate_backend_sha": None,
         "children": (phase("PRO-36", 1, "implementation"),),
         "pull_requests": (frontend_pr(),),
+        "next_stage": 2,
     }
     values.update(overrides)
+    if "next_stage" not in overrides:
+        values["next_stage"] = max(
+            (child.stage for child in values["children"]),
+            default=0,
+        ) + 1
     return ParentSnapshot(**values)
 
 
@@ -2187,11 +2193,59 @@ class ParentDecisionTests(unittest.TestCase):
                 "create_gate_stage",
                 (
                     f"2:PRO-35:create_gate_stage:0:frontend:{FRONTEND_SHA}:-"
-                    ":next-stage:1"
+                    ":next-stage:2"
                 ),
                 "implementation evidence is ready for exact-SHA gates",
             ),
         )
+
+    def test_future_gate_stage_cannot_override_authoritative_current_stage(self):
+        snapshot = parent_snapshot(
+            next_stage=3,
+            children=(
+                phase("PRO-36", 1, "implementation"),
+                phase("PRO-37", 2, "review", status="in_progress"),
+                phase("PRO-38", 2, "qa", status="in_progress"),
+                phase("PRO-97", 99, "review"),
+                phase("PRO-98", 99, "qa"),
+            ),
+        )
+
+        decision = decide_parent_action(snapshot)
+
+        self.assertEqual(decision.kind, "block_parent")
+
+    def test_duplicate_current_gate_identity_never_merges(self):
+        snapshot = parent_snapshot(
+            next_stage=3,
+            children=(
+                phase("PRO-36", 1, "implementation"),
+                phase("PRO-37", 2, "review"),
+                phase("PRO-38", 2, "review"),
+                phase("PRO-39", 2, "qa"),
+            ),
+        )
+
+        decision = decide_parent_action(snapshot)
+
+        self.assertEqual(decision.kind, "block_parent")
+
+    def test_future_smoke_stage_cannot_complete_parent(self):
+        snapshot = parent_snapshot(
+            merge_state="merged",
+            next_stage=4,
+            children=(
+                phase("PRO-36", 1, "implementation"),
+                phase("PRO-37", 2, "review"),
+                phase("PRO-38", 2, "qa"),
+                phase("PRO-39", 3, "smoke", status="in_progress"),
+                phase("PRO-99", 99, "smoke"),
+            ),
+        )
+
+        decision = decide_parent_action(snapshot)
+
+        self.assertEqual(decision.kind, "block_parent")
 
     def test_cross_stack_implementation_requires_exact_repository_coverage(self):
         backend_sha = "b" * 40
@@ -2860,6 +2914,24 @@ class ParentCompletionTests(unittest.TestCase):
                 self.assertFalse(
                     any(call[:2] == ("issue", "status") for call in runner.calls)
                 )
+
+    def test_parent_completion_rejects_future_smoke_over_current_active_stage(self):
+        snapshot = self.completion_snapshot(
+            next_stage=5,
+            children=(
+                phase("PRO-50", 4, "smoke", status="in_progress"),
+                phase("PRO-99", 99, "smoke"),
+            ),
+        )
+        runner = FakeParentCompletionRunner()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "parent completion is not authorized",
+        ):
+            finish_parent(runner, "PRO-35", lambda: snapshot)
+
+        self.assertFalse(any(call[:2] == ("issue", "status") for call in runner.calls))
 
     def test_parent_completion_rejects_human_wait_and_unverified_status_write(self):
         human = FakeParentCompletionRunner(assignee_type="member")
