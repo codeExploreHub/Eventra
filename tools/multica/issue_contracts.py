@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+import uuid
 
 
 ISSUE_STATUSES = frozenset(
@@ -283,3 +284,82 @@ def parse_issue_metadata(value: Any) -> dict[str, str]:
     ):
         _error("issue metadata")
     return dict(value)
+
+
+def parse_authorizing_comment(
+    value: Any,
+    expected_comment_uuid: str,
+) -> dict[str, str]:
+    """Select one exact comment from a parent-scoped compact comment read."""
+
+    contract = "authorizing comment"
+    try:
+        canonical_uuid = str(uuid.UUID(expected_comment_uuid))
+    except (AttributeError, TypeError, ValueError):
+        _error(contract)
+    if canonical_uuid != expected_comment_uuid or not isinstance(value, list):
+        _error(contract)
+    if not all(
+        isinstance(record, dict) and _string(record.get("id"))
+        for record in value
+    ):
+        _error(contract)
+    matches = [
+        record for record in value if record["id"] == expected_comment_uuid
+    ]
+    if len(matches) != 1:
+        _error(contract)
+    record = matches[0]
+    author_type = record.get("author_type")
+    content = record.get("content")
+    if not _string(author_type) or not isinstance(content, str):
+        _error(contract)
+    return {
+        "comment_uuid": expected_comment_uuid,
+        "author_type": author_type,
+        "content": content,
+    }
+
+
+def parse_evidence_comment(
+    value: Any,
+    expected_comment_uuid: str,
+    expected_issue_id: str,
+    expected_author_id: str,
+) -> dict[str, str]:
+    """Select only authoritative identity from one child-scoped comment read."""
+
+    contract = "evidence comment"
+    try:
+        canonical_uuid = str(uuid.UUID(expected_comment_uuid))
+    except (AttributeError, TypeError, ValueError):
+        _error(contract)
+    if (
+        canonical_uuid != expected_comment_uuid
+        or not _string(expected_issue_id)
+        or not _string(expected_author_id)
+        or not isinstance(value, list)
+        or not all(
+            isinstance(record, dict) and _string(record.get("id"))
+            for record in value
+        )
+    ):
+        _error(contract)
+    matches = [
+        record for record in value if record["id"] == expected_comment_uuid
+    ]
+    if len(matches) != 1:
+        _error(contract)
+    record = matches[0]
+    if (
+        record.get("issue_id") != expected_issue_id
+        or record.get("author_type") != "agent"
+        or record.get("author_id") != expected_author_id
+    ):
+        _error(contract)
+    return {
+        "comment_uuid": expected_comment_uuid,
+        "issue_id": expected_issue_id,
+        "author_id": expected_author_id,
+        "author_type": "agent",
+    }

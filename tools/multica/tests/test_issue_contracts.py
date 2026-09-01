@@ -4,6 +4,8 @@ import copy
 import unittest
 
 from tools.multica.issue_contracts import (
+    parse_authorizing_comment,
+    parse_evidence_comment,
     parse_issue_children,
     parse_issue_detail,
     parse_issue_list,
@@ -17,6 +19,7 @@ CHILD_ID = "01a00000-0000-7000-8000-000000000002"
 PROJECT_ID = "00000000-0000-4000-8000-000000000003"
 AGENT_ID = "00000000-0000-4000-8000-000000000004"
 RUN_ID = "01a00000-0000-7000-8000-000000000005"
+COMMENT_ID = "01a00000-0000-7000-8000-000000000010"
 
 
 def issue_detail(**overrides):
@@ -111,6 +114,114 @@ def issue_run(**overrides):
 
 
 class IssueContractTests(unittest.TestCase):
+    def test_evidence_comment_returns_only_exact_child_agent_identity(self):
+        secret_body = object()
+        value = [
+            {
+                "id": COMMENT_ID,
+                "issue_id": CHILD_ID,
+                "parent_id": None,
+                "author_id": AGENT_ID,
+                "author_type": "agent",
+                "content": secret_body,
+                "created_at": "2026-08-25T08:50:06Z",
+            }
+        ]
+
+        observed = parse_evidence_comment(
+            value,
+            COMMENT_ID,
+            CHILD_ID,
+            AGENT_ID,
+        )
+
+        self.assertEqual(
+            observed,
+            {
+                "comment_uuid": COMMENT_ID,
+                "issue_id": CHILD_ID,
+                "author_id": AGENT_ID,
+                "author_type": "agent",
+            },
+        )
+        self.assertNotIn(secret_body, observed.values())
+
+    def test_evidence_comment_rejects_missing_duplicate_foreign_and_wrong_actor(self):
+        valid = {
+            "id": COMMENT_ID,
+            "issue_id": CHILD_ID,
+            "author_id": AGENT_ID,
+            "author_type": "agent",
+            "content": "must not be read",
+        }
+        cases = (
+            [],
+            [valid, copy.deepcopy(valid)],
+            [{**valid, "id": "00000000-0000-4000-8000-000000000099"}],
+            [{**valid, "issue_id": PARENT_ID}],
+            [{**valid, "author_id": "00000000-0000-4000-8000-000000000099"}],
+            [{**valid, "author_type": "member"}],
+        )
+        for value in cases:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "malformed evidence comment",
+                ):
+                    parse_evidence_comment(
+                        value,
+                        COMMENT_ID,
+                        CHILD_ID,
+                        AGENT_ID,
+                    )
+
+    def test_compact_authorizing_comment_uses_only_parent_scoped_authoritative_fields(self):
+        value = [
+            {
+                "id": COMMENT_ID,
+                "parent_id": None,
+                "author_name": "Synthetic Member",
+                "author_type": "member",
+                "content": '{"bundle_digest":"' + "a" * 64 + '","granted_round":3}',
+                "created_at": "2026-08-25T08:50:06Z",
+            }
+        ]
+        original = copy.deepcopy(value)
+
+        observed = parse_authorizing_comment(value, COMMENT_ID)
+
+        self.assertEqual(
+            observed,
+            {
+                "comment_uuid": COMMENT_ID,
+                "author_type": "member",
+                "content": '{"bundle_digest":"' + "a" * 64 + '","granted_round":3}',
+            },
+        )
+        self.assertEqual(value, original)
+
+    def test_compact_authorizing_comment_rejects_missing_duplicate_and_malformed_identity(self):
+        valid = {
+            "id": COMMENT_ID,
+            "author_type": "member",
+            "content": '{"bundle_digest":"' + "a" * 64 + '","granted_round":3}',
+        }
+        cases = (
+            [],
+            [valid, copy.deepcopy(valid)],
+            [{**valid, "id": "00000000-0000-4000-8000-000000000099"}],
+            [{**valid, "author_type": 7}],
+            [{**valid, "content": None}],
+            {"comments": [valid]},
+        )
+        for value in cases:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "malformed authorizing comment",
+                ):
+                    parse_authorizing_comment(value, COMMENT_ID)
+
     def test_detail_normalizes_only_workflow_fields_without_mutation(self):
         value = issue_detail()
         original = copy.deepcopy(value)

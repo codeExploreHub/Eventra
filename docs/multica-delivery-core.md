@@ -130,6 +130,61 @@ the planned Multica resource reconciliation. That approval does not authorize
 GitHub repository creation, commit, push, business-code changes, pull-request
 merge, or deployment.
 
+Eventra provision dry-run is read-only; a later `--apply` is a separate explicit
+authorization with fresh authoritative preflight and revalidation. Eventra
+provision does not accept, bind, or validate a dry-run plan ID or hash. Push,
+tag, release, and deployment require separate authority. Version 2 parent
+metadata requires Stage fan-in before any gate decision. Core/plan-parent is the
+sole fan-in, canonical FailureBundle producer, and decision authority; it
+returns canonical JSON with the exact `failure_bundle` and digest, but does not
+create a Stage or child. Delivery Lead is the sole execution actor: after
+validating Core's canonical JSON, it uses the exact returned `failure_bundle`
+and digest without reconstruction. The sole operational repair command is
+`python3 -B -m tools.multica.workflow execute-parent-repair PRO-M
+--expected-action-key ACTION_KEY`; do not create repair children manually. It
+freshly rereads and replans, writes `eventra.workflow.repair_reservation`, parks
+one child per owner in backlog, persists and rereads
+`eventra.repair.creation_action`, `eventra.repair.failure_bundle_digest`, sorted
+evidence UUIDs, stage/round, managed PR, and
+`eventra.repair.authorizing_comment_uuid`, plus the canonical immutable
+`eventra.repair.source_candidates` rejected-SHA map, commits parent state and consumed
+authorization provenance, promotes only exact bound children, and clears the
+reservation last. Promotion starts the assigned agent only after the exact
+deterministic repair handoff has been persisted and reread; that handoff binds
+parent/action/bundle, source and next Stage, candidate and rejected SHAs,
+managed PR, source children, and assigned canonical evidence. `mutation_count`
+reports authoritatively observed effects, including a committed effect after a
+lost acknowledgement. An exact reserved backlog child interrupted during its
+canonical metadata writes is quarantined from Stage fan-in; retry verifies the
+immutable issue identity, no-run state, source evidence/authorization, and exact
+sorted prefix before writing only the missing suffix. Extra or conflicting
+metadata is never overwritten. Other conflicting or partial state blocks
+visibly; exact retries resume or no-op. This Eventra adapter relies on a single serialized Delivery
+Lead (`max_concurrent_tasks=1`) and is not generic CAS or transaction safety.
+
+The rejected source map remains immutable across execution and replay. A
+version-2 repair PASS must produce a different SHA for its owned repository;
+`finish-phase` changes only that child's owned `eventra.phase.sha.*` once and
+does not rewrite repair provenance or parent candidates. Once every owner child
+passes, Delivery Lead copies the exact replacement map to parent candidate
+metadata while preserving untouched source SHAs, then plans again. A plan made
+before that copy waits visibly. Fresh gates require the copied parent map and
+authoritative managed PR heads to match every completed replacement exactly.
+
+For round 3 the only caller-supplied authority locator is an authoritative
+parent-scoped comment UUID. The adapter rereads that parent thread and requires
+authoritative `author_type=member` plus an exact canonical body containing only
+the current bundle digest and `granted_round=3`; caller-supplied body and author
+identity are never trusted. A valid FailureBundle binds the version-2 parent and Gate Stage/action identity, exact
+candidate SHA map, current child identities, canonical managed PR URLs,
+non-PASS verdicts, evidence UUIDs, canonical HTTPS evidence-comment URLs, legal
+owners, and remaining repair budget. The Core decision waits for every current
+Gate Stage child to become terminal; it neither trusts a partial Stage nor
+accepts prose in place of canonical JSON. Automatic repair rounds are exactly 1
+and 2. A member comment may authorize only the exact current FailureBundle's
+exact next round 3, once. If round 3 fails, block the parent; do not create
+another repair child.
+
 In a development instance, development/local quality gates may authorize
 automatic merge. Before merging, the current Core proves exact-SHA
 implementation PASS evidence, independent review and repository/integration QA
@@ -185,6 +240,12 @@ If every repository is already merged, any pure missing, pending, failed, or
 stale pre-merge-evidence decision is propagated as a zero-mutation human block;
 the recovery path never converts it to a noop or rerun.
 
+The Watcher cannot create a FailureBundle or dispatch repair. It may recover one
+existing current assignment only after its version, Stage, attempt, repository,
+phase, suite, and authoritative creation action match. Malformed bundles,
+version mismatch, and PR drift are human-visible blocks. A gate comment, PR
+mention, or completed child cannot create repair or coding authority.
+
 ## Eventra compatibility and migration boundary
 
 The Eventra compatibility adapter remains operational at
@@ -201,6 +262,12 @@ pilots demonstrate parity. Plan 1 does not migrate live resources, rewrite
 active Issue metadata, create a control repository, push commits, or replace
 the legacy entry points. Those actions require a later migration plan and
 their own approval.
+
+Completed version 1 metadata is read-only history. Active version 1 work
+requires an explicit migration to version 2 before it can create a Stage, fan
+in gate results, dispatch repair, merge, or complete a parent. Historical
+inspection can read a completed version-1 record and its evidence, but cannot
+rerun it or create a child from it.
 
 ## Plan 2 lifecycle names
 

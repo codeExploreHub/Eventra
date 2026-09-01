@@ -34,22 +34,34 @@ The Delivery Lead decomposes and assigns, each implementer tests and commits,
 the Independent Reviewer reviews the exact SHA set, Integration QA verifies the
 same exact SHA set, then the Delivery Lead evaluates gates and merges. Every
 handoff states child Issue, repository, branch, exact SHA, changed paths,
-commands with exit codes, evidence, and concerns. Reviewer or QA failures
-return to the owning child Issue; the implementer supplies a replacement SHA
-for fresh review and QA.
+commands with exit codes, evidence, and concerns. Reviewer and QA terminate at
+a structured verdict completion. Core/plan-parent is the sole fan-in, canonical
+FailureBundle producer, and decision authority: it returns canonical JSON with
+the exact `failure_bundle` and digest, but does not create a Stage or child.
+Delivery Lead is the sole execution actor: after validating that canonical JSON,
+it uses the exact returned `failure_bundle` and digest without reconstruction,
+then executes one repair Stage with one bundle-bound child per legal owner and
+its existing managed PR. No role routes a gate failure directly to an
+Implementer.
 
-All children use ordered native Multica Stages: implementation, exact-SHA
-review/QA, bounded repair plus fresh gates, then post-merge smoke. Child `done`
-means execution finished, not PASS. Each child records workflow version, phase
-kind, `pass|fail|blocked`, attempt, evidence comment UUID, affected SHA, and
-implementation/repair PR as string metadata. FAIL and BLOCKED children still
-become `done` so the Stage barrier wakes Delivery Lead.
+All children use version-2 ordered native Multica Stages: implementation,
+exact-SHA review/QA, bounded repair plus fresh gates, then post-merge smoke.
+Child `done` means execution finished, not PASS. Each child records workflow
+version, phase kind, `pass|fail|blocked`, attempt, evidence comment UUID,
+affected SHA, and implementation/repair PR as string metadata. Non-PASS review
+and QA records also carry legal owners and a canonical HTTPS evidence-comment
+URL. FAIL and BLOCKED children still become `done` so the Stage barrier wakes
+Delivery Lead.
 
 Delivery Lead calls `tools.multica.workflow plan-parent`; execution roles call
 `tools.multica.workflow finish-phase`. Stage ordinals and action keys are
-monotonic and idempotent. At most two complete repair attempts are automatic.
-The scheduled Watcher may rerun one stale existing assignment; it never invents
-work, waives a gate, merges, or deploys.
+monotonic and idempotent. Automatic repair rounds are exactly 1 and 2. A member
+comment may authorize only the exact current FailureBundle's exact next round 3,
+once. If round 3 fails, block the parent; do not create another repair child.
+The scheduled Watcher may rerun one stale existing current assignment; it cannot
+create a FailureBundle or dispatch repair, invent work, waive a gate, merge, or
+deploy. Version mismatch, malformed bundle, and PR drift block visibly for
+human resolution.
 
 After an automatic merge and post-merge smoke PASS, approved unattended local
 development calls `tools.multica.workflow finish-parent` and moves the parent
@@ -80,3 +92,4 @@ integrated result until the escalation is resolved.
 
 No role may conceal secrets, replace exact SHA evidence with a branch name,
 bypass child-Issue routing, waive independent gates, or assume ambiguous scope.
+Push, tag, release, and deployment require separate authority.

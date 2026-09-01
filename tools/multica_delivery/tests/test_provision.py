@@ -1091,8 +1091,8 @@ class ProvisionerTests(unittest.TestCase):
             "engine downgrade": {"engine_version": "0.9.0"},
             "schema upgrade": {"manifest_schema_version": 2},
             "schema downgrade": {"manifest_schema_version": 0},
-            "metadata upgrade": {"workflow_metadata_version": 2},
-            "metadata downgrade": {"workflow_metadata_version": 0},
+            "metadata legacy": {"workflow_metadata_version": 1},
+            "metadata unsupported": {"workflow_metadata_version": 3},
             "CLI upgrade": {"supported_multica_cli": ">=0.5,<0.6"},
             "CLI downgrade": {"supported_multica_cli": ">=0.3,<0.4"},
         }
@@ -1102,6 +1102,17 @@ class ProvisionerTests(unittest.TestCase):
                 with self.assertRaisesRegex(ProvisionError, "lock version mismatch"):
                     self.apply(replace(initial.lock, **changes))
                 self.assertEqual(len(self.multica.mutations), mutations_before)
+
+    def test_initialized_version_one_lock_requires_migration_while_version_two_converges(self):
+        initial = self.apply()
+        mutations_before = len(self.multica.mutations)
+
+        with self.assertRaisesRegex(ProvisionError, "lock version mismatch; explicit migration required"):
+            self.apply(replace(initial.lock, workflow_metadata_version=1))
+
+        self.assertEqual(len(self.multica.mutations), mutations_before)
+        result = self.apply(replace(initial.lock, workflow_metadata_version=2))
+        self.assertEqual(result.actions, ())
 
     def test_locked_identity_swaps_after_planning_fail_before_any_mutation(self):
         cases = (
@@ -1247,7 +1258,7 @@ class ProvisionerTests(unittest.TestCase):
             "1.0.0",
             "1.0.0",
             1,
-            1,
+            2,
             ">=0.4,<0.5",
             "",
             MappingProxyType(

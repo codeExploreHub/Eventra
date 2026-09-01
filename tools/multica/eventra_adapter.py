@@ -20,6 +20,7 @@ from tools.multica_delivery.model import (
     SkillSource as DeliverySkillSource,
 )
 from tools.multica_delivery.metadata import canonical_json
+from .url_contracts import is_canonical_comment_url
 
 
 PUBLIC_SKILL_URLS = {
@@ -69,7 +70,7 @@ class PhaseContract:
 
 
 _COMPATIBILITY_PHASES = frozenset(
-    {"implementation", "review", "qa", "repair", "smoke"}
+    {"implementation", "review", "qa", "integration_qa", "repair", "smoke"}
 )
 _COMPATIBILITY_RESULTS = frozenset({"pass", "fail", "blocked"})
 _COMMIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -83,6 +84,8 @@ def legacy_phase_contract(
     attempt: int,
     evidence_comment: str,
     pr_url: str | None = None,
+    responsible_repositories: tuple[str, ...] = (),
+    evidence_comment_url: str | None = None,
 ) -> PhaseContract:
     """Use the real legacy builder as the independent compatibility oracle."""
 
@@ -104,6 +107,8 @@ def legacy_phase_contract(
                 frontend_sha=candidate_shas.get("frontend"),
                 backend_sha=candidate_shas.get("backend"),
                 pr_url=pr_url,
+                responsible_repositories=responsible_repositories,
+                evidence_comment_url=evidence_comment_url,
             )
         )
     except (TypeError, ValueError):
@@ -120,6 +125,8 @@ def render_phase_contract(
     attempt: int,
     evidence_comment: str,
     pr_url: str | None = None,
+    responsible_repositories: tuple[str, ...] = (),
+    evidence_comment_url: str | None = None,
 ) -> PhaseContract:
     """Independently render one legacy-compatible manifest phase payload."""
 
@@ -133,16 +140,50 @@ def render_phase_contract(
             for sha in candidate_shas.values()
         )
         or phase not in _COMPATIBILITY_PHASES
+        or (phase in {"review", "qa"} and len(candidate_shas) != 1)
+        or (
+            phase == "integration_qa"
+            and not any(
+                set(candidate_shas) == set(suite.repositories)
+                for suite in manifest.integration_suites
+            )
+        )
         or result not in _COMPATIBILITY_RESULTS
         or not isinstance(attempt, int)
         or isinstance(attempt, bool)
-        or not 0 <= attempt <= manifest.policy.max_repair_attempts
+        or not 0 <= attempt <= manifest.policy.max_repair_attempts + 1
+        or type(responsible_repositories) is not tuple
+        or any(
+            type(repository) is not str
+            or repository not in candidate_shas
+            for repository in responsible_repositories
+        )
+        or len(set(responsible_repositories)) != len(responsible_repositories)
+        or (evidence_comment_url is not None and type(evidence_comment_url) is not str)
     ):
         raise ValueError("invalid delivery phase contract")
     try:
-        uuid.UUID(evidence_comment)
+        if str(uuid.UUID(evidence_comment)) != evidence_comment:
+            raise ValueError("invalid delivery phase contract")
     except (AttributeError, TypeError, ValueError):
         raise ValueError("invalid delivery phase contract") from None
+    owners = set(responsible_repositories)
+    needs_evidence_url = (
+        phase in {"review", "qa", "integration_qa"}
+        and result != "pass"
+    )
+    if needs_evidence_url and (
+        not owners
+        or not owners <= set(candidate_shas)
+        or (len(candidate_shas) == 1 and owners != set(candidate_shas))
+        or not is_canonical_comment_url(
+            evidence_comment_url,
+            evidence_comment,
+        )
+    ):
+        raise ValueError("invalid delivery phase contract")
+    if not needs_evidence_url and (owners or evidence_comment_url is not None):
+        raise ValueError("invalid delivery phase contract")
     if phase in {"implementation", "repair"} and (
         len(candidate_shas) != 1 or pr_url is None
     ):
@@ -164,12 +205,17 @@ def render_phase_contract(
 
     namespace = manifest.instance.key
     values = {
-        f"{namespace}.workflow.version": "1",
+        f"{namespace}.workflow.version": "2",
         f"{namespace}.phase.kind": phase,
         f"{namespace}.phase.result": result,
         f"{namespace}.phase.attempt": str(attempt),
         f"{namespace}.phase.evidence_comment": evidence_comment,
+        f"{namespace}.phase.failure_repositories": canonical_json(
+            sorted(responsible_repositories)
+        ),
     }
+    if evidence_comment_url is not None:
+        values[f"{namespace}.phase.evidence_comment_url"] = evidence_comment_url
     for repository, sha in candidate_shas.items():
         values[f"{namespace}.phase.sha.{repository}"] = sha
     if pr_url is not None:

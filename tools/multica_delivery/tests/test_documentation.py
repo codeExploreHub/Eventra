@@ -8,6 +8,32 @@ CORE_DOC = ROOT / "docs" / "multica-delivery-core.md"
 
 
 class CoreDocumentationTests(unittest.TestCase):
+    def test_documents_version_two_gate_fan_in_and_repair_authority(self):
+        authority = self.normalized_section(
+            "Effect, merge, deployment, and Watcher policy"
+        )
+        migration = self.normalized_section(
+            "Eventra compatibility and migration boundary"
+        )
+        for statement in (
+            "Version 2 parent metadata requires Stage fan-in before any gate decision.",
+            "Core/plan-parent is the sole fan-in, canonical FailureBundle producer, and decision authority; it returns canonical JSON with the exact `failure_bundle` and digest, but does not create a Stage or child.",
+            "Delivery Lead is the sole execution actor: after validating Core's canonical JSON, it uses the exact returned `failure_bundle` and digest without reconstruction.",
+            "The sole operational repair command is `python3 -B -m tools.multica.workflow execute-parent-repair PRO-M --expected-action-key ACTION_KEY`; do not create repair children manually.",
+            "Automatic repair rounds are exactly 1 and 2.",
+            "A member comment may authorize only the exact current FailureBundle's exact next round 3, once.",
+            "If round 3 fails, block the parent; do not create another repair child.",
+            "The Watcher cannot create a FailureBundle or dispatch repair.",
+            "Malformed bundles, version mismatch, and PR drift are human-visible blocks.",
+            "Eventra provision dry-run is read-only; a later `--apply` is a separate explicit authorization with fresh authoritative preflight and revalidation.",
+            "Eventra provision does not accept, bind, or validate a dry-run plan ID or hash.",
+            "Push, tag, release, and deployment require separate authority.",
+        ):
+            with self.subTest(statement=statement):
+                self.assertIn(statement, authority)
+        self.assertIn("Completed version 1 metadata is read-only history.", migration)
+        self.assertIn("Active version 1 work requires an explicit migration to version 2", migration)
+
     @classmethod
     def setUpClass(cls):
         cls.text = CORE_DOC.read_text(encoding="utf-8")

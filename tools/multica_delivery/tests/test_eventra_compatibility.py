@@ -10,6 +10,7 @@ from tools.multica.eventra_adapter import (
 )
 from tools.multica_delivery.manifest import load_manifest
 from tools.multica_delivery.provision import effective_skill_bindings
+from tools.multica_delivery.provision import WORKFLOW_METADATA_VERSION
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "eventra-delivery.yaml"
@@ -93,6 +94,9 @@ class EventraCompatibilityTests(unittest.TestCase):
             EVENTRA_COMPATIBILITY_LOCK_IDS["agent"] = {}
         with self.assertRaises(TypeError):
             EVENTRA_COMPATIBILITY_LOCK_IDS["agent"]["workflow-watcher"] = "other"
+
+    def test_new_eventra_records_use_workflow_version_two(self):
+        self.assertEqual(WORKFLOW_METADATA_VERSION, 2)
 
     def test_manifest_exposes_local_commands_dependencies_and_secret_names_only(self):
         manifest = eventra_manifest(self.workspace)
