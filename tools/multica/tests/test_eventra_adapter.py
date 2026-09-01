@@ -426,6 +426,54 @@ class EventraAdapterTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "phase contract"):
                         renderer(evidence_url)
 
+    def test_review_candidate_cardinality_matches_runtime_in_both_renderers(self):
+        manifest = eventra_manifest(Path("/Users/didi/Eventra-workspace"))
+        arguments = {
+            "result": "pass",
+            "attempt": 1,
+            "evidence_comment": "00000000-0000-4000-8000-000000000031",
+        }
+        cases = (
+            ("zero", {}, False),
+            ("frontend", {"frontend": "a" * 40}, True),
+            ("backend", {"backend": "b" * 40}, True),
+            (
+                "both",
+                {"frontend": "a" * 40, "backend": "b" * 40},
+                False,
+            ),
+        )
+        for label, candidates, accepted in cases:
+            renderers = (
+                (
+                    "legacy",
+                    lambda: legacy_phase_contract(
+                        candidates,
+                        "review",
+                        **arguments,
+                    ),
+                ),
+                (
+                    "adapter",
+                    lambda: render_phase_contract(
+                        manifest,
+                        candidates,
+                        "review",
+                        **arguments,
+                    ),
+                ),
+            )
+            for renderer_name, renderer in renderers:
+                with self.subTest(
+                    cardinality=label,
+                    renderer=renderer_name,
+                ):
+                    if accepted:
+                        renderer()
+                    else:
+                        with self.assertRaisesRegex(ValueError, "phase contract"):
+                            renderer()
+
     def test_compatibility_renderer_rejects_generic_only_phase_names(self):
         manifest = eventra_manifest(Path("/Users/didi/Eventra-workspace"))
         arguments = {

@@ -140,6 +140,7 @@ def render_phase_contract(
             for sha in candidate_shas.values()
         )
         or phase not in _COMPATIBILITY_PHASES
+        or (phase == "review" and len(candidate_shas) != 1)
         or result not in _COMPATIBILITY_RESULTS
         or not isinstance(attempt, int)
         or isinstance(attempt, bool)
