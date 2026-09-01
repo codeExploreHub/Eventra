@@ -1151,6 +1151,20 @@ def _controlled_knowledge_metadata(metadata: Mapping[str, str]) -> dict[str, str
     }
 
 
+def _controlled_issue_transition_metadata(
+    metadata: Mapping[str, str],
+) -> dict[str, str]:
+    controlled = _controlled_knowledge_metadata(metadata)
+    allowed = {"eventra.knowledge.transition", "eventra.knowledge.pr"}
+    if not set(controlled).issubset(allowed):
+        raise RuntimeError("invalid knowledge transition")
+    return {
+        key: value
+        for key, value in controlled.items()
+        if key == "eventra.knowledge.transition"
+    }
+
+
 def _default_backend_root(frontend_root: Path) -> Path:
     resolved = frontend_root.resolve()
     if resolved.parent.name == ".worktrees":
@@ -1440,7 +1454,7 @@ def curate_once(
         issue_transition = _transition_record(
             snapshot, decision, identifier, "issue_created"
         )
-        target_metadata = _controlled_knowledge_metadata(
+        target_metadata = _controlled_issue_transition_metadata(
             _load_metadata(runner, identifier)
         )
         expected_target = {"eventra.knowledge.transition": issue_transition}
@@ -1453,7 +1467,9 @@ def curate_once(
                 "eventra.knowledge.transition",
                 issue_transition,
             )
-        if _controlled_knowledge_metadata(_load_metadata(runner, identifier)) != expected_target:
+        if _controlled_issue_transition_metadata(
+            _load_metadata(runner, identifier)
+        ) != expected_target:
             raise RuntimeError("invalid knowledge transition")
 
         current_snapshot = load_candidate_snapshot(runner, parent_ref, configured)

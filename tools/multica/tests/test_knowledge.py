@@ -1536,6 +1536,50 @@ class KnowledgeCurationRecoveryTests(unittest.TestCase):
         self.assertEqual(runner.create_attempts, 0)
         self.assertEqual(len(runner.created_issues), 1)
 
+    def test_existing_pr_metadata_does_not_block_transition_recovery(self):
+        runner = CurationApplyRunner()
+        planned = curate_once(
+            runner, self.projects, self.curator_id, False, **self.roots
+        )
+        issue = runner.seed_action_issue(planned.action_key)
+        pr_record = '{"status":"pr_open"}'
+        runner.issue_metadata[issue["identifier"]]["eventra.knowledge.pr"] = pr_record
+
+        result = curate_once(
+            runner, self.projects, self.curator_id, True, **self.roots
+        )
+
+        self.assertEqual(result.decision, "dispatched")
+        self.assertEqual(result.knowledge_issue_identifier, issue["identifier"])
+        self.assertEqual(result.created, 0)
+        self.assertEqual(
+            runner.issue_metadata[issue["identifier"]]["eventra.knowledge.pr"],
+            pr_record,
+        )
+        self.assertIn(
+            "eventra.knowledge.transition",
+            runner.issue_metadata[issue["identifier"]],
+        )
+
+    def test_unknown_knowledge_metadata_still_blocks_transition_recovery(self):
+        runner = CurationApplyRunner()
+        planned = curate_once(
+            runner, self.projects, self.curator_id, False, **self.roots
+        )
+        issue = runner.seed_action_issue(planned.action_key)
+        runner.issue_metadata[issue["identifier"]]["eventra.knowledge.unknown"] = "x"
+
+        result = curate_once(
+            runner, self.projects, self.curator_id, True, **self.roots
+        )
+
+        self.assertEqual(result.decision, "needs_human")
+        self.assertEqual(result.mutation_count, 0)
+        self.assertNotIn(
+            "eventra.knowledge.transition",
+            runner.issue_metadata[issue["identifier"]],
+        )
+
     def test_ambiguous_committed_create_is_recovered_without_duplicate(self):
         runner = CurationApplyRunner()
         runner.raise_after_committed_issue_create = True
