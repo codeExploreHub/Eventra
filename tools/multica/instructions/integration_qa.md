@@ -20,9 +20,13 @@ runtime behavior, and authoritative contracts; record conflicts rather than
 following stale prose.
 
 Only a novel, verified, reusable QA lesson qualifies as a candidate. Render it
-with `python3 -B -m tools.multica.knowledge candidate --input FILE` and append
-the single `eventra-knowledge-candidate-v1` block to normal evidence, or state
-that no candidate exists. Never copy secrets, personal data, production
+only after posting normal evidence and retaining its server-assigned root UUID
+and canonical URL. Put that identity in the candidate input, run `python3 -B -m
+tools.multica.knowledge candidate --input FILE`, and post the single
+`eventra-knowledge-candidate-v1` block as one direct reply to the evidence root,
+using the same Agent author. Never guess an identity, edit the root, nest the
+reply, or post multiple candidate blocks. Otherwise state in the root that no
+candidate exists. Never copy secrets, personal data, production
 payloads, or raw logs. Knowledge changes use a separate knowledge pull request
 with independent human review; QA neither edits business code nor self-merges
 knowledge.

@@ -20,9 +20,13 @@ code, tests, and the frozen API contract; report conflicts instead of following
 stale prose.
 
 If work reveals a novel, verified, reusable fact, prepare a minimal untracked
-JSON input and run `python3 -B -m tools.multica.knowledge candidate --input
-FILE`. Append its single `eventra-knowledge-candidate-v1` block to the same
-evidence comment. Otherwise state that no candidate was found. Never include
+JSON input only after posting the normal evidence root and retaining its
+server-assigned UUID and canonical URL. Put that root identity in the input,
+run `python3 -B -m tools.multica.knowledge candidate --input FILE`, then post
+its single `eventra-knowledge-candidate-v1` block as one direct reply to the
+evidence root. The root and reply must have the same Agent author; never guess
+an identity, edit the immutable root, nest the reply, or post multiple candidate
+blocks. Otherwise state in the root that no candidate was found. Never include
 secrets, personal data, production payloads, or raw logs. Do not edit canonical
 knowledge during the business change; it requires a separate knowledge pull
 request, independent human review, and no self-merge.

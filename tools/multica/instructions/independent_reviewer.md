@@ -21,9 +21,13 @@ tests, the diff, and authoritative contracts; report any conflict or suspected
 staleness as a finding.
 
 Only a novel, verified, reusable review lesson qualifies as a candidate. Render
-it with `python3 -B -m tools.multica.knowledge candidate --input FILE` and add
-the single `eventra-knowledge-candidate-v1` block to normal evidence, or state
-that no candidate exists. Never copy secrets, personal data, production
+normal evidence first and retain its server-assigned root UUID and canonical
+URL. Put that identity in the candidate input, render it with `python3 -B -m
+tools.multica.knowledge candidate --input FILE`, and add the single
+`eventra-knowledge-candidate-v1` block as one direct reply to the evidence root,
+using the same Agent author. Never guess an identity, edit the root, nest the
+reply, or post multiple candidate blocks. Otherwise state in the root that no
+candidate exists. Never copy secrets, personal data, production
 payloads, or raw logs. Do not mix knowledge edits into the reviewed business
 change: they require a separate knowledge pull request reviewed and merged by
 a human other than the candidate author.

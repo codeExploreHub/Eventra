@@ -613,6 +613,84 @@ def parent_ref():
 
 
 class KnowledgeCandidateSnapshotTests(unittest.TestCase):
+    def test_loads_candidate_from_single_reply_in_evidence_thread(self):
+        runner = CandidateEvidenceRunner()
+        candidate_reply_uuid = "01a00000-0000-7000-8000-000000000204"
+        runner.evidence = compact_comment(
+            CANDIDATE_COMMENT_UUID,
+            "Exact-SHA verification evidence. Candidate follows in one reply.",
+        )
+        runner.candidate_reply = compact_comment(
+            candidate_reply_uuid,
+            render_candidate_block(json.dumps(runner.payload)),
+            parent_id=CANDIDATE_COMMENT_UUID,
+            created_at="2026-08-31T09:02:00Z",
+        )
+        original_run = runner.run
+
+        def run(args, *, stdin_json=None):
+            if tuple(args) == (
+                "issue", "comment", "list", "PRO-101", "--thread",
+                CANDIDATE_COMMENT_UUID, "--tail", "30", "--compact", "--output", "json",
+            ):
+                return copy.deepcopy([runner.evidence, runner.candidate_reply])
+            return original_run(args, stdin_json=stdin_json)
+
+        runner.run = run
+        snapshot = load_candidate_snapshot(
+            runner,
+            parent_ref(),
+            {"frontend": FRONTEND_PROJECT_ID, "backend": BACKEND_PROJECT_ID},
+        )
+        self.assertEqual(snapshot.candidate.digest, runner.payload["digest"])
+        self.assertEqual(snapshot.candidate_comment_uuid, CANDIDATE_COMMENT_UUID)
+
+    def test_rejects_nested_foreign_or_multiple_candidate_replies(self):
+        reply_uuid = "01a00000-0000-7000-8000-000000000204"
+        intermediary_uuid = "01a00000-0000-7000-8000-000000000205"
+        second_reply_uuid = "01a00000-0000-7000-8000-000000000206"
+        foreign_author = "00000000-0000-4000-8000-000000000207"
+        for build_comments in (
+            lambda runner: [
+                runner.evidence,
+                compact_comment(intermediary_uuid, "Intermediate reply", parent_id=CANDIDATE_COMMENT_UUID),
+                compact_comment(reply_uuid, render_candidate_block(json.dumps(runner.payload)), parent_id=intermediary_uuid, created_at="2026-08-31T09:03:00Z"),
+            ],
+            lambda runner: [
+                runner.evidence,
+                dict(compact_comment(reply_uuid, render_candidate_block(json.dumps(runner.payload)), parent_id=CANDIDATE_COMMENT_UUID), author_id=foreign_author),
+            ],
+            lambda runner: [
+                runner.evidence,
+                compact_comment(reply_uuid, render_candidate_block(json.dumps(runner.payload)), parent_id=CANDIDATE_COMMENT_UUID),
+                compact_comment(second_reply_uuid, render_candidate_block(json.dumps(runner.payload)), parent_id=CANDIDATE_COMMENT_UUID, created_at="2026-08-31T09:03:00Z"),
+            ],
+        ):
+            runner = CandidateEvidenceRunner()
+            runner.evidence = compact_comment(
+                CANDIDATE_COMMENT_UUID,
+                "Exact-SHA verification evidence. Candidate follows in one reply.",
+            )
+            comments = build_comments(runner)
+            original_run = runner.run
+
+            def run(args, *, stdin_json=None):
+                if tuple(args) == (
+                    "issue", "comment", "list", "PRO-101", "--thread",
+                    CANDIDATE_COMMENT_UUID, "--tail", "30", "--compact", "--output", "json",
+                ):
+                    return copy.deepcopy(comments)
+                return original_run(args, stdin_json=stdin_json)
+
+            runner.run = run
+            with self.subTest(build_comments=build_comments):
+                with self.assertRaisesRegex(RuntimeError, "invalid knowledge evidence"):
+                    load_candidate_snapshot(
+                        runner,
+                        parent_ref(),
+                        {"frontend": FRONTEND_PROJECT_ID, "backend": BACKEND_PROJECT_ID},
+                    )
+
     def test_loads_summary_pointer_then_original_candidate_evidence(self):
         runner = CandidateEvidenceRunner()
         snapshot = load_candidate_snapshot(

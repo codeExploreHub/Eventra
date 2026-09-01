@@ -745,11 +745,25 @@ def load_candidate_snapshot(
     evidence_comment = _target_comment(
         evidence_comments, pointer.evidence_comment_uuid
     )
+    candidate_comments = [
+        item for item in evidence_comments
+        if f"```{_CANDIDATE_FENCE}" in str(item["content"])
+    ]
+    if len(candidate_comments) != 1:
+        raise RuntimeError("invalid knowledge evidence")
+    candidate_comment = candidate_comments[0]
+    if (
+        candidate_comment["id"] != pointer.evidence_comment_uuid
+        and candidate_comment.get("parent_id") != pointer.evidence_comment_uuid
+    ) or (
+        candidate_comment["author_id"] != evidence_comment["author_id"]
+        or candidate_comment["author_type"] != evidence_comment["author_type"]
+    ):
+        raise RuntimeError("invalid knowledge evidence")
     try:
-        candidates = extract_candidate_blocks(str(evidence_comment["content"]))
+        candidate = extract_candidate_blocks(str(candidate_comment["content"]))[0]
     except ValueError:
         raise RuntimeError("invalid knowledge evidence") from None
-    candidate = candidates[0]
     if (
         candidate.digest != metadata_digest
         or candidate.evidence.parent_identifier != parent_ref.identifier
