@@ -115,15 +115,27 @@ class EventraAdapterTests(unittest.TestCase):
             ["backend_engineer", "integration_qa"],
         )
 
-    def test_exposes_five_delivery_agents_plus_one_operational_watcher(self):
+    def test_exposes_five_delivery_agents_plus_two_operational_agents(self):
         self.assertEqual(len(self.config.blueprint.agents), 5)
-        self.assertEqual(len(self.config.blueprint.operational_agents), 1)
-        self.assertEqual(len(self.config.agents), 6)
-        self.assertEqual(self.config.agents[-1].role, "workflow_watcher")
-        self.assertFalse(self.config.agents[-1].needs_backend_env)
+        self.assertEqual(
+            [agent.role for agent in self.config.blueprint.operational_agents],
+            ["workflow_watcher", "knowledge_curator"],
+        )
+        self.assertEqual(len(self.config.agents), 7)
+        self.assertEqual(
+            [agent.role for agent in self.config.agents[-2:]],
+            ["workflow_watcher", "knowledge_curator"],
+        )
+        self.assertTrue(
+            all(not agent.needs_backend_env for agent in self.config.agents[-2:])
+        )
 
     def test_watcher_targets_the_operational_role(self):
         self.assertEqual(self.config.watcher.agent_role, "workflow_watcher")
+        self.assertEqual(
+            [item.key for item in self.config.operational_automations],
+            ["workflow-watcher", "knowledge-curator"],
+        )
 
     def test_exposes_frozen_dataclass_contracts(self):
         values = (
@@ -140,6 +152,7 @@ class EventraAdapterTests(unittest.TestCase):
         self.assertEqual(
             self.config.watcher,
             AutopilotSpec(
+                key="workflow-watcher",
                 title="Eventra · Stalled Work Watcher",
                 description_file=self.config.watcher.description_file,
                 cron="*/30 * * * *",
@@ -153,6 +166,63 @@ class EventraAdapterTests(unittest.TestCase):
             "python3 -B -m tools.multica.workflow watch",
             self.config.watcher.description_file.read_text(),
         )
+
+    def test_eventra_only_curator_has_bounded_persistent_and_scheduled_contracts(self):
+        curator = next(
+            agent
+            for agent in self.config.blueprint.operational_agents
+            if agent.role == "knowledge_curator"
+        )
+        self.assertEqual(curator.name, "Eventra Knowledge Curator")
+        self.assertEqual(
+            curator.skill_keys,
+            (
+                "using-superpowers",
+                "systematic-debugging",
+                "verification-before-completion",
+            ),
+        )
+        self.assertFalse(curator.needs_backend_env)
+        persistent = curator.instructions_file.read_text()
+        for required in (
+            "at most one candidate",
+            "docs/agent-knowledge/**",
+            "docs/delivery-knowledge/**",
+            "AGENTS.md",
+            "human review",
+        ):
+            self.assertIn(required, persistent)
+        for forbidden in (
+            "business code",
+            "Squad coordination",
+            "delivery state",
+            "secrets",
+            "self-approve",
+            "merge",
+            "deploy",
+            "force-push",
+        ):
+            self.assertIn(forbidden, persistent)
+
+        spec = self.config.operational_automations[1]
+        self.assertEqual(
+            spec,
+            AutopilotSpec(
+                key="knowledge-curator",
+                title="Eventra · Knowledge Curator",
+                description_file=spec.description_file,
+                cron="17 2 * * *",
+                timezone="Asia/Shanghai",
+                label="Eventra repository knowledge curation",
+                agent_role="knowledge_curator",
+            ),
+        )
+        scheduled = spec.description_file.read_text()
+        self.assertEqual(scheduled.count("__FRONTEND_PROJECT_ID__"), 1)
+        self.assertEqual(scheduled.count("__BACKEND_PROJECT_ID__"), 1)
+        self.assertEqual(scheduled.count("__KNOWLEDGE_CURATOR_AGENT_ID__"), 1)
+        self.assertIn("tools.multica.knowledge curate", scheduled)
+        self.assertIn("--apply", scheduled)
 
     def test_generic_render_preserves_every_current_eventra_phase_scope(self):
         manifest = eventra_manifest(Path("/Users/didi/Eventra-workspace"))

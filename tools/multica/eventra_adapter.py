@@ -335,6 +335,7 @@ class LocalResource:
 class AutopilotSpec:
     """One reconciled run-only scheduled workflow safety net."""
 
+    key: str
     title: str
     description_file: Path
     cron: str
@@ -360,7 +361,13 @@ class ProjectConfig:
     skills: Mapping[str, SkillSource]
     resources: tuple[LocalResource, ...]
     forbidden_paths: tuple[str, ...]
-    watcher: AutopilotSpec
+    operational_automations: tuple[AutopilotSpec, ...]
+
+    @property
+    def watcher(self) -> AutopilotSpec:
+        """Compatibility view while provisioning migrates to keyed automations."""
+
+        return self.operational_automations[0]
 
 
 def _eventra_agents(blueprint: TeamBlueprint) -> tuple[AgentSpec, ...]:
@@ -390,7 +397,26 @@ def _eventra_agents(blueprint: TeamBlueprint) -> tuple[AgentSpec, ...]:
 def build_eventra_config(runtime_id: str, daemon_id: str) -> ProjectConfig:
     """Build the isolated local-development configuration for Eventra."""
 
-    blueprint = build_multi_repo_blueprint("Eventra")
+    base = build_multi_repo_blueprint("Eventra")
+    instructions = Path(__file__).with_name("instructions")
+    curator = AgentSpec(
+        role="knowledge_curator",
+        name="Eventra Knowledge Curator",
+        description=(
+            "Validates repository knowledge evidence and opens bounded "
+            "documentation-only work for human review."
+        ),
+        instructions_file=instructions / "knowledge_curator.md",
+        skill_keys=(
+            "using-superpowers",
+            "systematic-debugging",
+            "verification-before-completion",
+        ),
+    )
+    blueprint = replace(
+        base,
+        operational_agents=base.operational_agents + (curator,),
+    )
     skills = MappingProxyType(
         {
             key: SkillSource(key=key, url=url)
@@ -430,15 +456,24 @@ def build_eventra_config(runtime_id: str, daemon_id: str) -> ProjectConfig:
             ),
         ),
         forbidden_paths=("/Users/didi/Eventra-workspace/Eventra/Backend",),
-        watcher=AutopilotSpec(
-            title="Eventra · Stalled Work Watcher",
-            description_file=(
-                Path(__file__).with_name("instructions")
-                / "stalled_work_watcher.md"
+        operational_automations=(
+            AutopilotSpec(
+                key="workflow-watcher",
+                title="Eventra · Stalled Work Watcher",
+                description_file=instructions / "stalled_work_watcher.md",
+                cron="*/30 * * * *",
+                timezone="Asia/Shanghai",
+                label="Eventra stalled-work recovery",
+                agent_role="workflow_watcher",
             ),
-            cron="*/30 * * * *",
-            timezone="Asia/Shanghai",
-            label="Eventra stalled-work recovery",
-            agent_role="workflow_watcher",
+            AutopilotSpec(
+                key="knowledge-curator",
+                title="Eventra · Knowledge Curator",
+                description_file=instructions / "knowledge_curator_schedule.md",
+                cron="17 2 * * *",
+                timezone="Asia/Shanghai",
+                label="Eventra repository knowledge curation",
+                agent_role="knowledge_curator",
+            ),
         ),
     )

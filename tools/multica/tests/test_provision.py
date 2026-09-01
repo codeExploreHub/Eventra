@@ -673,7 +673,7 @@ class ProvisionerTests(unittest.TestCase):
     def test_apply_uses_frozen_cli_and_builds_complete_state(self):
         result = self.provisioner.reconcile(self.config, apply=True, backend_env=self.backend_env)
         self.assertEqual(set(result.agent_ids), {agent.role for agent in self.config.agents})
-        self.assertEqual(len(result.agent_ids), 6)
+        self.assertEqual(len(result.agent_ids), 7)
         rendered = "\n".join(" ".join(call["args"]) for call in self.runner.calls)
         self.assertNotIn("daemon get", rendered)
         self.assertNotIn("agent skills set", rendered)
@@ -1606,7 +1606,13 @@ class ProvisionerTests(unittest.TestCase):
                 watcher = replace(self.config.watcher, agent_role=role)
                 with self.assertRaisesRegex(ValueError, "operational Agent"):
                     Provisioner(runner).reconcile(
-                        replace(self.config, watcher=watcher),
+                        replace(
+                            self.config,
+                            operational_automations=(
+                                watcher,
+                                *self.config.operational_automations[1:],
+                            ),
+                        ),
                         apply=True,
                         backend_env=self.backend_env,
                     )
