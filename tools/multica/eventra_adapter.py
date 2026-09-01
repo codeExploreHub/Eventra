@@ -70,7 +70,7 @@ class PhaseContract:
 
 
 _COMPATIBILITY_PHASES = frozenset(
-    {"implementation", "review", "qa", "repair", "smoke"}
+    {"implementation", "review", "qa", "integration_qa", "repair", "smoke"}
 )
 _COMPATIBILITY_RESULTS = frozenset({"pass", "fail", "blocked"})
 _COMMIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -140,7 +140,14 @@ def render_phase_contract(
             for sha in candidate_shas.values()
         )
         or phase not in _COMPATIBILITY_PHASES
-        or (phase == "review" and len(candidate_shas) != 1)
+        or (phase in {"review", "qa"} and len(candidate_shas) != 1)
+        or (
+            phase == "integration_qa"
+            and not any(
+                set(candidate_shas) == set(suite.repositories)
+                for suite in manifest.integration_suites
+            )
+        )
         or result not in _COMPATIBILITY_RESULTS
         or not isinstance(attempt, int)
         or isinstance(attempt, bool)
@@ -161,7 +168,10 @@ def render_phase_contract(
     except (AttributeError, TypeError, ValueError):
         raise ValueError("invalid delivery phase contract") from None
     owners = set(responsible_repositories)
-    needs_evidence_url = phase in {"review", "qa"} and result != "pass"
+    needs_evidence_url = (
+        phase in {"review", "qa", "integration_qa"}
+        and result != "pass"
+    )
     if needs_evidence_url and (
         not owners
         or not owners <= set(candidate_shas)

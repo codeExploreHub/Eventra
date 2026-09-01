@@ -210,7 +210,7 @@ class EventraAdapterTests(unittest.TestCase):
             (
                 "cross-stack integration QA",
                 LegacyPhaseCompletion(
-                    "qa",
+                    "integration_qa",
                     "pass",
                     2,
                     "00000000-0000-4000-8000-000000000005",
@@ -474,26 +474,108 @@ class EventraAdapterTests(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, "phase contract"):
                             renderer()
 
-    def test_compatibility_renderer_rejects_generic_only_phase_names(self):
+    def test_repository_qa_and_integration_qa_share_runtime_cardinality(self):
         manifest = eventra_manifest(Path("/Users/didi/Eventra-workspace"))
-        arguments = {
-            "result": "pass",
-            "attempt": 1,
-            "evidence_comment": "00000000-0000-4000-8000-000000000007",
-        }
-        with self.assertRaisesRegex(ValueError, "phase contract"):
-            legacy_phase_contract(
+        comment_uuid = "00000000-0000-4000-8000-000000000007"
+        comment_url = f"https://qa.example/comments/{comment_uuid}"
+        cases = (
+            (
+                "repository qa pass",
+                "qa",
+                {"backend": "b" * 40},
+                {"result": "pass"},
+                True,
+            ),
+            (
+                "repository qa failure",
+                "qa",
                 {"frontend": "a" * 40},
+                {
+                    "result": "fail",
+                    "responsible_repositories": ("frontend",),
+                    "evidence_comment_url": comment_url,
+                },
+                True,
+            ),
+            (
+                "repository qa dual candidate",
+                "qa",
+                {"frontend": "a" * 40, "backend": "b" * 40},
+                {"result": "pass"},
+                False,
+            ),
+            (
+                "integration pass",
                 "integration_qa",
-                **arguments,
-            )
-        with self.assertRaisesRegex(ValueError, "phase contract"):
-            render_phase_contract(
-                manifest,
+                {"frontend": "a" * 40, "backend": "b" * 40},
+                {"result": "pass"},
+                True,
+            ),
+            (
+                "integration failure",
+                "integration_qa",
+                {"frontend": "a" * 40, "backend": "b" * 40},
+                {
+                    "result": "blocked",
+                    "responsible_repositories": ("backend",),
+                    "evidence_comment_url": comment_url,
+                },
+                True,
+            ),
+            (
+                "integration missing suite candidate",
+                "integration_qa",
                 {"frontend": "a" * 40},
+                {"result": "pass"},
+                False,
+            ),
+            (
+                "integration missing failure URL",
                 "integration_qa",
-                **arguments,
+                {"frontend": "a" * 40, "backend": "b" * 40},
+                {
+                    "result": "fail",
+                    "responsible_repositories": ("frontend",),
+                },
+                False,
+            ),
+        )
+        for label, phase, candidates, overrides, accepted in cases:
+            arguments = {
+                "result": "pass",
+                "attempt": 1,
+                "evidence_comment": comment_uuid,
+                **overrides,
+            }
+            renderers = (
+                (
+                    "runtime/legacy",
+                    lambda: legacy_phase_contract(
+                        candidates,
+                        phase,
+                        **arguments,
+                    ),
+                ),
+                (
+                    "adapter",
+                    lambda: render_phase_contract(
+                        manifest,
+                        candidates,
+                        phase,
+                        **arguments,
+                    ),
+                ),
             )
+            for renderer_name, renderer in renderers:
+                with self.subTest(
+                    case=label,
+                    renderer=renderer_name,
+                ):
+                    if accepted:
+                        renderer()
+                    else:
+                        with self.assertRaisesRegex(ValueError, "phase contract"):
+                            renderer()
 
 if __name__ == "__main__":
     unittest.main()

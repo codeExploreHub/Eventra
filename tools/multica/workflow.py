@@ -478,7 +478,7 @@ def build_phase_metadata(value: PhaseCompletion) -> dict[str, str]:
         if sha is not None
     }
     if (
-        value.kind == "review"
+        value.kind in {"review", "qa"}
         and len(phase_repositories) != 1
     ) or (
         value.kind == "integration_qa"
