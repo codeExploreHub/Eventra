@@ -27,6 +27,11 @@ class OperatorDocsTests(unittest.TestCase):
             "eventra.knowledge.version=1",
             "eventra.knowledge.status=none",
             "eventra.knowledge.status=pending",
+            "tools.multica.knowledge summary",
+            "eventra-knowledge-summary-v1",
+            "child_identifier",
+            "evidence_comment_uuid",
+            "candidate_digest",
             "does not wait for curation",
         ):
             self.assertIn(fragment, lead)

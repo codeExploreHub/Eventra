@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import functools
 import hashlib
+import io
 import json
 import re
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
 
 import yaml
 
 from tools.multica.knowledge_contracts import (
+    CurationDecision,
     ContextReceipt,
     KnowledgeCandidate,
     KnowledgeIndexEntry,
@@ -23,6 +26,13 @@ from tools.multica.knowledge_contracts import (
     candidate_json,
     parse_candidate_json,
 )
+from tools.multica.issue_contracts import (
+    parse_issue_comments,
+    parse_issue_detail,
+    parse_issue_list,
+    parse_issue_metadata,
+)
+from tools.multica.provision import MulticaRunner
 
 
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -38,6 +48,41 @@ _CANDIDATE_BLOCK = re.compile(
     rf"(?m)^```{re.escape(_CANDIDATE_FENCE)}\n(?P<body>.*?)\n```[ \t]*$",
     re.DOTALL,
 )
+_SUMMARY_FENCE = "eventra-knowledge-summary-v1"
+_SUMMARY_BLOCK = re.compile(
+    rf"(?m)^```{re.escape(_SUMMARY_FENCE)}\n(?P<body>.*?)\n```[ \t]*$",
+    re.DOTALL,
+)
+
+
+@dataclass(frozen=True)
+class KnowledgeSummaryPointer:
+    schema_version: int
+    child_identifier: str
+    evidence_comment_uuid: str
+    candidate_digest: str
+
+
+@dataclass(frozen=True)
+class KnowledgeParentRef:
+    issue_id: str
+    identifier: str
+    project_id: str
+    status: Literal["done", "blocked"]
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class KnowledgeParentSnapshot:
+    issue_id: str
+    identifier: str
+    project_id: str
+    status: Literal["done", "blocked"]
+    updated_at: str
+    project_ids: tuple[tuple[str, str], ...]
+    summary_comment_uuid: str
+    candidate_comment_uuid: str
+    candidate: KnowledgeCandidate
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -160,6 +205,7 @@ def _parse_entry(raw: Any, root: Path, owner_repository: str | None, shared_cano
     provenance_kind = provenance["kind"]
     source_issue = source_comment_uuid = design_path = design_commit = None
     source_candidate_shas: tuple[tuple[str, str], ...] = ()
+    source_candidate_digest = None
     if provenance_kind == "bootstrap_design":
         if set(provenance) != {"kind", "design_path", "design_commit"}:
             _invalid()
@@ -168,7 +214,10 @@ def _parse_entry(raw: Any, root: Path, owner_repository: str | None, shared_cano
         if design_path != _BOOTSTRAP_DESIGN_PATH or design_commit != _BOOTSTRAP_DESIGN_COMMIT:
             _invalid()
     else:
-        if set(provenance) != {"kind", "source_issue", "source_comment_uuid", "source_candidate_shas"}:
+        if set(provenance) != {
+            "kind", "source_issue", "source_comment_uuid",
+            "source_candidate_shas", "source_candidate_digest",
+        }:
             _invalid()
         source_issue = provenance["source_issue"]
         source_comment_uuid = _string(provenance["source_comment_uuid"])
@@ -180,6 +229,9 @@ def _parse_entry(raw: Any, root: Path, owner_repository: str | None, shared_cano
         except (AttributeError, TypeError, ValueError):
             _invalid()
         source_candidate_shas = _sha_map(provenance["source_candidate_shas"], nonempty=True)
+        source_candidate_digest = provenance["source_candidate_digest"]
+        if not isinstance(source_candidate_digest, str) or _DIGEST.fullmatch(source_candidate_digest) is None:
+            _invalid()
 
     last_verified_sha = raw["last_verified_sha"]
     content_digest = raw["content_digest"]
@@ -205,6 +257,7 @@ def _parse_entry(raw: Any, root: Path, owner_repository: str | None, shared_cano
         source_issue=source_issue,
         source_comment_uuid=source_comment_uuid,
         source_candidate_shas=source_candidate_shas,
+        source_candidate_digest=source_candidate_digest,
         design_path=design_path,
         design_commit=design_commit,
         last_verified_sha=last_verified_sha,
@@ -388,6 +441,395 @@ def extract_candidate_blocks(text: str) -> tuple[KnowledgeCandidate, ...]:
     return (_candidate_from_input(body),)
 
 
+def _canonical_uuid(value: Any) -> str:
+    try:
+        parsed = str(uuid.UUID(value))
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("invalid knowledge summary") from None
+    if parsed != value:
+        raise ValueError("invalid knowledge summary")
+    return parsed
+
+
+def render_summary_pointer(
+    child_identifier: str, evidence_comment_uuid: str, digest: str
+) -> str:
+    """Render the only machine-readable parent-to-evidence pointer."""
+    if (
+        not isinstance(child_identifier, str)
+        or _ISSUE.fullmatch(child_identifier) is None
+        or not isinstance(digest, str)
+        or _DIGEST.fullmatch(digest) is None
+    ):
+        raise ValueError("invalid knowledge summary")
+    pointer = {
+        "schema_version": 1,
+        "child_identifier": child_identifier,
+        "evidence_comment_uuid": _canonical_uuid(evidence_comment_uuid),
+        "candidate_digest": digest,
+    }
+    body = json.dumps(pointer, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return f"```{_SUMMARY_FENCE}\n{body}\n```"
+
+
+def extract_summary_pointer(text: str) -> KnowledgeSummaryPointer:
+    """Extract exactly one non-nested summary pointer without candidate prose."""
+    if not isinstance(text, str) or text.count(f"```{_SUMMARY_FENCE}") != 1:
+        raise ValueError("invalid knowledge summary")
+    matches = tuple(_SUMMARY_BLOCK.finditer(text))
+    if len(matches) != 1 or "```" in matches[0].group("body"):
+        raise ValueError("invalid knowledge summary")
+    try:
+        value = json.loads(matches[0].group("body"))
+    except json.JSONDecodeError:
+        raise ValueError("invalid knowledge summary") from None
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version", "child_identifier", "evidence_comment_uuid",
+        "candidate_digest",
+    } or value.get("schema_version") != 1:
+        raise ValueError("invalid knowledge summary")
+    child_identifier = value.get("child_identifier")
+    digest = value.get("candidate_digest")
+    if (
+        not isinstance(child_identifier, str)
+        or _ISSUE.fullmatch(child_identifier) is None
+        or not isinstance(digest, str)
+        or _DIGEST.fullmatch(digest) is None
+    ):
+        raise ValueError("invalid knowledge summary")
+    return KnowledgeSummaryPointer(
+        schema_version=1,
+        child_identifier=child_identifier,
+        evidence_comment_uuid=_canonical_uuid(value.get("evidence_comment_uuid")),
+        candidate_digest=digest,
+    )
+
+
+def _string_metadata_filter(key: str, value: str) -> str:
+    buffer = io.StringIO(newline="")
+    csv.writer(buffer, lineterminator="").writerow(
+        [f"{key}={json.dumps(value)}"]
+    )
+    return buffer.getvalue()
+
+
+def _project_map(value: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != _REPOSITORIES
+        or not all(isinstance(item, str) and item for item in value.values())
+        or len(set(value.values())) != 2
+    ):
+        raise ValueError("invalid knowledge project mapping")
+    return tuple((key, value[key]) for key in ("frontend", "backend"))
+
+
+def list_pending_parents(
+    runner: MulticaRunner, project_ids: Mapping[str, str]
+) -> tuple[KnowledgeParentRef, ...]:
+    """List pending terminal top-level parents from exactly two Projects."""
+    configured = _project_map(project_ids)
+    records: dict[str, dict[str, Any]] = {}
+    identifiers: dict[str, str] = {}
+    filters = (
+        _string_metadata_filter("eventra.knowledge.version", "1"),
+        _string_metadata_filter("eventra.knowledge.status", "pending"),
+    )
+    for _, project_id in configured:
+        for status in ("done", "blocked"):
+            offset = 0
+            while True:
+                raw = runner.run(
+                    [
+                        "issue", "list",
+                        "--project", project_id,
+                        "--status", status,
+                        "--metadata", filters[0],
+                        "--metadata", filters[1],
+                        "--limit", "50",
+                        "--offset", str(offset),
+                        "--output", "json",
+                    ]
+                )
+                try:
+                    page = parse_issue_list(raw, project_id)
+                except RuntimeError:
+                    raise RuntimeError("malformed knowledge parent list") from None
+                if page["limit"] != 50 or page["offset"] != offset:
+                    raise RuntimeError("malformed knowledge parent list")
+                for issue in page["issues"]:
+                    if issue["status"] != status:
+                        raise RuntimeError("malformed knowledge parent list")
+                    if issue["parent_issue_id"] is not None:
+                        continue
+                    issue_id = str(issue["id"])
+                    identifier = str(issue["identifier"])
+                    previous = records.get(issue_id)
+                    if previous is not None and previous != issue:
+                        raise RuntimeError("malformed knowledge parent list")
+                    previous_id = identifiers.get(identifier)
+                    if previous_id is not None and previous_id != issue_id:
+                        raise RuntimeError("malformed knowledge parent list")
+                    records[issue_id] = issue
+                    identifiers[identifier] = issue_id
+                if not page["has_more"]:
+                    break
+                if not page["issues"]:
+                    raise RuntimeError("malformed knowledge parent list")
+                offset += len(page["issues"])
+    ordered = sorted(
+        records.values(),
+        key=lambda item: (str(item["updated_at"]), str(item["identifier"])),
+    )
+    return tuple(
+        KnowledgeParentRef(
+            issue_id=str(item["id"]),
+            identifier=str(item["identifier"]),
+            project_id=str(item["project_id"]),
+            status=item["status"],
+            updated_at=str(item["updated_at"]),
+        )
+        for item in ordered
+    )
+
+
+def _evidence_detail(value: Any, identifier: str) -> dict[str, Any]:
+    try:
+        return parse_issue_detail(value, identifier)
+    except RuntimeError:
+        raise RuntimeError("invalid knowledge evidence") from None
+
+
+def _evidence_comments(value: Any, identifier: str) -> list[dict[str, Any]]:
+    try:
+        return parse_issue_comments(value, identifier)
+    except RuntimeError:
+        raise RuntimeError("invalid knowledge evidence") from None
+
+
+def _target_comment(
+    comments: Sequence[Mapping[str, Any]], comment_uuid: str
+) -> Mapping[str, Any]:
+    matches = [item for item in comments if item.get("id") == comment_uuid]
+    if len(matches) != 1:
+        raise RuntimeError("invalid knowledge evidence")
+    return matches[0]
+
+
+def load_candidate_snapshot(
+    runner: MulticaRunner,
+    parent_ref: KnowledgeParentRef,
+    project_ids: Mapping[str, str],
+) -> KnowledgeParentSnapshot:
+    """Follow a parent summary pointer back to the original candidate comment."""
+    configured = _project_map(project_ids)
+    parent = _evidence_detail(
+        runner.run(["issue", "get", parent_ref.identifier, "--output", "json"]),
+        parent_ref.identifier,
+    )
+    if (
+        parent["id"] != parent_ref.issue_id
+        or parent["project_id"] != parent_ref.project_id
+        or parent["status"] != parent_ref.status
+        or parent["updated_at"] != parent_ref.updated_at
+        or parent["parent_issue_id"] is not None
+        or parent["stage"] is not None
+        or parent["status"] not in {"done", "blocked"}
+    ):
+        raise RuntimeError("invalid knowledge evidence")
+
+    try:
+        metadata = parse_issue_metadata(
+            runner.run(
+                ["issue", "metadata", "list", parent_ref.identifier, "--output", "json"]
+            )
+        )
+    except RuntimeError:
+        raise RuntimeError("invalid knowledge evidence") from None
+    knowledge_metadata = {
+        key: item for key, item in metadata.items()
+        if key.startswith("eventra.knowledge.")
+    }
+    required = {
+        "eventra.knowledge.version",
+        "eventra.knowledge.status",
+        "eventra.knowledge.summary_comment",
+        "eventra.knowledge.candidate_digest",
+    }
+    if set(knowledge_metadata) != required:
+        raise RuntimeError("invalid knowledge evidence")
+    summary_uuid = knowledge_metadata["eventra.knowledge.summary_comment"]
+    metadata_digest = knowledge_metadata["eventra.knowledge.candidate_digest"]
+    try:
+        canonical_summary_uuid = _canonical_uuid(summary_uuid)
+    except ValueError:
+        raise RuntimeError("invalid knowledge evidence") from None
+    if (
+        knowledge_metadata["eventra.knowledge.version"] != "1"
+        or knowledge_metadata["eventra.knowledge.status"] != "pending"
+        or _DIGEST.fullmatch(metadata_digest) is None
+    ):
+        raise RuntimeError("invalid knowledge evidence")
+
+    summary_comments = _evidence_comments(
+        runner.run(
+            [
+                "issue", "comment", "list", parent_ref.identifier,
+                "--thread", canonical_summary_uuid,
+                "--tail", "30", "--compact", "--output", "json",
+            ]
+        ),
+        parent_ref.identifier,
+    )
+    summary_comment = _target_comment(summary_comments, canonical_summary_uuid)
+    try:
+        pointer = extract_summary_pointer(str(summary_comment["content"]))
+    except ValueError:
+        raise RuntimeError("invalid knowledge evidence") from None
+    if pointer.candidate_digest != metadata_digest:
+        raise RuntimeError("invalid knowledge evidence")
+
+    child = _evidence_detail(
+        runner.run(
+            ["issue", "get", pointer.child_identifier, "--output", "json"]
+        ),
+        pointer.child_identifier,
+    )
+    if (
+        child["parent_issue_id"] != parent_ref.issue_id
+        or child["project_id"] not in dict(configured).values()
+    ):
+        raise RuntimeError("invalid knowledge evidence")
+    evidence_comments = _evidence_comments(
+        runner.run(
+            [
+                "issue", "comment", "list", pointer.child_identifier,
+                "--thread", pointer.evidence_comment_uuid,
+                "--tail", "30", "--compact", "--output", "json",
+            ]
+        ),
+        pointer.child_identifier,
+    )
+    evidence_comment = _target_comment(
+        evidence_comments, pointer.evidence_comment_uuid
+    )
+    try:
+        candidates = extract_candidate_blocks(str(evidence_comment["content"]))
+    except ValueError:
+        raise RuntimeError("invalid knowledge evidence") from None
+    candidate = candidates[0]
+    if (
+        candidate.digest != metadata_digest
+        or candidate.evidence.parent_identifier != parent_ref.identifier
+        or candidate.evidence.child_identifier != pointer.child_identifier
+        or candidate.evidence.comment_uuid != pointer.evidence_comment_uuid
+        or candidate.evidence.project_id != child["project_id"]
+    ):
+        raise RuntimeError("invalid knowledge evidence")
+    return KnowledgeParentSnapshot(
+        issue_id=parent_ref.issue_id,
+        identifier=parent_ref.identifier,
+        project_id=parent_ref.project_id,
+        status=parent_ref.status,
+        updated_at=parent_ref.updated_at,
+        project_ids=configured,
+        summary_comment_uuid=canonical_summary_uuid,
+        candidate_comment_uuid=pointer.evidence_comment_uuid,
+        candidate=candidate,
+    )
+
+
+def decide_curation(
+    snapshot: KnowledgeParentSnapshot,
+    entries: Iterable[KnowledgeIndexEntry],
+) -> CurationDecision:
+    """Return a deterministic pure decision for one verified snapshot."""
+    candidate = snapshot.candidate
+    project_ids = dict(snapshot.project_ids)
+    sha_keys = {key for key, _ in candidate.candidate_shas}
+    valid_scope = (
+        candidate.sensitivity == "public_repo"
+        and (
+            (candidate.target_scope in {"frontend", "backend"}
+             and candidate.target_repository == candidate.target_scope
+             and sha_keys == {candidate.target_scope})
+            or (
+                candidate.target_scope == "cross_repo"
+                and candidate.target_repository == "frontend"
+                and sha_keys == _REPOSITORIES
+            )
+        )
+    )
+    if not valid_scope or candidate.target_repository not in project_ids:
+        return CurationDecision(
+            "rejected", candidate.digest, None, None,
+            candidate.target_repository, "candidate scope or SHA coverage is invalid",
+        )
+    ordered_entries = tuple(entries)
+    duplicate = next(
+        (
+            item for item in sorted(ordered_entries, key=lambda item: item.knowledge_id)
+            if item.source_candidate_digest == candidate.digest
+        ),
+        None,
+    )
+    if duplicate is not None:
+        return CurationDecision(
+            "deduplicated", candidate.digest, None,
+            project_ids[candidate.target_repository],
+            candidate.target_repository, "candidate digest already indexed",
+            duplicate.knowledge_id,
+        )
+    known_ids = {item.knowledge_id for item in ordered_entries}
+    if set(candidate.related_knowledge_ids) - known_ids:
+        return CurationDecision(
+            "needs_human", candidate.digest, None,
+            project_ids[candidate.target_repository],
+            candidate.target_repository, "related knowledge reference is unresolved",
+        )
+    target_project_id = project_ids[candidate.target_repository]
+    action_payload = {
+        "candidate_digest": candidate.digest,
+        "knowledge_type": candidate.knowledge_type,
+        "parent_identifier": snapshot.identifier,
+        "target_project_id": target_project_id,
+        "target_repository": candidate.target_repository,
+    }
+    action_key = hashlib.sha256(
+        json.dumps(
+            action_payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode()
+    ).hexdigest()
+    return CurationDecision(
+        "create_issue", candidate.digest, action_key, target_project_id,
+        candidate.target_repository, "candidate is valid and not indexed",
+    )
+
+
+def stable_curation_decision(
+    snapshot_loader: Callable[[], KnowledgeParentSnapshot],
+    entries: Iterable[KnowledgeIndexEntry],
+) -> CurationDecision:
+    """Plan only when two authoritative snapshots and decisions are identical."""
+    frozen_entries = tuple(entries)
+    first = snapshot_loader()
+    first_decision = decide_curation(first, frozen_entries)
+    try:
+        second = snapshot_loader()
+    except RuntimeError:
+        return CurationDecision(
+            "needs_human", None, None, None, None,
+            "knowledge evidence changed during planning",
+        )
+    second_decision = decide_curation(second, frozen_entries)
+    if first != second or first_decision != second_decision:
+        return CurationDecision(
+            "needs_human", None, None, None, None,
+            "knowledge evidence changed during planning",
+        )
+    return second_decision
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Eventra verified knowledge retrieval")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -406,6 +848,18 @@ def _parser() -> argparse.ArgumentParser:
     context.add_argument("--conflict", action="append", default=[], dest="conflicts")
     candidate = subparsers.add_parser("candidate")
     candidate.add_argument("--input", required=True, type=Path)
+    summary = subparsers.add_parser("summary")
+    summary.add_argument("--child", required=True)
+    summary.add_argument("--evidence-comment", required=True)
+    summary.add_argument("--candidate-digest", required=True)
+    scan = subparsers.add_parser("scan")
+    scan.add_argument("--project-id", required=True)
+    scan.add_argument("--backend-project-id", required=True)
+    plan = subparsers.add_parser("plan")
+    plan.add_argument("--project-id", required=True)
+    plan.add_argument("--backend-project-id", required=True)
+    plan.add_argument("--frontend-root", type=Path, default=Path.cwd())
+    plan.add_argument("--backend-root", type=Path, default=Path.cwd().parent / "Eventra-Backend")
     return parser
 
 
@@ -430,6 +884,61 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (OSError, UnicodeError):
             raise ValueError("invalid knowledge candidate") from None
         print(render_candidate_block(source))
+        return 0
+    if args.command == "summary":
+        print(
+            render_summary_pointer(
+                args.child, args.evidence_comment, args.candidate_digest
+            )
+        )
+        return 0
+    if args.command in {"scan", "plan"}:
+        project_ids = {
+            "frontend": args.project_id,
+            "backend": args.backend_project_id,
+        }
+        runner = MulticaRunner()
+        refs = list_pending_parents(runner, project_ids)
+        if args.command == "scan":
+            print(
+                json.dumps(
+                    {
+                        "count": len(refs),
+                        "parents": [item.identifier for item in refs],
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+            return 0
+        entries = verify_indexes(args.frontend_root, args.backend_root)
+        if not refs:
+            parent_identifier = None
+            decision = CurationDecision(
+                "noop", None, None, None, None, "no pending knowledge parent"
+            )
+        else:
+            parent_ref = refs[0]
+            parent_identifier = parent_ref.identifier
+            decision = stable_curation_decision(
+                lambda: load_candidate_snapshot(runner, parent_ref, project_ids),
+                entries,
+            )
+        print(
+            json.dumps(
+                {
+                    "action_key": decision.action_key,
+                    "decision": decision.kind,
+                    "existing_knowledge_id": decision.existing_knowledge_id,
+                    "parent": parent_identifier,
+                    "reason": decision.reason,
+                    "target_project_id": decision.target_project_id,
+                    "target_repository": decision.target_repository,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
         return 0
     entries = verify_indexes(args.frontend_root, args.backend_root)
     if args.command == "verify":

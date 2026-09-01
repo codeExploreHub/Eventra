@@ -164,7 +164,7 @@ knowledge store. Each entry contains:
 - replacement identifier when deprecated;
 - provenance kind: `delivery_evidence` or `bootstrap_design`;
 - for delivery evidence, source Issue, evidence comment, and exact candidate SHA
-  map;
+  map and candidate digest;
 - for the initial bootstrap only, this design path and its Git commit SHA;
 - last verified commit SHA and date; and
 - content digest.
@@ -231,6 +231,15 @@ A candidate contains:
 Candidate content must not contain credentials, tokens, personal data,
 production payloads, or unrestricted command output. References point to
 authoritative evidence instead of copying sensitive material.
+
+The immutable parent summary does not copy candidate content. For the one
+candidate supported by this pilot it contains exactly one fenced
+`eventra-knowledge-summary-v1` JSON pointer with schema version, child Issue
+identifier, evidence comment UUID, and candidate digest. The Curator follows
+the pointer to the original child comment and accepts it only when the parent
+metadata, summary pointer, comment identity, candidate evidence identity, and
+candidate digest all match. Multiple candidates per parent are deferred until
+the generic workflow is designed.
 
 The Delivery Lead aggregates candidate references when it closes or blocks a
 parent. It writes one immutable knowledge summary comment and only flat pointer
@@ -320,6 +329,7 @@ surface is:
 ```text
 python3 -B -m tools.multica.knowledge context --task-id ISSUE --repository frontend|backend --task-type TYPE --sha KEY=FULL_SHA [--path PATH ...]
 python3 -B -m tools.multica.knowledge candidate --input CANDIDATE_JSON_FILE
+python3 -B -m tools.multica.knowledge summary --child ISSUE --evidence-comment UUID --candidate-digest SHA256
 python3 -B -m tools.multica.knowledge scan --project-id ID --backend-project-id ID
 python3 -B -m tools.multica.knowledge plan --project-id ID --backend-project-id ID
 python3 -B -m tools.multica.knowledge curate --project-id ID --backend-project-id ID --apply

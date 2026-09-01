@@ -81,6 +81,7 @@ class KnowledgeIndexEntry:
     source_issue: str | None
     source_comment_uuid: str | None
     source_candidate_shas: tuple[tuple[str, str], ...]
+    source_candidate_digest: str | None
     design_path: str | None
     design_commit: str | None
     last_verified_sha: str

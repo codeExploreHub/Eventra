@@ -171,6 +171,18 @@ production payloads, or raw logs. Candidates never block delivery and never
 authorize incidental knowledge edits; accepted changes use a separate
 knowledge pull request with human review and no Curator self-merge.
 
+At parent completion, Delivery Lead selects the one pilot candidate and posts
+only a machine-readable pointer; it does not copy the candidate claim:
+
+```text
+python3 -B -m tools.multica.knowledge summary --child PRO-N --evidence-comment COMMENT_UUID --candidate-digest SHA256
+```
+
+The resulting `eventra-knowledge-summary-v1` block contains only
+`schema_version`, `child_identifier`, `evidence_comment_uuid`, and
+`candidate_digest`. The Curator follows that pointer back to the original
+comment and requires every identity and digest to match.
+
 Cross-stack gates respect the one-worktree Project boundary. Reviewer tasks run
 once per Project and are combined by Delivery Lead. QA verifies the backend SHA
 in the backend Project, then Backend Engineer keeps that verified SHA running

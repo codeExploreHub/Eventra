@@ -33,6 +33,19 @@ Candidates do not change delivery gates. Before closing or blocking the parent,
 aggregate only validated candidate digests and their evidence comment UUIDs in
 one immutable knowledge summary comment.
 
+For the one selected pilot candidate, render the machine-readable pointer from
+the authoritative Eventra control repository:
+
+```text
+python3 -B -m tools.multica.knowledge summary --child PRO-N --evidence-comment COMMENT_UUID --candidate-digest SHA256
+```
+
+Post the single `eventra-knowledge-summary-v1` block without copying the claim
+or candidate body. Its exact JSON fields are `schema_version`,
+`child_identifier`, `evidence_comment_uuid`, and `candidate_digest`. Retain the
+new summary comment UUID for parent metadata. Multiple candidates are outside
+this pilot; do not concatenate blocks or choose through prose.
+
 When no candidate exists, write only these string metadata values and omit the
 summary UUID and digest:
 
