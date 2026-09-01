@@ -1536,6 +1536,14 @@ class ProvisionerTests(unittest.TestCase):
                 .replace("__FRONTEND_PROJECT_ID__", result.project_id)
                 .replace("__BACKEND_PROJECT_ID__", result.backend_project_id)
                 .replace(
+                    "__FRONTEND_ROOT__",
+                    self.config.resources[0].local_path,
+                )
+                .replace(
+                    "__BACKEND_ROOT__",
+                    self.config.resources[1].local_path,
+                )
+                .replace(
                     "__KNOWLEDGE_CURATOR_AGENT_ID__",
                     result.agent_ids["knowledge_curator"],
                 )
@@ -1547,6 +1555,15 @@ class ProvisionerTests(unittest.TestCase):
             )
             self.assertEqual(autopilot["description"], expected_description)
             self.assertNotIn("__", autopilot["description"])
+            if spec.key == "knowledge-curator":
+                self.assertIn(
+                    self.config.resources[0].local_path,
+                    autopilot["description"],
+                )
+                self.assertIn(
+                    self.config.resources[1].local_path,
+                    autopilot["description"],
+                )
             self.assertEqual(len(autopilot["triggers"]), 1)
             self.assertEqual(autopilot["triggers"][0]["timezone"], spec.timezone)
             self.assertEqual(

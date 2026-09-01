@@ -221,6 +221,8 @@ class EventraAdapterTests(unittest.TestCase):
         self.assertEqual(scheduled.count("__FRONTEND_PROJECT_ID__"), 1)
         self.assertEqual(scheduled.count("__BACKEND_PROJECT_ID__"), 1)
         self.assertEqual(scheduled.count("__KNOWLEDGE_CURATOR_AGENT_ID__"), 1)
+        self.assertEqual(scheduled.count("__FRONTEND_ROOT__"), 1)
+        self.assertEqual(scheduled.count("__BACKEND_ROOT__"), 1)
         self.assertIn("tools.multica.knowledge curate", scheduled)
         self.assertIn("--apply", scheduled)
 

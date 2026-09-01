@@ -360,6 +360,8 @@ class Provisioner:
                 agent_ids,
                 project_id,
                 backend_project_id,
+                config.resources[0].local_path,
+                config.resources[1].local_path,
             )
             for spec in config.operational_automations
         }
@@ -940,6 +942,8 @@ class Provisioner:
                     curator_id,
                     frontend_project_id,
                     backend_project_id,
+                    config.resources[0].local_path,
+                    config.resources[1].local_path,
                 )
                 autopilot_changed = self._changed_fields(
                     autopilot["autopilot"], wanted
@@ -1286,6 +1290,8 @@ class Provisioner:
         agent_ids,
         frontend_project_id,
         backend_project_id,
+        frontend_root,
+        backend_root,
     ):
         wanted = self._desired_autopilot(
             spec,
@@ -1293,6 +1299,8 @@ class Provisioner:
             agent_ids["knowledge_curator"],
             frontend_project_id,
             backend_project_id,
+            frontend_root,
+            backend_root,
         )
         if detail is None:
             self.runner.run(
@@ -1369,12 +1377,16 @@ class Provisioner:
         curator_agent_id,
         frontend_project_id,
         backend_project_id,
+        frontend_root,
+        backend_root,
     ):
         description = (
             spec.description_file.read_text()
             .replace("__FRONTEND_PROJECT_ID__", frontend_project_id)
             .replace("__BACKEND_PROJECT_ID__", backend_project_id)
             .replace("__KNOWLEDGE_CURATOR_AGENT_ID__", curator_agent_id)
+            .replace("__FRONTEND_ROOT__", frontend_root)
+            .replace("__BACKEND_ROOT__", backend_root)
         )
         return {
             "id": None,

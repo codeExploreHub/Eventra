@@ -545,8 +545,13 @@ python3 -B -m tools.multica.knowledge curate \
   --project-id FRONTEND_PROJECT_ID \
   --backend-project-id BACKEND_PROJECT_ID \
   --curator-agent-id KNOWLEDGE_CURATOR_AGENT_ID \
+  --frontend-root FRONTEND_ROOT \
+  --backend-root BACKEND_ROOT \
   --apply
 ```
+
+Both roots are explicit because scheduled tasks execute in runtime-managed
+worktrees that are not necessarily nested under either repository.
 
 For a manual scenario, trigger only the known Curator Autopilot and then reread
 its run history and the affected Issue metadata:
