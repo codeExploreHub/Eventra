@@ -1128,6 +1128,14 @@ def _repair_or_block(
                 "automatic attempt limit exhausted without exact member authorization",
             )
         authorizing_comment_uuid = snapshot.authorization_comment_uuid
+    try:
+        _repair_child_specs(snapshot, bundle)
+    except (RuntimeError, TypeError, ValueError):
+        return _parent_decision(
+            snapshot,
+            "block_parent",
+            "repair owner routing is not authoritative",
+        )
     return _parent_decision(
         snapshot,
         "create_repair_stage",
@@ -3171,27 +3179,25 @@ def _repair_child_specs(
         }
     )
     pull_requests = {item.repository: item.url for item in snapshot.pull_requests}
+    authority_problem = _parent_assignment_authority_problem(snapshot)
+    if authority_problem is not None:
+        raise RuntimeError(authority_problem)
+    configured_projects = dict(snapshot.assignment_project_ids)
+    configured_agents = dict(snapshot.assignment_agent_ids)
     specs: list[dict[str, object]] = []
     for repository in owners:
         if repository not in REPAIR_ASSIGNEES:
             raise RuntimeError("failure bundle has an invalid repair owner")
-        project_ids = {
-            item.project_id
+        engineer_role = f"{repository}_engineer"
+        project_id = configured_projects.get(repository, "")
+        assignee_id = configured_agents.get(engineer_role, "")
+        lineage = tuple(
+            item
             for item in snapshot.children
-            if item.project_id
-            and item.kind in {"implementation", "repair"}
+            if item.kind in {"implementation", "repair"}
             and item.pr_url
             and _repository_for_pr(item.pr_url) == repository
-        }
-        assignee_ids = {
-            item.assignee_id
-            for item in snapshot.children
-            if item.assignee_type == "agent"
-            and item.assignee_id
-            and item.kind in {"implementation", "repair"}
-            and item.pr_url
-            and _repository_for_pr(item.pr_url) == repository
-        }
+        )
         evidence_uuids = sorted(
             {
                 str(failure["evidence_comment_uuid"])
@@ -3204,8 +3210,15 @@ def _repair_child_specs(
         candidate_sha = candidates.get(repository)
         pull_request = pull_requests.get(repository)
         if (
-            len(project_ids) != 1
-            or len(assignee_ids) != 1
+            engineer_role not in ASSIGNMENT_AGENT_NAMES
+            or not _is_uuid(project_id)
+            or not _is_uuid(assignee_id)
+            or any(
+                item.project_id != project_id
+                or item.assignee_type != "agent"
+                or item.assignee_id != assignee_id
+                for item in lineage
+            )
             or type(candidate_sha) is not str
             or SHA_PATTERN.fullmatch(candidate_sha) is None
             or type(pull_request) is not str
@@ -3215,10 +3228,10 @@ def _repair_child_specs(
             raise RuntimeError("repair owner routing is not authoritative")
         specs.append(
             {
-                "assignee_id": next(iter(assignee_ids)),
+                "assignee_id": assignee_id,
                 "candidate_sha": candidate_sha,
                 "evidence_uuids": evidence_uuids,
-                "project_id": next(iter(project_ids)),
+                "project_id": project_id,
                 "pull_request": pull_request,
                 "repository": repository,
             }
@@ -5951,6 +5964,22 @@ def _finish_phase_authority_problem(
         ):
             return "phase completion conflicts with current assignment provenance"
     if value.kind == "repair":
+        repository = metadata.get("eventra.repair.repository", "")
+        try:
+            assignment_authority = _exact_assignment_authority(runner)
+            configured_projects = dict(assignment_authority[1])
+            configured_agents = dict(assignment_authority[0])
+            engineer_role = f"{repository}_engineer"
+        except (RuntimeError, TypeError, ValueError):
+            return "authoritative repair assignment route is malformed"
+        if (
+            repository not in REPAIR_ASSIGNEES
+            or engineer_role not in ASSIGNMENT_AGENT_NAMES
+            or detail["project_id"] != configured_projects.get(repository)
+            or detail["assignee_type"] != "agent"
+            or detail["assignee_id"] != configured_agents.get(engineer_role)
+        ):
+            return "repair completion conflicts with configured assignment route"
         authoritative_repair_snapshot = None
         try:
             source_candidates = _decode_source_candidates(
@@ -6244,7 +6273,10 @@ def finish_phase(
             assignment_authority = (
                 _exact_assignment_authority(runner)
                 if value.kind
-                in {"implementation", "smoke", "review", "qa", "integration_qa"}
+                in {
+                    "implementation", "repair", "smoke", "review", "qa",
+                    "integration_qa",
+                }
                 else None
             )
             evidence_before = _finish_gate_evidence_authority(
@@ -6300,7 +6332,10 @@ def finish_phase(
     assignment_authority = (
         _exact_assignment_authority(runner)
         if value.kind
-        in {"implementation", "smoke", "review", "qa", "integration_qa"}
+        in {
+            "implementation", "repair", "smoke", "review", "qa",
+            "integration_qa",
+        }
         else None
     )
     evidence_before = _finish_gate_evidence_authority(runner, detail, value)

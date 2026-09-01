@@ -2510,8 +2510,8 @@ def parent_snapshot(**overrides):
 class ParentDecisionTests(unittest.TestCase):
     def _authoritative_current_repair_snapshot(self, *, parent_copied=True):
         replacement_sha = "c" * 40
-        project_id = "00000000-0000-4000-8000-000000000040"
-        assignee_id = "00000000-0000-4000-8000-000000000042"
+        project_id = PROJECT_ID
+        assignee_id = AGENT_ID
         review_uuid = "00000000-0000-4000-8000-000000000071"
         qa_uuid = "00000000-0000-4000-8000-000000000072"
         implementation = phase(
@@ -2592,10 +2592,10 @@ class ParentDecisionTests(unittest.TestCase):
         frontend_replacement = "c" * 40
         backend_replacement = "d" * 40
         backend_pr = "https://github.com/codeExploreHub/Eventra-Backend/pull/7"
-        frontend_project = "00000000-0000-4000-8000-000000000040"
-        backend_project = "00000000-0000-4000-8000-000000000041"
-        frontend_owner = "00000000-0000-4000-8000-000000000042"
-        backend_owner = "00000000-0000-4000-8000-000000000043"
+        frontend_project = PROJECT_ID
+        backend_project = BACKEND_PROJECT_ID
+        frontend_owner = AGENT_ID
+        backend_owner = BACKEND_AGENT_ID
         frontend_failure = "00000000-0000-4000-8000-000000000091"
         backend_evidence = "00000000-0000-4000-8000-000000000092"
         source_attempt = repair_round - 1
@@ -3256,10 +3256,10 @@ class ParentDecisionTests(unittest.TestCase):
                 self.assertIsNone(decision.action_key)
     def test_cross_stack_repair_owner_uses_its_managed_pr_project(self):
         backend_sha = "b" * 40
-        frontend_project = "00000000-0000-4000-8000-000000000040"
-        backend_project = "00000000-0000-4000-8000-000000000041"
-        frontend_owner = "00000000-0000-4000-8000-000000000042"
-        backend_owner = "00000000-0000-4000-8000-000000000043"
+        frontend_project = PROJECT_ID
+        backend_project = BACKEND_PROJECT_ID
+        frontend_owner = AGENT_ID
+        backend_owner = BACKEND_AGENT_ID
         backend_pr_url = "https://github.com/codeExploreHub/Eventra-Backend/pull/7"
         review_uuid = "00000000-0000-4000-8000-000000000062"
         qa_uuid = "00000000-0000-4000-8000-000000000063"
@@ -3818,10 +3818,10 @@ class ParentDecisionTests(unittest.TestCase):
     def test_cross_stack_repair_may_target_only_affected_repository(self):
         backend_sha = "b" * 40
         backend_pr_url = "https://github.com/codeExploreHub/Eventra-Backend/pull/7"
-        frontend_project = "00000000-0000-4000-8000-000000000040"
-        backend_project = "00000000-0000-4000-8000-000000000041"
-        frontend_owner = "00000000-0000-4000-8000-000000000042"
-        backend_owner = "00000000-0000-4000-8000-000000000043"
+        frontend_project = PROJECT_ID
+        backend_project = BACKEND_PROJECT_ID
+        frontend_owner = AGENT_ID
+        backend_owner = BACKEND_AGENT_ID
         review_uuid = "00000000-0000-4000-8000-000000000081"
         qa_uuid = "00000000-0000-4000-8000-000000000082"
         backend_review_uuid = "00000000-0000-4000-8000-000000000083"
@@ -3925,10 +3925,10 @@ class ParentDecisionTests(unittest.TestCase):
         replacement_frontend = "c" * 40
         replacement_backend = "d" * 40
         backend_pr = "https://github.com/codeExploreHub/Eventra-Backend/pull/7"
-        frontend_project = "00000000-0000-4000-8000-000000000040"
-        backend_project = "00000000-0000-4000-8000-000000000041"
-        frontend_owner = "00000000-0000-4000-8000-000000000042"
-        backend_owner = "00000000-0000-4000-8000-000000000043"
+        frontend_project = PROJECT_ID
+        backend_project = BACKEND_PROJECT_ID
+        frontend_owner = AGENT_ID
+        backend_owner = BACKEND_AGENT_ID
         frontend_failure = "00000000-0000-4000-8000-000000000091"
         backend_failure = "00000000-0000-4000-8000-000000000092"
         source_children = (
@@ -6838,7 +6838,13 @@ class FakeRepairRunner:
             status="done",
             project_id=BACKEND_PROJECT_ID,
             assignee_id=(
-                REVIEWER_ID if kind == "review" else QA_ID
+                REVIEWER_ID
+                if kind == "review"
+                else (
+                    QA_ID
+                    if kind in {"qa", "integration_qa"}
+                    else BACKEND_AGENT_ID
+                )
             ),
         )
         comment_uuid = comment_uuid or f"00000000-0000-4000-8000-{self.next_child_number:012d}"
@@ -7868,6 +7874,293 @@ class RepairExecutionTests(unittest.TestCase):
         decision = decide_parent_action(snapshot)
         self.assertEqual(decision.kind, "create_repair_stage")
         return runner, github, decision
+
+    def _planned_for_repair_owner(self, repository, attempt):
+        if repository == "backend":
+            return self._planned(attempt=attempt)
+        runner, github, decision, _ = (
+            self._planned_cross_stack_integration_failure(
+                attempt=attempt,
+                owners=(repository,),
+            )
+        )
+        return runner, github, decision
+
+    @staticmethod
+    def _repair_lineage_children(runner, repository):
+        pull_request = (
+            FRONTEND_PR
+            if repository == "frontend"
+            else FakeRepairRunner.BACKEND_PR
+        )
+        return tuple(
+            child
+            for child in runner.children
+            if runner.metadata[child["identifier"]].get("eventra.phase.kind")
+            in {"implementation", "repair"}
+            and runner.metadata[child["identifier"]].get("eventra.phase.pr")
+            == pull_request
+        )
+
+    def _forge_repair_lineage_route(self, runner, repository, face):
+        lineage = self._repair_lineage_children(runner, repository)
+        self.assertTrue(lineage, "fixture requires repair PR lineage")
+        for child in lineage:
+            if face in {"project", "both"}:
+                child["project_id"] = (
+                    "00000000-0000-4000-8000-000000000097"
+                )
+            if face in {"agent", "both"}:
+                child["assignee_id"] = (
+                    "00000000-0000-4000-8000-000000000098"
+                )
+
+    @staticmethod
+    def _drift_configured_repair_route(runner, repository, face):
+        if face == "project":
+            title = workflow_module.ASSIGNMENT_PROJECT_TITLES[repository]
+            record = next(
+                item for item in runner.assignment_projects
+                if item["title"] == title
+            )
+            record["id"] = "00000000-0000-4000-8000-000000000096"
+            return
+        name = workflow_module.REPAIR_ASSIGNEES[repository]
+        record = next(
+            item for item in runner.assignment_agents if item["name"] == name
+        )
+        previous_id = record["id"]
+        replacement_id = "00000000-0000-4000-8000-000000000095"
+        record["id"] = replacement_id
+        membership = next(
+            item for item in runner.assignment_squad_members
+            if item["member_id"] == previous_id
+        )
+        membership["member_id"] = replacement_id
+
+    def test_planner_and_reservation_reject_foreign_historical_repair_routes(self):
+        for repository in ("frontend", "backend"):
+            for attempt in (1, 2):
+                for face in ("project", "agent", "both"):
+                    with self.subTest(
+                        repository=repository,
+                        repair_round=attempt + 1,
+                        face=face,
+                    ):
+                        runner, github, legal_decision = (
+                            self._planned_for_repair_owner(repository, attempt)
+                        )
+                        self._forge_repair_lineage_route(
+                            runner,
+                            repository,
+                            face,
+                        )
+                        snapshot = load_parent_snapshot(
+                            runner,
+                            github,
+                            "PRO-65",
+                        )
+
+                        planned = decide_parent_action(snapshot)
+
+                        self.assertEqual(
+                            planned.kind,
+                            "block_parent",
+                            planned.reason,
+                        )
+                        with self.assertRaisesRegex(RuntimeError, "routing"):
+                            _build_repair_reservation(
+                                snapshot,
+                                legal_decision,
+                            )
+                        self.assertEqual(runner.mutation_calls, [])
+
+    def test_repair_reservation_uses_configured_project_and_engineer_route(self):
+        expected = {
+            "frontend": (PROJECT_ID, AGENT_ID),
+            "backend": (BACKEND_PROJECT_ID, BACKEND_AGENT_ID),
+        }
+        for repository in ("frontend", "backend"):
+            for attempt in (1, 2):
+                with self.subTest(
+                    repository=repository,
+                    repair_round=attempt + 1,
+                ):
+                    runner, github, decision = (
+                        self._planned_for_repair_owner(repository, attempt)
+                    )
+                    snapshot = load_parent_snapshot(runner, github, "PRO-65")
+
+                    reservation = _build_repair_reservation(snapshot, decision)
+
+                    self.assertEqual(len(reservation["child_specs"]), 1)
+                    spec = reservation["child_specs"][0]
+                    self.assertEqual(
+                        (spec["project_id"], spec["assignee_id"]),
+                        expected[repository],
+                    )
+
+    def test_reserved_and_replayed_repair_reject_configured_route_drift(self):
+        for state in ("reserved", "committed"):
+            for repository in ("frontend", "backend"):
+                for attempt in (1, 2):
+                    for face in ("project", "agent"):
+                        with self.subTest(
+                            state=state,
+                            repository=repository,
+                            repair_round=attempt + 1,
+                            face=face,
+                        ):
+                            runner, github, decision = (
+                                self._planned_for_repair_owner(
+                                    repository,
+                                    attempt,
+                                )
+                            )
+                            if state == "reserved":
+                                snapshot = load_parent_snapshot(
+                                    runner,
+                                    github,
+                                    "PRO-65",
+                                )
+                                reservation = _build_repair_reservation(
+                                    snapshot,
+                                    decision,
+                                )
+                                runner.metadata["PRO-65"][
+                                    workflow_module.REPAIR_RESERVATION_KEY
+                                ] = workflow_module._canonical_json(reservation)
+                            else:
+                                created = execute_parent_repair(
+                                    runner,
+                                    github,
+                                    "PRO-65",
+                                    expected_action_key=decision.action_key,
+                                )
+                                self.assertEqual(
+                                    created.next_action,
+                                    "repair",
+                                    created.reason,
+                                )
+                            self._drift_configured_repair_route(
+                                runner,
+                                repository,
+                                face,
+                            )
+                            before = len(runner.mutation_calls)
+
+                            result = execute_parent_repair(
+                                runner,
+                                github,
+                                "PRO-65",
+                                expected_action_key=decision.action_key,
+                            )
+
+                            self.assertEqual(result.next_action, "block", result.reason)
+                            self.assertEqual(result.mutation_count, 0)
+                            self.assertEqual(len(runner.mutation_calls), before)
+
+    def test_reserved_repair_rejects_historical_lineage_route_drift(self):
+        for repository in ("frontend", "backend"):
+            for attempt in (1, 2):
+                for face in ("project", "agent", "both"):
+                    with self.subTest(
+                        repository=repository,
+                        repair_round=attempt + 1,
+                        face=face,
+                    ):
+                        runner, github, decision = (
+                            self._planned_for_repair_owner(repository, attempt)
+                        )
+                        snapshot = load_parent_snapshot(
+                            runner,
+                            github,
+                            "PRO-65",
+                        )
+                        reservation = _build_repair_reservation(snapshot, decision)
+                        runner.metadata["PRO-65"][
+                            workflow_module.REPAIR_RESERVATION_KEY
+                        ] = workflow_module._canonical_json(reservation)
+                        self._forge_repair_lineage_route(
+                            runner,
+                            repository,
+                            face,
+                        )
+                        before = len(runner.mutation_calls)
+
+                        result = execute_parent_repair(
+                            runner,
+                            github,
+                            "PRO-65",
+                            expected_action_key=decision.action_key,
+                        )
+
+                        self.assertEqual(result.next_action, "block", result.reason)
+                        self.assertEqual(result.mutation_count, 0)
+                        self.assertEqual(len(runner.mutation_calls), before)
+
+    def test_foreign_routed_current_repair_cannot_finish(self):
+        for repository in ("frontend", "backend"):
+            for attempt in (1, 2):
+                for face in ("project", "agent", "both"):
+                    with self.subTest(
+                        repository=repository,
+                        repair_round=attempt + 1,
+                        face=face,
+                    ):
+                        runner, github, decision = (
+                            self._planned_for_repair_owner(repository, attempt)
+                        )
+                        created = execute_parent_repair(
+                            runner,
+                            github,
+                            "PRO-65",
+                            expected_action_key=decision.action_key,
+                        )
+                        self.assertEqual(created.next_action, "repair", created.reason)
+                        child_key = created.child_identifiers[0]
+                        self._forge_repair_lineage_route(
+                            runner,
+                            repository,
+                            face,
+                        )
+                        replacement_sha = "c" * 40
+                        if repository == "frontend":
+                            github.head_shas[FRONTEND_PR] = replacement_sha
+                        else:
+                            github.head_sha = replacement_sha
+                        completion = PhaseCompletion(
+                            kind="repair",
+                            result="pass",
+                            attempt=attempt + 1,
+                            evidence_comment=COMMENT_ID,
+                            frontend_sha=(
+                                replacement_sha
+                                if repository == "frontend"
+                                else None
+                            ),
+                            backend_sha=(
+                                replacement_sha
+                                if repository == "backend"
+                                else None
+                            ),
+                            pr_url=(
+                                FRONTEND_PR
+                                if repository == "frontend"
+                                else FakeRepairRunner.BACKEND_PR
+                            ),
+                        )
+                        before = len(runner.mutation_calls)
+
+                        with patch.object(
+                            workflow_module,
+                            "GitHubRunner",
+                            return_value=github,
+                        ):
+                            with self.assertRaises(RuntimeError):
+                                finish_phase(runner, child_key, completion)
+
+                        self.assertEqual(len(runner.mutation_calls), before)
 
     def test_parent_load_requires_stable_child_scoped_gate_evidence(self):
         cases = (
