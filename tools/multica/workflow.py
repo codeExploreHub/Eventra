@@ -5534,6 +5534,7 @@ def _list_workflow_parents(
     for project_id in project_ids:
         if not isinstance(project_id, str) or not project_id:
             raise ValueError("invalid watcher project identifier")
+    for project_id in project_ids[:1]:
         for status in ("in_progress", "in_review"):
             for workflow_version in ("1", "2"):
                 version_filter = _string_metadata_filter(

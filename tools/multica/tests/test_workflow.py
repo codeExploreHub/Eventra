@@ -5436,6 +5436,71 @@ class FakeWatchRunner:
             raise AssertionError("foreign status")
 
 
+class BackendForeignParentWatchRunner(FakeWatchRunner):
+    def __init__(self, *, include_control_parent: bool):
+        super().__init__()
+        self.include_control_parent = include_control_parent
+        self.backend_parent = raw_issue(
+            id="01a00000-0000-7000-8000-000000000099",
+            identifier="PRO-99",
+            parent_issue_id=None,
+            stage=None,
+            status="in_progress",
+            assignee_id=SQUAD_ID,
+            assignee_type="squad",
+            project_id=BACKEND_PROJECT_ID,
+            updated_at="2026-08-25T08:33:48Z",
+        )
+
+    def run(self, args, *, stdin_json=None):
+        call = tuple(args)
+        if call[:2] == ("issue", "list"):
+            flags = dict(zip(call[2::2], call[3::2]))
+            if (
+                flags.get("--project") == PROJECT_ID
+                and not self.include_control_parent
+            ):
+                self.calls.append(call)
+                self._assert_list_flags(flags)
+                return {
+                    "has_more": False,
+                    "issues": [],
+                    "limit": 50,
+                    "offset": 0,
+                    "total": 0,
+                }
+            if (
+                flags.get("--project") == BACKEND_PROJECT_ID
+                and flags.get("--status") == "in_progress"
+                and flags.get("--metadata")
+                == '"eventra.workflow.version=""1"""'
+            ):
+                self.calls.append(call)
+                self._assert_list_flags(flags)
+                return {
+                    "has_more": False,
+                    "issues": [copy.deepcopy(self.backend_parent)],
+                    "limit": 50,
+                    "offset": 0,
+                    "total": 1,
+                }
+        if call == ("issue", "get", "PRO-99", "--output", "json"):
+            self.calls.append(call)
+            return copy.deepcopy(self.backend_parent)
+        if call == (
+            "issue", "metadata", "list", "PRO-99", "--output", "json"
+        ):
+            self.calls.append(call)
+            return {"eventra.workflow.version": "1"}
+        if call == ("issue", "children", "PRO-99", "--output", "json"):
+            self.calls.append(call)
+            return {"stages": [], "total": 0, "unstaged": []}
+        if call == ("issue", "runs", "PRO-99", "--output", "json"):
+            self.calls.append(call)
+            return []
+        return super().run(args, stdin_json=stdin_json)
+
+
 class WatchWorkflowTests(unittest.TestCase):
     def _watch(self, runner, *, apply):
         return watch_projects(
@@ -5953,7 +6018,7 @@ class WatchWorkflowTests(unittest.TestCase):
 
                 result = self._watch(runner, apply=True)
 
-                self.assertEqual(result, WatchResult(1, 0, 0, "noop"))
+                self.assertEqual(result, WatchResult(0, 0, 0, "noop"))
                 self.assertFalse(
                     any(call[:2] == ("issue", "rerun") for call in runner.calls)
                 )
@@ -6446,6 +6511,45 @@ class WatchWorkflowTests(unittest.TestCase):
         self.assertIn(
             "version 1 workflow requires explicit migration",
             output.getvalue(),
+        )
+
+    def test_backend_project_version_one_parent_is_not_a_watcher_parent(self):
+        runner = BackendForeignParentWatchRunner(include_control_parent=False)
+
+        result = self._watch(runner, apply=True)
+
+        self.assertEqual(result, WatchResult(0, 0, 0, "noop"))
+        self.assertFalse(
+            any(call[:3] == ("issue", "get", "PRO-99") for call in runner.calls)
+        )
+
+    def test_backend_version_one_parent_cannot_starve_control_version_two(self):
+        runner = BackendForeignParentWatchRunner(include_control_parent=True)
+
+        result = self._watch(runner, apply=False)
+
+        self.assertEqual(result, WatchResult(1, 1, 0, "rerun_child"))
+        self.assertFalse(
+            any(call[:3] == ("issue", "get", "PRO-99") for call in runner.calls)
+        )
+
+    def test_control_parent_snapshot_still_discovers_backend_project_children(self):
+        runner = FakeWatchRunner()
+        runner.install_parent_snapshot(self._cross_stack_gate_snapshot(), "PRO-36")
+
+        snapshot = workflow_module.load_workflow_snapshot(
+            runner,
+            "PRO-35",
+            runner.PROJECTS,
+            runner.github,
+        )
+
+        self.assertTrue(
+            any(
+                child.phase is not None
+                and child.phase.project_id == BACKEND_PROJECT_ID
+                for child in snapshot.children
+            )
         )
 
     def test_string_metadata_filter_is_json_string_inside_one_csv_field(self):
