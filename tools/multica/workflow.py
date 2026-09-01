@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 from typing import Literal, Sequence
 from urllib.parse import urlsplit
 
+from .contracts import parse_agent_list
 from .issue_contracts import (
     ACTIVE_RUN_STATUSES,
     parse_authorizing_comment,
@@ -68,6 +69,12 @@ MAX_REPAIR_TITLE_BYTES = 255
 REPAIR_ASSIGNEES = {
     "frontend": "Eventra Frontend Engineer",
     "backend": "Eventra Backend Engineer",
+}
+ASSIGNMENT_AGENT_NAMES = {
+    "frontend_engineer": "Eventra Frontend Engineer",
+    "backend_engineer": "Eventra Backend Engineer",
+    "integration_qa": "Eventra Integration QA",
+    "independent_reviewer": "Eventra Independent Reviewer",
 }
 REPAIR_PROVENANCE_KEYS = frozenset(
     {
@@ -238,6 +245,7 @@ class WorkflowSnapshot:
     parent: ParentSnapshot | None = None
     project_ids: tuple[str, ...] = ()
     parent_project_id: str = ""
+    agent_ids: tuple[tuple[str, str], ...] = ()
 
     def first_terminal_run_needing_transition(
         self,
@@ -1525,6 +1533,7 @@ def _recovery_authority_identity(
             else _canonical_json(parent.repair_reservation)
         ),
         snapshot.project_ids,
+        snapshot.agent_ids,
         tuple(
             sorted(
                 (
@@ -1707,12 +1716,103 @@ def _current_assignment_provenance_problem(
         return "current assignment child identity is conflicting"
     kinds = {phase.kind for phase in phases}
     if kinds == {"implementation"}:
-        return _implementation_assignment_problem(snapshot, parent, phases)
-    if kinds <= {"review", "qa", "integration_qa"}:
-        return _gate_assignment_problem(snapshot, parent, phases)
+        problem = _implementation_assignment_problem(snapshot, parent, phases)
+    elif kinds <= {"review", "qa", "integration_qa"}:
+        problem = _gate_assignment_problem(snapshot, parent, phases)
+    elif kinds == {"repair"}:
+        problem = _current_repair_provenance_problem(parent, phases)
+    else:
+        return "current assignment phase membership is malformed"
+    if problem is not None:
+        return problem
+    problem = _assignment_agent_problem(snapshot, phases)
+    if problem is not None:
+        return problem
     if kinds == {"repair"}:
-        return _current_repair_provenance_problem(parent, phases)
-    return "current assignment phase membership is malformed"
+        try:
+            _, source_stage = _repair_action_stage_identity(parent.last_action or "")
+        except RuntimeError:
+            return "current repair assignment action is malformed"
+        source_phases = tuple(
+            phase for phase in parent.children if phase.stage == source_stage
+        )
+        problem = _assignment_agent_problem(snapshot, source_phases)
+        if problem is not None:
+            return "current repair source Gate agent authority is conflicting"
+    return None
+
+
+def _assignment_agent_problem(
+    snapshot: WorkflowSnapshot,
+    phases: tuple[PhaseSnapshot, ...],
+) -> str | None:
+    expected = dict(snapshot.agent_ids)
+    if set(expected) != set(ASSIGNMENT_AGENT_NAMES):
+        return "current assignment agent authority is incomplete"
+    for phase in phases:
+        if phase.kind == "implementation":
+            role = phase.phase_role
+        elif phase.kind == "repair":
+            role = f"{phase.repair_repository}_engineer"
+        elif phase.kind == "review":
+            role = "independent_reviewer"
+        elif phase.kind in {"qa", "integration_qa"}:
+            role = "integration_qa"
+        else:
+            return "current assignment agent role is malformed"
+        if phase.assignee_id != expected.get(role):
+            return "current assignment agent authority is conflicting"
+    return None
+
+
+def _terminal_current_assignment_problem(
+    snapshot: WorkflowSnapshot,
+) -> str | None:
+    current_children = tuple(
+        child
+        for child in snapshot.children
+        if child.stage == snapshot.current_stage
+    )
+    if not current_children:
+        return "terminal current Stage assignment membership is missing"
+    problem = _current_assignment_provenance_problem(snapshot)
+    if problem is not None:
+        return problem
+    if any(
+        child.issue_status != "done"
+        or child.has_active_run
+        or child.latest_run_status not in {"completed", "failed"}
+        or not child.has_phase_completion
+        or child.phase is None
+        or child.phase.status != "done"
+        or child.phase.result not in PHASE_RESULTS
+        for child in current_children
+    ):
+        return "terminal current Stage completion authority is incomplete"
+    return None
+
+
+def _initial_parent_recovery_problem(
+    snapshot: WorkflowSnapshot,
+) -> str | None:
+    parent = snapshot.parent
+    if (
+        parent is None
+        or parent.workflow_version != 2
+        or snapshot.current_stage != 0
+        or snapshot.children
+        or parent.children
+        or parent.next_stage != 1
+        or parent.attempt != 0
+        or parent.last_action is not None
+        or parent.merge_state != "not_ready"
+        or parent.repair_reservation is not None
+        or parent.authorization_comment_uuid
+        or parent.consumed_authorization_uuid
+        or _scope(parent) == "invalid"
+    ):
+        return "initial parent recovery authority is conflicting"
+    return None
 
 
 def decide_recovery(snapshot: WorkflowSnapshot) -> RecoveryDecision:
@@ -1787,12 +1887,18 @@ def decide_recovery(snapshot: WorkflowSnapshot) -> RecoveryDecision:
             "nonterminal assigned child without an active run",
         )
     if snapshot.latest_stage_finished and not snapshot.has_later_parent_run:
+        assignment_problem = _terminal_current_assignment_problem(snapshot)
+        if assignment_problem is not None:
+            return RecoveryDecision("noop", None, assignment_problem)
         return RecoveryDecision(
             "rerun_parent",
             snapshot.parent_identifier,
             "finished stage without successor parent run",
         )
     if snapshot.active_parent_has_no_executable_successor:
+        assignment_problem = _initial_parent_recovery_problem(snapshot)
+        if assignment_problem is not None:
+            return RecoveryDecision("noop", None, assignment_problem)
         return RecoveryDecision(
             "rerun_parent",
             snapshot.parent_identifier,
@@ -3500,11 +3606,25 @@ def load_workflow_snapshot(
     if workflow_version not in {"1", "2"}:
         raise RuntimeError("unsupported workflow metadata")
     decoded_parent: dict[str, object] | None = None
+    assignment_agent_ids: tuple[tuple[str, str], ...] = ()
     if workflow_version == "2":
         try:
             decoded_parent = _parent_metadata(parent_metadata)
         except RuntimeError:
             decoded_parent = None
+        if project_ids:
+            records = parse_agent_list(
+                runner.run(["agent", "list", "--output", "json"])
+            )
+            resolved: dict[str, str] = {}
+            for role, name in ASSIGNMENT_AGENT_NAMES.items():
+                matches = [item["id"] for item in records if item["name"] == name]
+                if len(matches) != 1 or not _is_uuid(matches[0]):
+                    resolved = {}
+                    break
+                resolved[role] = matches[0]
+            if len(resolved) == len(ASSIGNMENT_AGENT_NAMES):
+                assignment_agent_ids = tuple(sorted(resolved.items()))
     children = parse_issue_children(
         runner.run(["issue", "children", parent_key, "--output", "json"]),
         str(parent["id"]),
@@ -3576,6 +3696,7 @@ def load_workflow_snapshot(
             and str(parent["project_id"]) not in set(project_ids)
         )
         or decoded_parent is None
+        or (bool(project_ids) and not assignment_agent_ids)
         or any(
             child.phase is None
             for child in snapshots
@@ -3685,6 +3806,7 @@ def load_workflow_snapshot(
         parent=parent_snapshot,
         project_ids=tuple(project_ids),
         parent_project_id=str(parent["project_id"]),
+        agent_ids=assignment_agent_ids,
     )
 
 

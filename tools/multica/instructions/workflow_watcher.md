@@ -9,6 +9,10 @@ phase, role, Project, Agent, candidate SHAs, pull request, and authoritative
 creation action must exactly match the current parent assignment. Repair also
 requires its exact immutable source candidate map, FailureBundle digest,
 assigned evidence partition, round, and round-3 authorization when applicable.
+Before rerunning Delivery Lead after a finished Stage, apply the same exact
+typed membership and provenance checks to every terminal current child and
+require each authoritative completion to be complete and stable. Never wake
+Delivery Lead past a malformed, missing, foreign, or forged terminal child.
 Fail closed on any command error, malformed result, or unsuccessful status: do
 not retry, infer a result, or take follow-up action. Version mismatch, malformed
 FailureBundle, or PR drift is a human-visible block, never a recovery target.

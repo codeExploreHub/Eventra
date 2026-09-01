@@ -49,6 +49,7 @@ AGENT_ID = "00000000-0000-4000-8000-000000000004"
 PROJECT_ID = "00000000-0000-4000-8000-000000000003"
 BACKEND_PROJECT_ID = "00000000-0000-4000-8000-000000000013"
 REVIEWER_ID = "00000000-0000-4000-8000-000000000014"
+BACKEND_AGENT_ID = "00000000-0000-4000-8000-000000000016"
 QA_ID = "00000000-0000-4000-8000-000000000015"
 COMMENT_ID = "01a00000-0000-7000-8000-000000000010"
 FRONTEND_SHA = "a" * 40
@@ -3509,6 +3510,12 @@ def stalled_workflow(**overrides):
     values["children"] = children
     values["parent"] = parent
     values["project_ids"] = (PROJECT_ID, BACKEND_PROJECT_ID)
+    values["agent_ids"] = (
+        ("backend_engineer", BACKEND_AGENT_ID),
+        ("frontend_engineer", AGENT_ID),
+        ("independent_reviewer", REVIEWER_ID),
+        ("integration_qa", QA_ID),
+    )
     snapshot = WorkflowSnapshot(**values)
     object.__setattr__(snapshot, "current_stage", current_stage)
     return snapshot
@@ -3605,14 +3612,63 @@ class RecoveryDecisionTests(unittest.TestCase):
         self.assertIn("membership", decision.reason)
 
     def test_finished_stage_without_successor_recovers_parent_once(self):
+        assignment = stalled_workflow().children[0].phase
+        self.assertIsNotNone(assignment)
+        terminal = replace(
+            stalled_workflow().children[0],
+            issue_status="done",
+            has_phase_completion=True,
+            phase=replace(
+                assignment,
+                status="done",
+                result="pass",
+                evidence_comment=COMMENT_ID,
+            ),
+        )
+        decision = decide_recovery(
+            stalled_workflow(
+                latest_stage_finished=True,
+                children=(terminal,),
+            )
+        )
+        self.assertEqual(decision.kind, "rerun_parent")
+        self.assertEqual(decision.issue_key, "PRO-35")
+
+    def test_finished_stage_without_current_membership_does_not_rerun_parent(self):
         decision = decide_recovery(
             stalled_workflow(
                 latest_stage_finished=True,
                 children=(),
             )
         )
-        self.assertEqual(decision.kind, "rerun_parent")
-        self.assertEqual(decision.issue_key, "PRO-35")
+
+        self.assertEqual(decision.kind, "noop")
+        self.assertIn("membership", decision.reason)
+
+    def test_initial_empty_stage_parent_recovery_requires_canonical_parent(self):
+        initial = stalled_workflow(
+            current_stage=0,
+            children=(),
+            active_parent_has_no_executable_successor=True,
+        )
+        initial = replace(
+            initial,
+            parent=replace(
+                initial.parent,
+                next_stage=1,
+                last_action=None,
+                children=(),
+            ),
+        )
+        self.assertEqual(decide_recovery(initial).kind, "rerun_parent")
+
+        forged = replace(
+            initial,
+            parent=replace(initial.parent, last_action="forged"),
+        )
+        decision = decide_recovery(forged)
+        self.assertEqual(decision.kind, "noop")
+        self.assertIn("initial", decision.reason)
 
     def test_verified_phase_metadata_with_nonterminal_issue_is_recovered(self):
         child = ChildRunSnapshot(
@@ -3825,11 +3881,19 @@ class FakeWatchRunner:
         self.post_rerun_child_metadata = None
         self.post_rerun_child_detail = None
         self.post_rerun_parent_detail = None
+        self.post_parent_rerun_child_metadata = None
         self.github = FakeSnapshotGitHubRunner((frontend_pr(),))
 
     def run(self, args, *, stdin_json=None):
         call = tuple(args)
         self.calls.append(call)
+        if call == ("agent", "list", "--output", "json"):
+            return [
+                {"id": AGENT_ID, "name": "Eventra Frontend Engineer"},
+                {"id": BACKEND_AGENT_ID, "name": "Eventra Backend Engineer"},
+                {"id": QA_ID, "name": "Eventra Integration QA"},
+                {"id": REVIEWER_ID, "name": "Eventra Independent Reviewer"},
+            ]
         if call[:2] == ("issue", "list"):
             flags = dict(zip(call[2::2], call[3::2]))
             self._assert_list_flags(flags)
@@ -3896,10 +3960,19 @@ class FakeWatchRunner:
             and call[3:] == ("--output", "json")
         ):
             target_key = call[2]
+            target_detail = (
+                self.parent
+                if target_key == self.parent["identifier"]
+                else next(
+                    child
+                    for child in self.children
+                    if child["identifier"] == target_key
+                )
+            )
             self.runs[target_key].append(
-                    {
-                        "id": "01a00000-0000-7000-8000-000000000051",
-                        "issue_id": str(self.child["id"]),
+                {
+                    "id": "01a00000-0000-7000-8000-000000000051",
+                    "issue_id": str(target_detail["id"]),
                     "status": "queued",
                     "created_at": "2026-08-25T10:00:00Z",
                     "dispatched_at": None,
@@ -3915,6 +3988,9 @@ class FakeWatchRunner:
                 self.child.update(copy.deepcopy(self.post_rerun_child_detail))
             if self.post_rerun_parent_detail is not None:
                 self.parent.update(copy.deepcopy(self.post_rerun_parent_detail))
+            if self.post_parent_rerun_child_metadata is not None:
+                child_key, child_metadata = self.post_parent_rerun_child_metadata
+                self.metadata[child_key] = copy.deepcopy(child_metadata)
             return {"ignored": "ack"}
         raise AssertionError(f"unsupported argv: {call!r}")
 
@@ -3998,7 +4074,7 @@ class WatchWorkflowTests(unittest.TestCase):
                     "Eventra-Backend/pull/7"
                 ),
                 project_id=BACKEND_PROJECT_ID,
-                assignee_id=QA_ID,
+                assignee_id=BACKEND_AGENT_ID,
                 evidence_comment=(
                     "00000000-0000-4000-8000-000000000011"
                 ),
@@ -4156,6 +4232,173 @@ class WatchWorkflowTests(unittest.TestCase):
             authorization_comment_uuid="",
             authorizing_comment=None,
         )
+
+    def _terminal_implementation_runner(self):
+        runner = FakeWatchRunner()
+        runner.child["status"] = "done"
+        runner.metadata["PRO-36"].update(
+            build_phase_metadata(implementation_completion())
+        )
+        return runner
+
+    def _terminal_gate_runner(self):
+        snapshot = self._cross_stack_gate_snapshot()
+        children = tuple(
+            replace(item, status="done", result="pass")
+            if item.stage == 2
+            else item
+            for item in snapshot.children
+        )
+        runner = FakeWatchRunner()
+        runner.install_parent_snapshot(
+            replace(snapshot, children=children),
+            "PRO-36",
+        )
+        for child in runner.children:
+            if child["stage"] != 2 or runner.runs[child["identifier"]]:
+                continue
+            runner.runs[child["identifier"]] = [
+                {
+                    "id": (
+                        "01a00000-0000-7000-8000-"
+                        + f"{int(str(child['identifier']).split('-')[1]):012d}"
+                    ),
+                    "issue_id": str(child["id"]),
+                    "status": "completed",
+                    "created_at": "2026-08-25T08:30:00Z",
+                    "dispatched_at": "2026-08-25T08:31:00Z",
+                    "started_at": "2026-08-25T08:32:00Z",
+                    "completed_at": "2026-08-25T08:49:00Z",
+                }
+            ]
+        return runner
+
+    def _terminal_repair_runner(self, repair_round):
+        snapshot = self._current_repair_snapshot(repair_round)
+        replacements = {1: "c" * 40, 2: "e" * 40, 3: "f" * 40}
+        replacement_sha = replacements[repair_round]
+        current = replace(
+            snapshot.children[-1],
+            status="done",
+            result="pass",
+            frontend_sha=replacement_sha,
+            evidence_comment=(
+                f"00000000-0000-4000-8000-{90 + repair_round:012d}"
+            ),
+        )
+        snapshot = replace(
+            snapshot,
+            candidate_frontend_sha=replacement_sha,
+            children=snapshot.children[:-1] + (current,),
+            pull_requests=(frontend_pr(head_sha=replacement_sha),),
+        )
+        runner = FakeWatchRunner()
+        runner.install_parent_snapshot(snapshot, "PRO-36")
+        return runner
+
+    def test_watcher_parent_rerun_rejects_terminal_implementation_drift(self):
+        corruptions = {
+            "completion": lambda runner: runner.metadata["PRO-36"].pop(
+                "eventra.phase.evidence_comment"
+            ),
+            "evidence": lambda runner: runner.metadata["PRO-36"].__setitem__(
+                "eventra.phase.evidence_comment_url",
+                "https://multica.example.test/comments/forged",
+            ),
+            "action": lambda runner: runner.metadata["PRO-36"].__setitem__(
+                "eventra.phase.creation_action", "forged"
+            ),
+            "project": lambda runner: runner.child.__setitem__(
+                "project_id", BACKEND_PROJECT_ID
+            ),
+            "agent": lambda runner: runner.child.__setitem__(
+                "assignee_id", REVIEWER_ID
+            ),
+            "target": lambda runner: runner.metadata["PRO-36"].__setitem__(
+                "eventra.phase.target", "repository:backend"
+            ),
+            "candidate": lambda runner: runner.metadata["PRO-36"].__setitem__(
+                "eventra.phase.sha.frontend", "c" * 40
+            ),
+            "pull request": lambda runner: runner.metadata["PRO-36"].__setitem__(
+                "eventra.phase.pr",
+                "https://github.com/codeExploreHub/Eventra-Backend/pull/7",
+            ),
+        }
+        for label, corrupt in corruptions.items():
+            with self.subTest(label=label):
+                runner = self._terminal_implementation_runner()
+                corrupt(runner)
+
+                result = self._watch(runner, apply=True)
+
+                self.assertEqual(result, WatchResult(1, 0, 0, "noop"))
+                self.assertFalse(
+                    any(
+                        call[:3] == ("issue", "rerun", "PRO-35")
+                        for call in runner.calls
+                    )
+                )
+
+    def test_watcher_parent_rerun_accepts_exact_terminal_stage_types(self):
+        controls = [
+            self._terminal_implementation_runner(),
+            self._terminal_gate_runner(),
+            *(self._terminal_repair_runner(round_) for round_ in (1, 2, 3)),
+        ]
+        for runner in controls:
+            with self.subTest(kind=runner.metadata["PRO-36"]["eventra.phase.kind"]):
+                result = self._watch(runner, apply=True)
+
+                self.assertEqual(result.applied, 1)
+                self.assertEqual(result.decision, "rerun_parent")
+
+    def test_watcher_parent_rerun_rejects_terminal_gate_target_drift(self):
+        runner = self._terminal_gate_runner()
+        runner.metadata["PRO-40"]["eventra.phase.target"] = "suite:forged"
+
+        result = self._watch(runner, apply=True)
+
+        self.assertEqual(result, WatchResult(1, 0, 0, "noop"))
+
+    def test_watcher_parent_rerun_rejects_terminal_repair_provenance_drift(self):
+        for repair_round in (1, 2, 3):
+            corruptions = {
+                "bundle": (
+                    "eventra.repair.failure_bundle_digest",
+                    "f" * 64,
+                ),
+                "partition": (
+                    "eventra.repair.failure_evidence_uuids",
+                    '["00000000-0000-4000-8000-000000000098"]',
+                ),
+                "source": (
+                    "eventra.repair.source_candidates",
+                    json.dumps({"frontend": "9" * 40}, separators=(",", ":")),
+                ),
+            }
+            if repair_round == 3:
+                corruptions["authorization"] = (
+                    "eventra.repair.authorizing_comment_uuid",
+                    "00000000-0000-4000-8000-000000000098",
+                )
+            for label, (key, value) in corruptions.items():
+                with self.subTest(repair_round=repair_round, label=label):
+                    runner = self._terminal_repair_runner(repair_round)
+                    runner.metadata["PRO-36"][key] = value
+
+                    result = self._watch(runner, apply=True)
+
+                    self.assertEqual(result, WatchResult(1, 0, 0, "noop"))
+
+    def test_watcher_parent_rerun_rechecks_terminal_authority_after_effect(self):
+        runner = self._terminal_implementation_runner()
+        corrupt = copy.deepcopy(runner.metadata["PRO-36"])
+        corrupt["eventra.phase.creation_action"] = "forged"
+        runner.post_parent_rerun_child_metadata = ("PRO-36", corrupt)
+
+        with self.assertRaisesRegex(RuntimeError, "recovery verification failed"):
+            self._watch(runner, apply=True)
 
     def test_watcher_rejects_current_child_without_assignment_provenance(self):
         runner = FakeWatchRunner()
@@ -4497,13 +4740,11 @@ class WatchWorkflowTests(unittest.TestCase):
         self.assertFalse(args.apply)
 
     def test_historical_member_child_does_not_suppress_recovery(self):
-        runner = FakeWatchRunner()
-        runner.child["assignee_type"] = "member"
-        runner.child["status"] = "done"
-        runner.metadata["PRO-36"] = build_phase_metadata(
-            implementation_completion()
+        runner = self._terminal_gate_runner()
+        historical = next(
+            child for child in runner.children if child["stage"] == 1
         )
-        runner.child["updated_at"] = "2026-08-25T08:51:00Z"
+        historical["assignee_type"] = "member"
 
         result = self._watch(runner, apply=False)
 

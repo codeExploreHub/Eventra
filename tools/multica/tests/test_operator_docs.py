@@ -107,6 +107,10 @@ class OperatorDocsTests(unittest.TestCase):
             "never changes parent metadata, status, Stage, or action history",
             watcher,
         )
+        self.assertIn(
+            "Before rerunning Delivery Lead after a finished Stage",
+            watcher,
+        )
 
         forbidden = (
             "Route failures to the owning implementer",

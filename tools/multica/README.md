@@ -318,6 +318,12 @@ provenance when applicable. It rereads the same immutable authority after the
 rerun. The Watcher never writes parent metadata, status, Stage, or action
 history; only the selected child's run/liveness state may change.
 
+A finished Stage does not bypass these checks. Before the Watcher wakes
+Delivery Lead, every exact current child must have its canonical typed
+assignment and authoritative terminal completion; malformed or drifting
+membership returns a zero-mutation noop. The initial empty Stage is recoverable
+only from its canonical version-2 parent state.
+
 Provisioning migrates the existing scheduled Autopilot in place to this Agent:
 it preserves the existing Autopilot and trigger IDs, updates only the
 assignee and any desired drift, and leaves the existing schedule trigger
