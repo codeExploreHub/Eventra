@@ -13,7 +13,6 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Literal, Sequence
-from urllib.parse import unquote, urlsplit
 
 from .blueprint import build_multi_repo_blueprint
 from .contracts import (
@@ -34,6 +33,7 @@ from .issue_contracts import (
     parse_issue_runs,
 )
 from .provision import MulticaRunner
+from .url_contracts import is_canonical_comment_url
 
 
 PHASE_KINDS = frozenset(
@@ -386,29 +386,7 @@ def _is_canonical_evidence_url(
     value: object,
     evidence_comment: object,
 ) -> bool:
-    if type(value) is not str:
-        return False
-    try:
-        parsed = urlsplit(value)
-        port = parsed.port
-    except ValueError:
-        return False
-    path = parsed.path
-    return bool(
-        _is_uuid(evidence_comment)
-        and parsed.scheme == "https"
-        and parsed.hostname
-        and port is None
-        and parsed.username is None
-        and parsed.password is None
-        and not parsed.query
-        and not parsed.fragment
-        and path == unquote(path)
-        and "\\" not in path
-        and "//" not in path
-        and all(part not in {".", ".."} for part in path.split("/"))
-        and path.endswith(f"/comments/{evidence_comment}")
-    )
+    return is_canonical_comment_url(value, evidence_comment)
 
 
 def _valid_phase_ownership(

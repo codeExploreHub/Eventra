@@ -5,7 +5,6 @@ from pathlib import Path
 import re
 from types import MappingProxyType
 from typing import Mapping
-from urllib.parse import urlsplit
 import uuid
 
 from .blueprint import AgentSpec, TeamBlueprint, build_multi_repo_blueprint
@@ -21,6 +20,7 @@ from tools.multica_delivery.model import (
     SkillSource as DeliverySkillSource,
 )
 from tools.multica_delivery.metadata import canonical_json
+from .url_contracts import is_canonical_comment_url
 
 
 PUBLIC_SKILL_URLS = {
@@ -161,22 +161,14 @@ def render_phase_contract(
         raise ValueError("invalid delivery phase contract") from None
     owners = set(responsible_repositories)
     needs_evidence_url = phase in {"review", "qa"} and result != "pass"
-    parsed_evidence_url = (
-        None if evidence_comment_url is None else urlsplit(evidence_comment_url)
-    )
     if needs_evidence_url and (
         not owners
         or not owners <= set(candidate_shas)
         or (len(candidate_shas) == 1 and owners != set(candidate_shas))
-        or evidence_comment_url is None
-        or parsed_evidence_url is None
-        or parsed_evidence_url.scheme != "https"
-        or not parsed_evidence_url.netloc
-        or parsed_evidence_url.username is not None
-        or parsed_evidence_url.password is not None
-        or parsed_evidence_url.query
-        or parsed_evidence_url.fragment
-        or not parsed_evidence_url.path
+        or not is_canonical_comment_url(
+            evidence_comment_url,
+            evidence_comment,
+        )
     ):
         raise ValueError("invalid delivery phase contract")
     if not needs_evidence_url and (owners or evidence_comment_url is not None):
