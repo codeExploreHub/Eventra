@@ -58,12 +58,15 @@ with `--parent`, `--stage`, the exact Engineer/Project assignment, and
 any child, persist and reread the canonical implementation action as
 `eventra.phase.creation_action`, its single `repository:NAME` target as
 `eventra.phase.target`, its `NAME_engineer` role as `eventra.phase.role`, the
-one exact candidate SHA, and its canonical managed PR. A valid creation prefix
-is `["multica", "issue", "create", "--parent", "PRO-35", "--stage", "1",
-"--status", "backlog", "--title", "PRO-35 frontend implementation"]`.
-Verify the full Stage 1 assignment group, promote only those exact initialized
-children, record the canonical action key, then set
-`eventra.workflow.next_stage=2`.
+creation provenance and initial base candidate SHA before starting. A valid
+creation prefix is `["multica", "issue", "create", "--parent", "PRO-35",
+"--stage", "1", "--status", "backlog", "--title", "PRO-35 frontend
+implementation"]`. Verify the full Stage 1 assignment group, promote only
+those exact initialized children, record the canonical action key, then set
+`eventra.workflow.next_stage=2`. The first authoritative implementation
+completion establishes the canonical managed PR. From then on replay, repair,
+Gate, and merge require that PR identity and head to remain exact; a different
+URL or out-of-band head is conflicting authority and blocks.
 
 Multica wakes you only after every child in a Stage reaches `done`. Here `done`
 means phase execution finished; it is never PASS without a complete

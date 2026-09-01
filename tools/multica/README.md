@@ -235,10 +235,14 @@ or deleted evidence comment, stale child, or PR drift is a human-visible block.
 
 An implementation assignment is usable only after Delivery Lead creates it in
 backlog and persists the canonical Stage action, single repository target,
-Engineer role, exact Engineer/Project identity, one candidate SHA, and canonical
-managed PR before starting it. Planner, `finish-phase`, replay, and Watcher all
-reuse that immutable assignment authority; an empty/manual/foreign child cannot
-advance merely by carrying a PASS envelope.
+Engineer role, exact Engineer/Project identity, and its creation provenance and
+initial base candidate SHA before starting. The first authoritative
+implementation completion establishes the canonical managed PR. From then on
+replay, repair, Gate, and merge require that PR identity and head to remain
+exact; a different URL or out-of-band head is conflicting authority and blocks.
+Planner, `finish-phase`, replay, and Watcher reuse the immutable assignment
+authority; an empty/manual/foreign child cannot advance merely by carrying a
+PASS envelope.
 
 Current version-2 Gate membership is typed and exact: every affected repository
 has one single-repository Review and one single-repository QA child, while a

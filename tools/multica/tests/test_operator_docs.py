@@ -338,6 +338,27 @@ class OperatorDocsTests(unittest.TestCase):
 
         self.assertIn("Do not create smoke children manually", lead)
 
+    def test_initial_implementation_pr_is_established_by_first_completion(self):
+        lead = " ".join(
+            Path("tools/multica/instructions/delivery_lead.md").read_text().split()
+        )
+        readme = " ".join(Path("tools/multica/README.md").read_text().split())
+
+        for rendered in (lead, readme):
+            self.assertIn(
+                "creation provenance and initial base candidate SHA before starting",
+                rendered,
+            )
+            self.assertIn(
+                "first authoritative implementation completion establishes the canonical managed PR",
+                rendered,
+            )
+            self.assertIn(
+                "replay, repair, Gate, and merge require that PR identity and head to remain exact",
+                rendered,
+            )
+            self.assertNotIn("canonical managed PR before starting", rendered)
+
     def test_unattended_parent_completion_and_exact_sha_checkout_are_explicit(self):
         instructions = Path("tools/multica/instructions")
         lead = (instructions / "delivery_lead.md").read_text()
