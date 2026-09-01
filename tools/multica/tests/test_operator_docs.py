@@ -28,7 +28,10 @@ class OperatorDocsTests(unittest.TestCase):
                 "N": "1",
                 "FULL_SHA": "a" * 40,
                 "COMMENT_UUID": "00000000-0000-4000-8000-000000000099",
-                "HTTPS_URL": "https://multica.example.test/comments/99",
+                "HTTPS_URL": (
+                    "https://multica.example.test/comments/"
+                    "00000000-0000-4000-8000-000000000099"
+                ),
                 "pass|fail|blocked": "pass",
             }
             argv = [replacements.get(value, value) for value in argv]
@@ -169,6 +172,9 @@ class OperatorDocsTests(unittest.TestCase):
         self.assertIn("### Non-PASS gate completion", qa)
         self.assertIn("### Smoke completion", qa)
         for rendered in (reviewer, qa):
+            self.assertIn("exact", rendered)
+            self.assertIn("child Issue before calling `finish-phase`", rendered)
+            self.assertIn("/comments/COMMENT_UUID", rendered)
             pass_form = rendered.split("### PASS gate completion", 1)[1].split(
                 "### Non-PASS gate completion", 1
             )[0]

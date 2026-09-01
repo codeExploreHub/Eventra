@@ -222,8 +222,16 @@ uses the exact returned `failure_bundle` and digest without reconstruction to
 execute its one allowed action. The decision revalidates the
 version-2 parent and Stage, exact candidate SHA map, current child identities,
 canonical managed PR URLs, verdict evidence UUIDs, and non-PASS canonical HTTPS
-evidence-comment URLs. Any malformed JSON or bundle, version mismatch, stale
-child, or PR drift is a human-visible block.
+evidence-comment URLs. Before a Gate completion is accepted, the verdict Agent
+must first post that evidence comment on the exact Gate child Issue. Planning,
+completion replay, repair execution, and Watcher recovery reread the
+child-scoped comment identity twice around an exact parent/child metadata read;
+the UUID, child Issue, Agent author, and current child assignee must agree.
+Comment content is not consumed by workflow logic. A non-PASS URL remains
+product-neutral HTTPS, but its normalized path must end exactly in
+`/comments/<evidence UUID>` and cannot contain credentials, a port, query,
+fragment, or traversal. Any malformed JSON or bundle, version mismatch, stale
+or deleted evidence comment, stale child, or PR drift is a human-visible block.
 
 Current version-2 Gate membership is typed and exact: every affected repository
 has one single-repository Review and one single-repository QA child, while a

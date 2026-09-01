@@ -319,3 +319,47 @@ def parse_authorizing_comment(
         "author_type": author_type,
         "content": content,
     }
+
+
+def parse_evidence_comment(
+    value: Any,
+    expected_comment_uuid: str,
+    expected_issue_id: str,
+    expected_author_id: str,
+) -> dict[str, str]:
+    """Select only authoritative identity from one child-scoped comment read."""
+
+    contract = "evidence comment"
+    try:
+        canonical_uuid = str(uuid.UUID(expected_comment_uuid))
+    except (AttributeError, TypeError, ValueError):
+        _error(contract)
+    if (
+        canonical_uuid != expected_comment_uuid
+        or not _string(expected_issue_id)
+        or not _string(expected_author_id)
+        or not isinstance(value, list)
+        or not all(
+            isinstance(record, dict) and _string(record.get("id"))
+            for record in value
+        )
+    ):
+        _error(contract)
+    matches = [
+        record for record in value if record["id"] == expected_comment_uuid
+    ]
+    if len(matches) != 1:
+        _error(contract)
+    record = matches[0]
+    if (
+        record.get("issue_id") != expected_issue_id
+        or record.get("author_type") != "agent"
+        or record.get("author_id") != expected_author_id
+    ):
+        _error(contract)
+    return {
+        "comment_uuid": expected_comment_uuid,
+        "issue_id": expected_issue_id,
+        "author_id": expected_author_id,
+        "author_type": "agent",
+    }

@@ -13,12 +13,13 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Literal, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from .contracts import parse_agent_list, parse_squad_list
 from .issue_contracts import (
     ACTIVE_RUN_STATUSES,
     parse_authorizing_comment,
+    parse_evidence_comment,
     parse_issue_children,
     parse_issue_detail,
     parse_issue_list,
@@ -340,18 +341,32 @@ def _validated_pr_url(value: str) -> str:
     return value
 
 
-def _is_canonical_evidence_url(value: object) -> bool:
+def _is_canonical_evidence_url(
+    value: object,
+    evidence_comment: object,
+) -> bool:
     if type(value) is not str:
         return False
-    parsed = urlsplit(value)
-    return (
-        parsed.scheme == "https"
-        and bool(parsed.netloc)
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    path = parsed.path
+    return bool(
+        _is_uuid(evidence_comment)
+        and parsed.scheme == "https"
+        and parsed.hostname
+        and port is None
         and parsed.username is None
         and parsed.password is None
         and not parsed.query
         and not parsed.fragment
-        and bool(parsed.path)
+        and path == unquote(path)
+        and "\\" not in path
+        and "//" not in path
+        and all(part not in {".", ".."} for part in path.split("/"))
+        and path.endswith(f"/comments/{evidence_comment}")
     )
 
 
@@ -361,6 +376,7 @@ def _valid_phase_ownership(
     phase_repositories: set[str],
     responsible_repositories: tuple[str, ...],
     evidence_comment_url: str | None,
+    evidence_comment: str,
 ) -> bool:
     owners = set(responsible_repositories)
     if kind not in {"review", "qa", "integration_qa"}:
@@ -372,7 +388,10 @@ def _valid_phase_ownership(
     if (
         not owners
         or not owners <= phase_repositories
-        or not _is_canonical_evidence_url(evidence_comment_url)
+        or not _is_canonical_evidence_url(
+            evidence_comment_url,
+            evidence_comment,
+        )
     ):
         return False
     if kind == "review":
@@ -446,6 +465,7 @@ def build_phase_metadata(value: PhaseCompletion) -> dict[str, str]:
         phase_repositories,
         value.responsible_repositories,
         value.evidence_comment_url,
+        value.evidence_comment,
     ):
         _invalid_completion()
 
@@ -939,6 +959,7 @@ def _failure_bundle(
                 set(phase_candidates),
                 phase.responsible_repositories,
                 phase.evidence_comment_url,
+                phase.evidence_comment,
             )
         ):
             raise ValueError("failure bundle gate evidence is malformed")
@@ -949,7 +970,10 @@ def _failure_bundle(
             continue
         if phase.result not in {"fail", "blocked"} or not owners:
             raise ValueError("nonpassing gate requires failure ownership")
-        if not _is_canonical_evidence_url(phase.evidence_comment_url):
+        if not _is_canonical_evidence_url(
+            phase.evidence_comment_url,
+            phase.evidence_comment,
+        ):
             raise ValueError("nonpassing gate requires canonical evidence URL")
         failures.append(
             {
@@ -2323,6 +2347,7 @@ def _phase_snapshot(
         phase_repositories,
         responsible_repositories,
         evidence_comment_url,
+        evidence_comment,
     ):
         raise RuntimeError("malformed child phase metadata")
     completed = _has_phase_completion(metadata)
@@ -2420,6 +2445,71 @@ def _parse_pull_request(
     )
 
 
+def _read_gate_evidence_comment(
+    runner: MulticaRunner,
+    issue_key: str,
+    issue_id: str,
+    assignee_id: str,
+    evidence_comment: str,
+) -> tuple[str, str, str, str]:
+    """Read only the authoritative identity of one child-scoped comment."""
+
+    parsed = parse_evidence_comment(
+        runner.run(
+            [
+                "issue",
+                "comment",
+                "list",
+                issue_key,
+                "--thread",
+                evidence_comment,
+                "--full",
+                "--summary",
+                "--output",
+                "json",
+            ]
+        ),
+        evidence_comment,
+        issue_id,
+        assignee_id,
+    )
+    return (
+        parsed["comment_uuid"],
+        parsed["issue_id"],
+        parsed["author_id"],
+        parsed["author_type"],
+    )
+
+
+def _read_gate_evidence_set(
+    runner: MulticaRunner,
+    children: Sequence[dict[str, object]],
+    phases: Sequence[PhaseSnapshot],
+) -> tuple[tuple[str, str, str, str, str], ...]:
+    phase_by_key = {phase.issue_key: phase for phase in phases}
+    authorities: list[tuple[str, str, str, str, str]] = []
+    for child in children:
+        key = str(child["identifier"])
+        phase = phase_by_key.get(key)
+        if (
+            phase is None
+            or phase.workflow_version != 2
+            or phase.kind not in {"review", "qa", "integration_qa"}
+            or phase.result not in PHASE_RESULTS
+            or phase.status != "done"
+        ):
+            continue
+        authority = _read_gate_evidence_comment(
+            runner,
+            key,
+            str(child["id"]),
+            str(child["assignee_id"]),
+            phase.evidence_comment,
+        )
+        authorities.append((key, *authority))
+    return tuple(sorted(authorities))
+
+
 def load_parent_snapshot(
     runner: MulticaRunner,
     github: GitHubRunner,
@@ -2470,6 +2560,7 @@ def load_parent_snapshot(
         str(parent["id"]),
     )
     phases: list[PhaseSnapshot] = []
+    child_metadata_by_key: dict[str, dict[str, str]] = {}
     pr_candidates: dict[str, tuple[int, str]] = {}
     for child in children:
         if child["stage"] is None:
@@ -2482,6 +2573,7 @@ def load_parent_snapshot(
                 ]
             )
         )
+        child_metadata_by_key[str(child["identifier"])] = child_metadata
         phases.append(_phase_snapshot(child, child_metadata))
         pr_url = child_metadata.get("eventra.phase.pr")
         if pr_url is not None:
@@ -2492,6 +2584,61 @@ def load_parent_snapshot(
                 pr_candidates[repository] = candidate
             elif candidate[0] == previous[0] and candidate[1] != previous[1]:
                 raise RuntimeError("conflicting phase pull requests")
+
+    evidence_before = _read_gate_evidence_set(runner, children, phases)
+    if evidence_before:
+        stable_parent = parse_issue_detail(
+            runner.run(["issue", "get", parent_key, "--output", "json"]),
+            parent_key,
+        )
+        stable_metadata = _parent_metadata(
+            parse_issue_metadata(
+                runner.run(
+                    [
+                        "issue", "metadata", "list", parent_key,
+                        "--output", "json",
+                    ]
+                )
+            )
+        )
+        stable_children = parse_issue_children(
+            runner.run(["issue", "children", parent_key, "--output", "json"]),
+            str(parent["id"]),
+        )
+        stable_child_metadata = {
+            str(child["identifier"]): parse_issue_metadata(
+                runner.run(
+                    [
+                        "issue", "metadata", "list",
+                        str(child["identifier"]), "--output", "json",
+                    ]
+                )
+            )
+            for child in stable_children
+            if child["stage"] is not None
+        }
+        if (
+            stable_parent != parent
+            or stable_metadata != metadata
+            or stable_children != children
+            or stable_child_metadata != child_metadata_by_key
+        ):
+            raise RuntimeError("Gate evidence parent authority changed")
+        stable_phases = tuple(
+            _phase_snapshot(
+                child,
+                stable_child_metadata[str(child["identifier"])],
+            )
+            for child in stable_children
+            if child["stage"] is not None
+        )
+        evidence_after = _read_gate_evidence_set(
+            runner,
+            stable_children,
+            stable_phases,
+        )
+        if evidence_after != evidence_before:
+            raise RuntimeError("Gate evidence comment changed during read")
 
     pull_requests = []
     for repository, (_, url) in sorted(pr_candidates.items()):
@@ -2904,7 +3051,10 @@ def _render_repair_handoff(
             or type(failure["child_identifier"]) is not str
             or ISSUE_KEY_PATTERN.fullmatch(failure["child_identifier"]) is None
             or not _is_uuid(failure["evidence_comment_uuid"])
-            or not _is_canonical_evidence_url(failure["evidence_comment_url"])
+            or not _is_canonical_evidence_url(
+                failure["evidence_comment_url"],
+                failure["evidence_comment_uuid"],
+            )
             or not isinstance(owners, list)
             or any(
                 type(owner) is not str or owner not in REPAIR_ASSIGNEES
@@ -3577,6 +3727,7 @@ def _has_phase_completion(metadata: dict[str, str]) -> bool:
             phase_repositories,
             tuple(repositories),
             metadata.get("eventra.phase.evidence_comment_url"),
+            metadata.get("eventra.phase.evidence_comment", ""),
         ):
             return False
     return (
@@ -3666,6 +3817,7 @@ def load_workflow_snapshot(
     )
     snapshots: list[ChildRunSnapshot] = []
     phases: list[PhaseSnapshot] = []
+    child_metadata_by_key: dict[str, dict[str, str]] = {}
     has_human_wait = _is_human_wait(parent)
     for child in children:
         child_key = str(child["identifier"])
@@ -3674,6 +3826,7 @@ def load_workflow_snapshot(
                 ["issue", "metadata", "list", child_key, "--output", "json"]
             )
         )
+        child_metadata_by_key[child_key] = metadata
         runs = parse_issue_runs(
             runner.run(["issue", "runs", child_key, "--output", "json"]),
             str(child["id"]),
@@ -3705,6 +3858,55 @@ def load_workflow_snapshot(
             )
         )
 
+    evidence_authority_malformed = False
+    try:
+        evidence_before = _read_gate_evidence_set(runner, children, phases)
+        if evidence_before:
+            stable_parent = parse_issue_detail(
+                runner.run(["issue", "get", parent_key, "--output", "json"]),
+                parent_key,
+            )
+            stable_parent_metadata = parse_issue_metadata(
+                runner.run(
+                    [
+                        "issue", "metadata", "list", parent_key,
+                        "--output", "json",
+                    ]
+                )
+            )
+            stable_children = parse_issue_children(
+                runner.run(
+                    ["issue", "children", parent_key, "--output", "json"]
+                ),
+                str(parent["id"]),
+            )
+            stable_child_metadata = {
+                str(child["identifier"]): parse_issue_metadata(
+                    runner.run(
+                        [
+                            "issue", "metadata", "list",
+                            str(child["identifier"]), "--output", "json",
+                        ]
+                    )
+                )
+                for child in stable_children
+            }
+            if (
+                stable_parent != parent
+                or stable_parent_metadata != parent_metadata
+                or stable_children != children
+                or stable_child_metadata != child_metadata_by_key
+                or _read_gate_evidence_set(
+                    runner,
+                    stable_children,
+                    phases,
+                )
+                != evidence_before
+            ):
+                evidence_authority_malformed = True
+    except (RuntimeError, TypeError, ValueError):
+        evidence_authority_malformed = True
+
     next_stage_text = parent_metadata.get("eventra.workflow.next_stage")
     current_stage = (
         int(next_stage_text) - 1
@@ -3719,7 +3921,8 @@ def load_workflow_snapshot(
         item for item in staged if item["stage"] == current_stage
     ]
     malformed_current_stage = workflow_version == "2" and (
-        current_stage is None
+        evidence_authority_malformed
+        or current_stage is None
         or any(int(item["stage"]) > current_stage for item in staged)
         or (bool(staged) and not current_stage_children)
         or (
@@ -4441,6 +4644,22 @@ def _controlled_phase_authority(metadata: dict[str, str]) -> dict[str, str]:
     }
 
 
+def _finish_gate_evidence_authority(
+    runner: MulticaRunner,
+    detail: dict[str, object],
+    value: PhaseCompletion,
+) -> tuple[str, str, str, str] | None:
+    if value.kind not in {"review", "qa", "integration_qa"}:
+        return None
+    return _read_gate_evidence_comment(
+        runner,
+        str(detail["identifier"]),
+        str(detail["id"]),
+        str(detail["assignee_id"]),
+        value.evidence_comment,
+    )
+
+
 def finish_phase(
     runner: MulticaRunner,
     issue_key: str,
@@ -4465,6 +4684,15 @@ def finish_phase(
     }
     if detail["status"] == "done":
         if controlled_before == wanted:
+            evidence_before = _finish_gate_evidence_authority(
+                runner,
+                detail,
+                value,
+            )
+            authority_envelope = _finish_parent_authority_envelope(
+                runner,
+                detail,
+            )
             authority_problem = _finish_phase_authority_problem(
                 runner,
                 detail,
@@ -4473,6 +4701,18 @@ def finish_phase(
             )
             if authority_problem is not None:
                 raise RuntimeError(authority_problem)
+            if (
+                _finish_parent_authority_envelope(runner, detail)
+                != authority_envelope
+            ):
+                raise RuntimeError("phase authority changed during replay")
+            evidence_after = _finish_gate_evidence_authority(
+                runner,
+                detail,
+                value,
+            )
+            if evidence_after != evidence_before:
+                raise RuntimeError("Gate evidence comment changed during replay")
             return PhaseResult(
                 str(detail["id"]), issue_key, "done", value.kind, value.result, 0
             )
@@ -4489,6 +4729,7 @@ def finish_phase(
         raise RuntimeError("phase issue is not mutable")
     if controlled_before.get("eventra.workflow.version") == "1":
         raise RuntimeError("version 1 workflow requires explicit migration")
+    evidence_before = _finish_gate_evidence_authority(runner, detail, value)
     authority_envelope = _finish_parent_authority_envelope(runner, detail)
     authority_problem = _finish_phase_authority_problem(
         runner,
@@ -4500,6 +4741,9 @@ def finish_phase(
         raise RuntimeError(authority_problem)
     if _finish_parent_authority_envelope(runner, detail) != authority_envelope:
         raise RuntimeError("phase authority changed before metadata mutation")
+    evidence_after = _finish_gate_evidence_authority(runner, detail, value)
+    if evidence_after != evidence_before:
+        raise RuntimeError("Gate evidence comment changed before metadata mutation")
     allowed_replacement_key = (
         f"eventra.phase.sha.{before['eventra.repair.repository']}"
         if value.kind == "repair" and value.result == "pass"
@@ -4554,8 +4798,23 @@ def finish_phase(
         or observed_authorities[0] != observed_authorities[1]
     ):
         raise RuntimeError("phase metadata reconciliation failed")
+    evidence_before_status = _finish_gate_evidence_authority(
+        runner,
+        detail,
+        value,
+    )
     if _finish_parent_authority_envelope(runner, detail) != authority_envelope:
         raise RuntimeError("phase authority changed before terminal transition")
+    evidence_after_status_gate = _finish_gate_evidence_authority(
+        runner,
+        detail,
+        value,
+    )
+    if (
+        evidence_before_status != evidence_before
+        or evidence_after_status_gate != evidence_before
+    ):
+        raise RuntimeError("Gate evidence comment changed before terminal transition")
     runner.run(
         [
             "issue",
@@ -4596,6 +4855,22 @@ def finish_phase(
         or final_observations[0][1] != expected_authority
     ):
         raise RuntimeError("phase completion failed")
+    final_evidence_before = _finish_gate_evidence_authority(
+        runner,
+        final_observations[0][0],
+        value,
+    )
+    _finish_parent_authority_envelope(runner, final_observations[0][0])
+    final_evidence_after = _finish_gate_evidence_authority(
+        runner,
+        final_observations[0][0],
+        value,
+    )
+    if (
+        final_evidence_before != evidence_before
+        or final_evidence_after != evidence_before
+    ):
+        raise RuntimeError("Gate evidence comment changed after terminal transition")
     final = final_observations[0][0]
     return PhaseResult(
         str(final["id"]),

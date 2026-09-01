@@ -36,7 +36,12 @@ replacement exact SHA assigned by a current repair child; a prior approval does
 not transfer.
 
 Reread the submitted PR head and reject a moving or mismatched SHA. Post the
-finding record, retain its comment UUID, and use exactly one completion form.
+finding record on the exact Review child Issue before calling `finish-phase`,
+retain its comment UUID, and use exactly one completion form. The comment must
+be authored by this assigned Agent. Workflow logic validates only its identity,
+not its content. A non-PASS URL must have a normalized path ending exactly in
+`/comments/COMMENT_UUID`, with no credentials, port, query, fragment, or path
+traversal.
 
 ### PASS gate completion
 

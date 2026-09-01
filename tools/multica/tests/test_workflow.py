@@ -244,6 +244,9 @@ class FakeSnapshotFinishRunner:
         self.issues = {}
         self.metadata = {}
         self.runs = {}
+        self.evidence_comments = {}
+        self.evidence_reads = {}
+        self.evidence_drift_after_first_read = set()
         for index, item in enumerate(snapshot.children, start=100):
             issue_id = f"01a00000-0000-7000-8000-{index:012d}"
             self.issues[item.issue_key] = raw_issue(
@@ -318,6 +321,19 @@ class FakeSnapshotFinishRunner:
                         }
                     )
             self.metadata[item.issue_key] = metadata
+            if (
+                item.kind in {"review", "qa", "integration_qa"}
+                and item.evidence_comment
+            ):
+                self.evidence_comments[item.issue_key] = [
+                    {
+                        "id": item.evidence_comment,
+                        "issue_id": issue_id,
+                        "author_id": self.issues[item.issue_key]["assignee_id"],
+                        "author_type": "agent",
+                        "content": "accepted transport preview must not be parsed",
+                    }
+                ]
             self.runs[item.issue_key] = (
                 [
                     {
@@ -479,6 +495,16 @@ class FakeSnapshotFinishRunner:
                 "--value",
             )
             return {"ok": True}
+        if call[:3] == ("issue", "comment", "list"):
+            identifier = call[3]
+            records = copy.deepcopy(self.evidence_comments.get(identifier, []))
+            self.evidence_reads[identifier] = self.evidence_reads.get(identifier, 0) + 1
+            if (
+                identifier in self.evidence_drift_after_first_read
+                and self.evidence_reads[identifier] >= 2
+            ):
+                records = []
+            return records
         if call[:2] == ("issue", "runs"):
             return copy.deepcopy(self.runs[call[2]])
         if call[:3] == ("issue", "status", self.target_key):
@@ -555,10 +581,53 @@ class PhaseCompletionTests(unittest.TestCase):
         )
 
     def test_nonpassing_gate_requires_one_canonical_evidence_url(self):
+        comment_uuid = "00000000-0000-4000-8000-000000000031"
         cases = (
             ("missing", {"evidence_comment_url": None}),
             ("HTTP", {"evidence_comment_url": "http://multica.example/comments/31"}),
             ("query", {"evidence_comment_url": "https://multica.example/comments/31?token=x"}),
+            (
+                "credentials",
+                {
+                    "evidence_comment_url": (
+                        f"https://user@multica.example/comments/{comment_uuid}"
+                    )
+                },
+            ),
+            (
+                "port",
+                {
+                    "evidence_comment_url": (
+                        f"https://multica.example:443/comments/{comment_uuid}"
+                    )
+                },
+            ),
+            (
+                "wrong comment",
+                {
+                    "evidence_comment_url": (
+                        "https://multica.example/comments/"
+                        "00000000-0000-4000-8000-000000000099"
+                    )
+                },
+            ),
+            (
+                "path suffix",
+                {
+                    "evidence_comment_url": (
+                        f"https://multica.example/comments/{comment_uuid}/extra"
+                    )
+                },
+            ),
+            (
+                "traversal",
+                {
+                    "evidence_comment_url": (
+                        "https://multica.example/comments/../comments/"
+                        f"{comment_uuid}"
+                    )
+                },
+            ),
             (
                 "PASS",
                 {"result": "pass", "responsible_repositories": ()},
@@ -770,6 +839,7 @@ class PhaseCompletionTests(unittest.TestCase):
             "review",
             result=None,
             status="in_review",
+            evidence_comment="00000000-0000-4000-8000-000000000031",
         )
         qa = phase(
             "PRO-38",
@@ -823,6 +893,16 @@ class PhaseCompletionTests(unittest.TestCase):
             phase("PRO-40", 2, "integration_qa", backend_sha=backend_sha, evidence_comment="00000000-0000-4000-8000-000000000035"),
         )
         completions = (
+            ("PRO-36", PhaseCompletion(
+                "review", "blocked", 0,
+                "00000000-0000-4000-8000-000000000031",
+                FRONTEND_SHA, None, None,
+                ("frontend",),
+                (
+                    "https://multica.example.test/comments/"
+                    "00000000-0000-4000-8000-000000000031"
+                ),
+            )),
             ("PRO-37", PhaseCompletion(
                 "qa", "pass", 0,
                 "00000000-0000-4000-8000-000000000032",
@@ -833,7 +913,20 @@ class PhaseCompletionTests(unittest.TestCase):
                 "00000000-0000-4000-8000-000000000032",
                 FRONTEND_SHA, None, None,
                 ("frontend",),
-                "https://multica.example.test/comments/37",
+                (
+                    "https://multica.example.test/comments/"
+                    "00000000-0000-4000-8000-000000000032"
+                ),
+            )),
+            ("PRO-37", PhaseCompletion(
+                "qa", "blocked", 0,
+                "00000000-0000-4000-8000-000000000032",
+                FRONTEND_SHA, None, None,
+                ("frontend",),
+                (
+                    "https://multica.example.test/comments/"
+                    "00000000-0000-4000-8000-000000000032"
+                ),
             )),
             ("PRO-39", PhaseCompletion(
                 "qa", "pass", 0,
@@ -845,7 +938,10 @@ class PhaseCompletionTests(unittest.TestCase):
                 "00000000-0000-4000-8000-000000000034",
                 None, backend_sha, None,
                 ("backend",),
-                "https://multica.example.test/comments/39",
+                (
+                    "https://multica.example.test/comments/"
+                    "00000000-0000-4000-8000-000000000034"
+                ),
             )),
             ("PRO-40", PhaseCompletion(
                 "integration_qa", "pass", 0,
@@ -857,7 +953,20 @@ class PhaseCompletionTests(unittest.TestCase):
                 "00000000-0000-4000-8000-000000000035",
                 FRONTEND_SHA, backend_sha, None,
                 ("frontend",),
-                "https://multica.example.test/comments/40",
+                (
+                    "https://multica.example.test/comments/"
+                    "00000000-0000-4000-8000-000000000035"
+                ),
+            )),
+            ("PRO-40", PhaseCompletion(
+                "integration_qa", "blocked", 0,
+                "00000000-0000-4000-8000-000000000035",
+                FRONTEND_SHA, backend_sha, None,
+                ("backend",),
+                (
+                    "https://multica.example.test/comments/"
+                    "00000000-0000-4000-8000-000000000035"
+                ),
             )),
         )
         for target_key, completion in completions:
@@ -905,6 +1014,81 @@ class PhaseCompletionTests(unittest.TestCase):
                     finish_phase(runner, target_key, completion).status,
                     "done",
                 )
+
+    def test_finish_gate_requires_stable_child_scoped_evidence_before_mutation(self):
+        review_uuid = "00000000-0000-4000-8000-000000000031"
+        snapshot = parent_snapshot(
+            children=(
+                phase(
+                    "PRO-36", 2, "review", result=None,
+                    status="in_review", evidence_comment=review_uuid,
+                ),
+                phase(
+                    "PRO-37", 2, "qa",
+                    evidence_comment=(
+                        "00000000-0000-4000-8000-000000000032"
+                    ),
+                ),
+            ),
+        )
+        completion = PhaseCompletion(
+            "review", "pass", 0, review_uuid,
+            FRONTEND_SHA, None, None,
+        )
+        for face in (
+            "missing", "foreign issue", "wrong agent", "member author",
+            "duplicate", "between-read deletion",
+        ):
+            with self.subTest(face=face):
+                runner = FakeSnapshotFinishRunner(snapshot, "PRO-36")
+                record = runner.evidence_comments["PRO-36"][0]
+                if face == "missing":
+                    runner.evidence_comments["PRO-36"] = []
+                elif face == "foreign issue":
+                    record["issue_id"] = PARENT_ID
+                elif face == "wrong agent":
+                    record["author_id"] = AGENT_ID
+                elif face == "member author":
+                    record["author_type"] = "member"
+                elif face == "duplicate":
+                    runner.evidence_comments["PRO-36"].append(
+                        copy.deepcopy(record)
+                    )
+                else:
+                    runner.evidence_drift_after_first_read.add("PRO-36")
+
+                with self.assertRaisesRegex(RuntimeError, "evidence comment"):
+                    finish_phase(runner, "PRO-36", completion)
+
+                self.assertEqual(runner.mutation_count, 0)
+
+    def test_terminal_gate_replay_rereads_authoritative_evidence(self):
+        evidence_uuid = "00000000-0000-4000-8000-000000000031"
+        snapshot = parent_snapshot(
+            children=(
+                phase("PRO-36", 2, "review", evidence_comment=evidence_uuid),
+                phase(
+                    "PRO-37", 2, "qa",
+                    evidence_comment=(
+                        "00000000-0000-4000-8000-000000000032"
+                    ),
+                ),
+            ),
+        )
+        runner = FakeSnapshotFinishRunner(snapshot, "PRO-36")
+        runner.evidence_comments["PRO-36"] = []
+
+        with self.assertRaisesRegex(RuntimeError, "evidence comment"):
+            finish_phase(
+                runner,
+                "PRO-36",
+                PhaseCompletion(
+                    "review", "pass", 0, evidence_uuid,
+                    FRONTEND_SHA, None, None,
+                ),
+            )
+
+        self.assertEqual(runner.mutation_count, 0)
 
     def test_finish_phase_requires_and_preserves_current_repair_provenance(self):
         digest = "d" * 64
@@ -3884,6 +4068,9 @@ class FakeWatchRunner:
             ],
             "PRO-36": copy.deepcopy(FakeRecoveryRunner().runs),
         }
+        self.evidence_comments = {}
+        self.evidence_reads = {}
+        self.evidence_drift_after_first_read = set()
         self.calls = []
         self.post_rerun_child_metadata = None
         self.post_rerun_child_detail = None
@@ -3964,6 +4151,16 @@ class FakeWatchRunner:
             }
         if call[:3] == ("issue", "metadata", "list"):
             return copy.deepcopy(self.metadata[call[3]])
+        if call[:3] == ("issue", "comment", "list"):
+            identifier = call[3]
+            records = copy.deepcopy(self.evidence_comments.get(identifier, []))
+            self.evidence_reads[identifier] = self.evidence_reads.get(identifier, 0) + 1
+            if (
+                identifier in self.evidence_drift_after_first_read
+                and self.evidence_reads[identifier] >= 2
+            ):
+                records = []
+            return records
         if call[:2] == ("issue", "runs"):
             return copy.deepcopy(self.runs[call[2]])
         if (
@@ -4036,6 +4233,9 @@ class FakeWatchRunner:
             ],
             **source.runs,
         }
+        self.evidence_comments = copy.deepcopy(source.evidence_comments)
+        self.evidence_reads = {}
+        self.evidence_drift_after_first_read = set()
         self.runs[target_key] = copy.deepcopy(FakeRecoveryRunner().runs)
         for run in self.runs[target_key]:
             run["issue_id"] = str(self.child["id"])
@@ -4310,6 +4510,51 @@ class WatchWorkflowTests(unittest.TestCase):
         runner = FakeWatchRunner()
         runner.install_parent_snapshot(snapshot, "PRO-36")
         return runner
+
+    def test_watcher_terminal_gate_requires_stable_authoritative_evidence(self):
+        for face in ("missing", "foreign issue", "wrong agent", "duplicate", "drift"):
+            with self.subTest(face=face):
+                runner = self._terminal_gate_runner()
+                record = runner.evidence_comments["PRO-36"][0]
+                if face == "missing":
+                    runner.evidence_comments["PRO-36"] = []
+                elif face == "foreign issue":
+                    record["issue_id"] = PARENT_ID
+                elif face == "wrong agent":
+                    record["author_id"] = AGENT_ID
+                elif face == "duplicate":
+                    runner.evidence_comments["PRO-36"].append(
+                        copy.deepcopy(record)
+                    )
+                else:
+                    runner.evidence_drift_after_first_read.add("PRO-36")
+
+                result = self._watch(runner, apply=True)
+
+                self.assertEqual(result, WatchResult(1, 0, 0, "noop"))
+                self.assertFalse(
+                    any(call[:2] == ("issue", "rerun") for call in runner.calls)
+                )
+
+    def test_watcher_terminal_gate_reads_each_comment_without_content_access(self):
+        runner = self._terminal_gate_runner()
+
+        result = self._watch(runner, apply=True)
+
+        self.assertEqual(result.decision, "rerun_parent")
+        for child in runner.children:
+            if child["stage"] != 2:
+                continue
+            key = child["identifier"]
+            evidence_uuid = runner.metadata[key]["eventra.phase.evidence_comment"]
+            self.assertGreaterEqual(runner.evidence_reads[key], 2)
+            self.assertIn(
+                (
+                    "issue", "comment", "list", key, "--thread",
+                    evidence_uuid, "--full", "--summary", "--output", "json",
+                ),
+                runner.calls,
+            )
 
     def test_watcher_parent_rerun_rejects_terminal_implementation_drift(self):
         corruptions = {
@@ -5015,6 +5260,11 @@ class FakeRepairRunner:
             }
         }
         self.comments = []
+        self.evidence_comments = {}
+        self.evidence_reads = {}
+        self.evidence_drift_after_first_read = set()
+        self.parent_drift_after_first_evidence_read = False
+        self.child_drift_after_first_evidence_read = set()
         self.calls = []
         self.runs = {}
         self.next_child_number = 80
@@ -5113,6 +5363,16 @@ class FakeRepairRunner:
             )
         self.children.append(child)
         self.metadata[identifier] = metadata
+        if kind in {"review", "qa", "integration_qa"}:
+            self.evidence_comments[identifier] = [
+                {
+                    "id": comment_uuid,
+                    "issue_id": child["id"],
+                    "author_id": child["assignee_id"],
+                    "author_type": "agent",
+                    "content": "accepted transport preview must not be parsed",
+                }
+            ]
 
     def authorize(self, bundle_digest, *, author_type="member", granted_round=3):
         self.metadata["PRO-65"][
@@ -5207,6 +5467,25 @@ class FakeRepairRunner:
             return value
         if call[:4] == ("issue", "comment", "list", "PRO-65"):
             return copy.deepcopy(self.comments)
+        if call[:3] == ("issue", "comment", "list"):
+            identifier = call[3]
+            records = copy.deepcopy(self.evidence_comments.get(identifier, []))
+            self.evidence_reads[identifier] = self.evidence_reads.get(identifier, 0) + 1
+            if self.evidence_reads[identifier] == 1:
+                if self.parent_drift_after_first_evidence_read:
+                    self.metadata["PRO-65"][
+                        "eventra.workflow.merge_state"
+                    ] = "ready"
+                if identifier in self.child_drift_after_first_evidence_read:
+                    self.metadata[identifier][
+                        "eventra.phase.evidence_comment"
+                    ] = "00000000-0000-4000-8000-000000000099"
+            if (
+                identifier in self.evidence_drift_after_first_read
+                and self.evidence_reads[identifier] >= 2
+            ):
+                records = []
+            return records
         if call[:2] == ("issue", "create"):
             if self.fail_once_create:
                 self.fail_once_create = False
@@ -5329,6 +5608,174 @@ class RepairExecutionTests(unittest.TestCase):
         decision = decide_parent_action(snapshot)
         self.assertEqual(decision.kind, "create_repair_stage")
         return runner, github, decision
+
+    def test_parent_load_requires_stable_child_scoped_gate_evidence(self):
+        cases = (
+            "missing fail",
+            "missing pass",
+            "foreign issue",
+            "wrong agent",
+            "member author",
+            "duplicate",
+            "between-read deletion",
+            "parent metadata drift",
+            "child metadata drift",
+        )
+        for label in cases:
+            with self.subTest(label=label):
+                runner = FakeRepairRunner(attempt=0)
+                reviews = [
+                    child
+                    for child in runner.children
+                    if runner.metadata[child["identifier"]].get(
+                        "eventra.phase.kind"
+                    ) == "review"
+                ]
+                qas = [
+                    child
+                    for child in runner.children
+                    if runner.metadata[child["identifier"]].get(
+                        "eventra.phase.kind"
+                    ) == "qa"
+                ]
+                target = max(
+                    qas if label == "missing pass" else reviews,
+                    key=lambda child: child["stage"],
+                )
+                key = target["identifier"]
+                if label.startswith("missing"):
+                    runner.evidence_comments[key] = []
+                elif label == "foreign issue":
+                    runner.evidence_comments[key][0]["issue_id"] = ISSUE_ID
+                elif label == "wrong agent":
+                    runner.evidence_comments[key][0]["author_id"] = AGENT_ID
+                elif label == "member author":
+                    runner.evidence_comments[key][0]["author_type"] = "member"
+                elif label == "duplicate":
+                    runner.evidence_comments[key].append(
+                        copy.deepcopy(runner.evidence_comments[key][0])
+                    )
+                else:
+                    if label == "between-read deletion":
+                        runner.evidence_drift_after_first_read.add(key)
+                    elif label == "parent metadata drift":
+                        runner.parent_drift_after_first_evidence_read = True
+                    else:
+                        runner.child_drift_after_first_evidence_read.add(key)
+
+                with self.assertRaisesRegex(RuntimeError, "evidence"):
+                    load_parent_snapshot(
+                        runner,
+                        FakeRepairGitHubRunner(),
+                        "PRO-65",
+                    )
+
+                self.assertEqual(runner.mutation_calls, [])
+
+    def test_parent_load_reads_gate_evidence_twice_without_exposing_content(self):
+        runner = FakeRepairRunner(attempt=0)
+
+        snapshot = load_parent_snapshot(
+            runner,
+            FakeRepairGitHubRunner(),
+            "PRO-65",
+        )
+
+        self.assertEqual(decide_parent_action(snapshot).kind, "create_repair_stage")
+        gate_keys = [
+            child["identifier"]
+            for child in runner.children
+            if runner.metadata[child["identifier"]].get("eventra.phase.kind")
+            in {"review", "qa", "integration_qa"}
+        ]
+        self.assertTrue(gate_keys)
+        for key in gate_keys:
+            evidence_uuid = runner.metadata[key]["eventra.phase.evidence_comment"]
+            self.assertEqual(runner.evidence_reads[key], 2)
+            self.assertIn(
+                (
+                    "issue", "comment", "list", key, "--thread",
+                    evidence_uuid, "--full", "--summary", "--output", "json",
+                ),
+                runner.calls,
+            )
+
+    def test_repair_execution_rejects_deleted_source_gate_evidence(self):
+        runner, github, decision = self._planned(attempt=0)
+        review_key = max(
+            (
+                child["identifier"]
+                for child in runner.children
+                if runner.metadata[child["identifier"]].get(
+                    "eventra.phase.kind"
+                ) == "review"
+            ),
+            key=lambda key: next(
+                child["stage"]
+                for child in runner.children
+                if child["identifier"] == key
+            ),
+        )
+        runner.evidence_comments[review_key] = []
+
+        result = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual((result.next_action, result.mutation_count), ("block", 0))
+        self.assertEqual(runner.mutation_calls, [])
+
+    def test_repair_reservation_and_replay_reread_source_gate_evidence(self):
+        for state in ("reserved", "committed"):
+            with self.subTest(state=state):
+                runner, github, decision = self._planned(attempt=0)
+                if state == "reserved":
+                    snapshot = load_parent_snapshot(runner, github, "PRO-65")
+                    runner.metadata["PRO-65"][
+                        workflow_module.REPAIR_RESERVATION_KEY
+                    ] = workflow_module._canonical_json(
+                        _build_repair_reservation(snapshot, decision)
+                    )
+                else:
+                    committed = execute_parent_repair(
+                        runner,
+                        github,
+                        "PRO-65",
+                        expected_action_key=decision.action_key,
+                    )
+                    self.assertEqual(committed.next_action, "repair")
+                review_key = max(
+                    (
+                        child["identifier"]
+                        for child in runner.children
+                        if runner.metadata[child["identifier"]].get(
+                            "eventra.phase.kind"
+                        ) == "review"
+                    ),
+                    key=lambda key: next(
+                        child["stage"]
+                        for child in runner.children
+                        if child["identifier"] == key
+                    ),
+                )
+                runner.evidence_comments[review_key] = []
+                mutations_before = len(runner.mutation_calls)
+
+                result = execute_parent_repair(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+
+                self.assertEqual(
+                    (result.next_action, result.mutation_count),
+                    ("block", 0),
+                )
+                self.assertEqual(len(runner.mutation_calls), mutations_before)
 
     @staticmethod
     def _forge_source_gate_identity(runner, face):

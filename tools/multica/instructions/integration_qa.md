@@ -35,8 +35,13 @@ Delivery Lead uses its exact returned bundle and digest without reconstruction
 to dispatch repair. A passing result applies only to the tested SHA set.
 
 Reread every candidate SHA and test only that immutable set. Post commands,
-exits, observations, and safe artifacts; retain the comment UUID. Use exactly
-one completion form, selected by the handed-off child kind. Never mix a
+exits, observations, and safe artifacts on the exact QA or integration-suite
+child Issue before calling `finish-phase`; retain the comment UUID. The comment
+must be authored by this assigned Agent. Workflow logic validates only its
+identity, not its content. A non-PASS URL must have a normalized path ending
+exactly in `/comments/COMMENT_UUID`, with no credentials, port, query, fragment,
+or path traversal. Use exactly one completion form, selected by the handed-off
+child kind. Never mix a
 repository QA child's kind or single-repository SHA with an integration-suite
 child's kind or full candidate SHA set.
 
