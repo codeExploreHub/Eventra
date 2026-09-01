@@ -1515,6 +1515,33 @@ class ProvisionerTests(unittest.TestCase):
             "*/30 * * * *",
         )
 
+    def test_provisioned_watcher_recovers_only_v2_and_migration_blocks_v1(self):
+        result = self.provisioner.reconcile(
+            self.config,
+            apply=True,
+            backend_env=self.backend_env,
+        )
+        rendered = self.runner.autopilots[result.autopilot_id]["description"]
+        normalized = " ".join(rendered.split())
+
+        self.assertIn(
+            "Workflow contract version `2` is the only recoverable authority.",
+            normalized,
+        )
+        self.assertIn(
+            "Version `1` may be recognized only to report a migration block",
+            normalized,
+        )
+        self.assertIn(
+            "must not cause a rerun or any metadata, status, Stage, or "
+            "action-history write",
+            normalized,
+        )
+        self.assertNotIn(
+            "inspect only those two Projects and workflow contract version `1`",
+            normalized,
+        )
+
     def test_existing_watcher_migrates_in_place_to_operational_agent(self):
         first = self.provisioner.reconcile(
             self.config, apply=True, backend_env=self.backend_env

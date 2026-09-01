@@ -480,6 +480,29 @@ class OperatorDocsTests(unittest.TestCase):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, readme)
 
+    def test_watcher_role_and_deployed_prompt_share_v2_only_recovery_contract(self):
+        instructions = Path("tools/multica/instructions")
+        role = " ".join(
+            (instructions / "workflow_watcher.md").read_text().split()
+        )
+        deployed = " ".join(
+            (instructions / "stalled_work_watcher.md").read_text().split()
+        )
+        for rendered in (role, deployed):
+            self.assertIn(
+                "Workflow contract version `2` is the only recoverable authority.",
+                rendered,
+            )
+            self.assertIn(
+                "Version `1` may be recognized only to report a migration block",
+                rendered,
+            )
+            self.assertIn(
+                "must not cause a rerun or any metadata, status, Stage, or "
+                "action-history write",
+                rendered,
+            )
+
     def test_runbook_documents_independent_watcher_agent(self):
         readme = Path("tools/multica/README.md").read_text()
         normalized = " ".join(readme.split())

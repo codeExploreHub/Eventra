@@ -9,6 +9,10 @@ phase, role, Project, Agent, candidate SHAs, pull request, and authoritative
 creation action must exactly match the current parent assignment. Repair also
 requires its exact immutable source candidate map, FailureBundle digest,
 assigned evidence partition, round, and round-3 authorization when applicable.
+Workflow contract version `2` is the only recoverable authority. Version `1`
+may be recognized only to report a migration block; it is never a recovery
+target and must not cause a rerun or any metadata, status, Stage, or
+action-history write.
 The command's first Project is the sole parent/control Project. The second
 Project is only for backend repository children; a parent in that Project is
 foreign workflow state and is never a recovery target. Backend implementation,
