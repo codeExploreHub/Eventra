@@ -6571,6 +6571,10 @@ class FakeRepairRunner:
         self.lost_ack_once = set()
         self.committed_mutations = 0
         self.drift_reservation_after_parent_metadata_reads = None
+        self.authority_drift_after_status = None
+        self.authority_drift_after_parent_metadata_key = None
+        self.authority_drift_after_parent_delete_key = None
+        self.authority_drift_after_child_metadata_write = None
         self.corrupt_created_title = False
         self.suppress_status_run = False
         self.create_two_active_runs = False
@@ -6722,6 +6726,18 @@ class FakeRepairRunner:
             self.lost_ack_once.remove(match)
             raise RuntimeError("injected lost acknowledgement")
 
+    def _apply_authority_drift(self, kind):
+        if kind == "project":
+            self.parent["project_id"] = BACKEND_PROJECT_ID
+        elif kind == "squad":
+            self.parent["assignee_id"] = FOREIGN_SQUAD_ID
+        elif kind == "lead":
+            self.assignment_squad_detail["leader_id"] = WATCHER_ID
+        elif kind == "members":
+            self.assignment_squad_members = self.assignment_squad_members[:-1]
+        else:
+            raise AssertionError(f"unknown authority drift: {kind!r}")
+
     @staticmethod
     def _flag(args, name):
         return args[args.index(name) + 1]
@@ -6845,12 +6861,21 @@ class FakeRepairRunner:
             if identifier != "PRO-65":
                 self.child_metadata_writes += 1
                 if (
+                    self.authority_drift_after_child_metadata_write
+                    == self.child_metadata_writes
+                ):
+                    self.authority_drift_after_child_metadata_write = None
+                    self._apply_authority_drift("members")
+                if (
                     self.hard_interrupt_after_child_metadata_writes
                     == self.child_metadata_writes
                 ):
                     raise KeyboardInterrupt(
                         "injected hard interruption during child initialization"
                     )
+            elif key == self.authority_drift_after_parent_metadata_key:
+                self.authority_drift_after_parent_metadata_key = None
+                self._apply_authority_drift("members")
             self._maybe_lose_ack(
                 f"set:{identifier}:{key}",
                 f"set-child:{key}" if identifier != "PRO-65" else "",
@@ -6862,6 +6887,9 @@ class FakeRepairRunner:
             if key in self.metadata[identifier]:
                 self.metadata[identifier].pop(key)
                 self.committed_mutations += 1
+            if key == self.authority_drift_after_parent_delete_key:
+                self.authority_drift_after_parent_delete_key = None
+                self._apply_authority_drift("members")
             self._maybe_lose_ack(f"delete:{identifier}:{key}")
             return {"ok": True}
         if call[:2] == ("issue", "status"):
@@ -6894,6 +6922,10 @@ class FakeRepairRunner:
                         duplicate_run = copy.deepcopy(runs[-1])
                         duplicate_run["id"] += "-duplicate"
                         runs.append(duplicate_run)
+            if self.authority_drift_after_status is not None:
+                kind = self.authority_drift_after_status
+                self.authority_drift_after_status = None
+                self._apply_authority_drift(kind)
             self._maybe_lose_ack("status")
             return copy.deepcopy(child)
         if call[:2] == ("issue", "runs"):
@@ -7159,6 +7191,84 @@ class SmokeExecutionTests(unittest.TestCase):
             1,
         )
 
+    def test_smoke_promotion_rechecks_complete_parent_authority_before_parent_writes(self):
+        for drift in ("project", "squad", "lead", "members"):
+            with self.subTest(drift=drift):
+                runner, github, decision = self._planned()
+                original_next_stage = runner.metadata["PRO-65"][
+                    "eventra.workflow.next_stage"
+                ]
+                original_last_action = runner.metadata["PRO-65"][
+                    "eventra.workflow.last_action"
+                ]
+                runner.authority_drift_after_status = drift
+
+                result = execute_parent_smoke(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+
+                status_index = next(
+                    index
+                    for index, call in enumerate(runner.mutation_calls)
+                    if call[:2] == ("issue", "status")
+                )
+                self.assertEqual(result.next_action, "block", result.reason)
+                self.assertEqual(runner.mutation_calls[status_index + 1 :], [])
+                self.assertIn(
+                    workflow_module.SMOKE_RESERVATION_KEY,
+                    runner.metadata["PRO-65"],
+                )
+                self.assertEqual(
+                    runner.metadata["PRO-65"]["eventra.workflow.next_stage"],
+                    original_next_stage,
+                )
+                self.assertEqual(
+                    runner.metadata["PRO-65"]["eventra.workflow.last_action"],
+                    original_last_action,
+                )
+
+    def test_smoke_parent_metadata_mutations_have_authority_gates(self):
+        cases = (
+            ("set", "eventra.workflow.next_stage"),
+            ("set", "eventra.workflow.last_action"),
+            ("delete", workflow_module.SMOKE_RESERVATION_KEY),
+        )
+        for operation, key in cases:
+            with self.subTest(operation=operation, key=key):
+                runner, github, decision = self._planned()
+                if operation == "set":
+                    runner.authority_drift_after_parent_metadata_key = key
+                else:
+                    runner.authority_drift_after_parent_delete_key = key
+
+                result = execute_parent_smoke(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+
+                mutation_index = next(
+                    index
+                    for index, call in enumerate(runner.mutation_calls)
+                    if call[:3] == ("issue", "metadata", operation)
+                    and self._mutation_key(call) == key
+                )
+                self.assertEqual(result.next_action, "block", result.reason)
+                self.assertEqual(runner.mutation_calls[mutation_index + 1 :], [])
+                if operation != "delete":
+                    self.assertIn(
+                        workflow_module.SMOKE_RESERVATION_KEY,
+                        runner.metadata["PRO-65"],
+                    )
+
+    @staticmethod
+    def _mutation_key(call):
+        return call[call.index("--key") + 1]
+
 
 class RepairExecutionTests(unittest.TestCase):
     SOURCE_GATE_FORGERIES = (
@@ -7232,6 +7342,95 @@ class RepairExecutionTests(unittest.TestCase):
                     "eventra.workflow.repair_reservation",
                     runner.metadata["PRO-65"],
                 )
+
+    def test_repair_metadata_prefix_rechecks_configured_parent_authority(self):
+        runner, github, decision = self._planned(attempt=0)
+        runner.authority_drift_after_child_metadata_write = 1
+
+        result = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        child_sets = [
+            call
+            for call in runner.mutation_calls
+            if call[:3] == ("issue", "metadata", "set")
+            and call[3] != "PRO-65"
+        ]
+        self.assertEqual(result.next_action, "block", result.reason)
+        self.assertEqual(len(child_sets), 1)
+        self.assertIn(
+            workflow_module.REPAIR_RESERVATION_KEY,
+            runner.metadata["PRO-65"],
+        )
+
+    def test_repair_promotion_rechecks_complete_parent_authority_before_clear(self):
+        for drift in ("project", "squad", "lead", "members"):
+            with self.subTest(drift=drift):
+                runner, github, decision = self._planned(attempt=0)
+                runner.authority_drift_after_status = drift
+
+                result = execute_parent_repair(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+
+                status_index = next(
+                    index
+                    for index, call in enumerate(runner.mutation_calls)
+                    if call[:2] == ("issue", "status")
+                )
+                self.assertEqual(result.next_action, "block", result.reason)
+                self.assertEqual(runner.mutation_calls[status_index + 1 :], [])
+                self.assertIn(
+                    workflow_module.REPAIR_RESERVATION_KEY,
+                    runner.metadata["PRO-65"],
+                )
+
+    def test_repair_parent_metadata_mutations_have_authority_gates(self):
+        cases = (
+            ("set", "eventra.workflow.attempt"),
+            ("set", "eventra.workflow.next_stage"),
+            ("set", "eventra.workflow.last_action"),
+            ("delete", workflow_module.REPAIR_RESERVATION_KEY),
+        )
+        for operation, key in cases:
+            with self.subTest(operation=operation, key=key):
+                runner, github, decision = self._planned(attempt=0)
+                if operation == "set":
+                    runner.authority_drift_after_parent_metadata_key = key
+                else:
+                    runner.authority_drift_after_parent_delete_key = key
+
+                result = execute_parent_repair(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+
+                mutation_index = next(
+                    index
+                    for index, call in enumerate(runner.mutation_calls)
+                    if call[:3] == ("issue", "metadata", operation)
+                    and self._mutation_key(call) == key
+                )
+                self.assertEqual(result.next_action, "block", result.reason)
+                self.assertEqual(runner.mutation_calls[mutation_index + 1 :], [])
+                if operation != "delete":
+                    self.assertIn(
+                        workflow_module.REPAIR_RESERVATION_KEY,
+                        runner.metadata["PRO-65"],
+                    )
+
+    @staticmethod
+    def _mutation_key(call):
+        return call[call.index("--key") + 1]
 
     def test_empty_reserved_repair_child_converges_in_all_repair_rounds(self):
         for attempt, expected_stage in ((0, 3), (1, 5), (2, 7)):

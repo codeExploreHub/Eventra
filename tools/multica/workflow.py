@@ -3452,6 +3452,56 @@ def _metadata_delete_observed(
     return 1
 
 
+def _read_parent_control_authority(
+    runner: MulticaRunner,
+    parent_key: str,
+) -> tuple[object, ...]:
+    parent = parse_issue_detail(
+        runner.run(["issue", "get", parent_key, "--output", "json"]),
+        parent_key,
+    )
+    raw_metadata = parse_issue_metadata(
+        runner.run(
+            ["issue", "metadata", "list", parent_key, "--output", "json"]
+        )
+    )
+    children = parse_issue_children(
+        runner.run(["issue", "children", parent_key, "--output", "json"]),
+        str(parent["id"]),
+    )
+    assignment_authority = _exact_assignment_authority(runner)
+    if (
+        parent["parent_issue_id"] is not None
+        or parent["stage"] is not None
+        or parent["status"] not in {"in_progress", "in_review"}
+        or _parent_control_detail_problem(parent, assignment_authority) is not None
+    ):
+        raise RuntimeError("parent control authority is conflicting")
+    return parent, raw_metadata, children, assignment_authority
+
+
+def _require_stable_parent_control_authority(
+    runner: MulticaRunner,
+    parent_key: str,
+    *,
+    reservation_key: str,
+    reservation_value: str | None,
+) -> tuple[object, ...]:
+    first = _read_parent_control_authority(runner, parent_key)
+    second = _read_parent_control_authority(runner, parent_key)
+    if first != second:
+        raise RuntimeError("parent control authority changed during read")
+    raw_metadata = first[1]
+    if not isinstance(raw_metadata, dict):
+        raise RuntimeError("parent control metadata is malformed")
+    if reservation_value is None:
+        if reservation_key in raw_metadata:
+            raise RuntimeError("parent reservation clear was not observed")
+    elif raw_metadata.get(reservation_key) != reservation_value:
+        raise RuntimeError("parent reservation authority is conflicting")
+    return first
+
+
 def _repair_child_title(
     reservation: dict[str, object],
     spec: dict[str, object],
@@ -3719,11 +3769,13 @@ def _read_repair_prefix_authority(
         runner.run(["issue", "runs", child_key, "--output", "json"]),
         str(detail["id"]),
     )
+    assignment_authority = _exact_assignment_authority(runner)
     if (
         parent["id"] != parent_id
         or parent["parent_issue_id"] is not None
         or parent["stage"] is not None
         or parent["status"] not in {"in_progress", "in_review"}
+        or _parent_control_detail_problem(parent, assignment_authority) is not None
         or parent_metadata["repair_reservation"] != reservation
         or detail["id"] != child["id"]
         or detail["identifier"] != child["identifier"]
@@ -3748,6 +3800,7 @@ def _read_repair_prefix_authority(
         description,
         child_metadata,
         runs,
+        assignment_authority,
     )
 
 
@@ -4078,6 +4131,26 @@ def _promote_repair_child_observed(
         raise RuntimeError("repair child promotion effect was not observed")
 
 
+def _require_stable_repair_reservation_authority(
+    runner: MulticaRunner,
+    github: GitHubRunner,
+    parent_key: str,
+    reservation: dict[str, object],
+) -> ParentSnapshot:
+    action_key = str(reservation["action_key"])
+    first = load_parent_snapshot(runner, github, parent_key)
+    if first.repair_reservation != reservation:
+        raise RuntimeError("repair reservation authority is conflicting")
+    _validate_repair_reservation(first, reservation, action_key)
+    second = load_parent_snapshot(runner, github, parent_key)
+    if second.repair_reservation != reservation:
+        raise RuntimeError("repair reservation authority is conflicting")
+    _validate_repair_reservation(second, reservation, action_key)
+    if first != second:
+        raise RuntimeError("repair reservation authority changed during read")
+    return first
+
+
 def _commit_reserved_repair(
     runner: MulticaRunner,
     github: GitHubRunner,
@@ -4118,10 +4191,23 @@ def _commit_reserved_repair(
     }
     if authorization_uuid:
         desired[REPAIR_AUTHORIZATION_CONSUMED_KEY] = authorization_uuid
+    reservation_value = _canonical_json(reservation)
     for key, value in desired.items():
         if raw_metadata.get(key, "") != value:
+            _require_stable_parent_control_authority(
+                runner,
+                parent_key,
+                reservation_key=REPAIR_RESERVATION_KEY,
+                reservation_value=reservation_value,
+            )
             observed_effects[0] += _metadata_set_observed(
                 runner, parent_key, key, value
+            )
+            _require_stable_parent_control_authority(
+                runner,
+                parent_key,
+                reservation_key=REPAIR_RESERVATION_KEY,
+                reservation_value=reservation_value,
             )
             raw_metadata[key] = value
     if authorization_uuid:
@@ -4129,10 +4215,22 @@ def _commit_reserved_repair(
         if current_authorization not in {None, authorization_uuid}:
             raise RuntimeError("parent authorization changed during commit")
         if current_authorization == authorization_uuid:
+            _require_stable_parent_control_authority(
+                runner,
+                parent_key,
+                reservation_key=REPAIR_RESERVATION_KEY,
+                reservation_value=reservation_value,
+            )
             observed_effects[0] += _metadata_delete_observed(
                 runner,
                 parent_key,
                 REPAIR_AUTHORIZATION_KEY,
+            )
+            _require_stable_parent_control_authority(
+                runner,
+                parent_key,
+                reservation_key=REPAIR_RESERVATION_KEY,
+                reservation_value=reservation_value,
             )
 
     committed_metadata = parse_issue_metadata(
@@ -4159,12 +4257,27 @@ def _commit_reserved_repair(
         raise RuntimeError("repair children changed before promotion")
     for repository in sorted(children):
         child = children[repository]
+        _require_stable_repair_reservation_authority(
+            runner, github, parent_key, reservation
+        )
         _promote_repair_child_observed(runner, child, observed_effects)
+        _require_stable_repair_reservation_authority(
+            runner, github, parent_key, reservation
+        )
 
+    _require_stable_repair_reservation_authority(
+        runner, github, parent_key, reservation
+    )
     observed_effects[0] += _metadata_delete_observed(
         runner,
         parent_key,
         REPAIR_RESERVATION_KEY,
+    )
+    _require_stable_parent_control_authority(
+        runner,
+        parent_key,
+        reservation_key=REPAIR_RESERVATION_KEY,
+        reservation_value=None,
     )
     final_metadata = parse_issue_metadata(
         runner.run(["issue", "metadata", "list", parent_key, "--output", "json"])
@@ -4779,13 +4892,12 @@ def _read_smoke_reservation_authority(
     )
 
 
-def _resume_smoke_reservation(
+def _require_stable_smoke_reservation_authority(
     runner: MulticaRunner,
     github: GitHubRunner,
     parent_key: str,
     reservation: dict[str, object],
-    effects: list[int],
-) -> SmokeExecutionResult:
+) -> tuple[object, ...]:
     first = _read_smoke_reservation_authority(
         runner, github, parent_key, reservation
     )
@@ -4794,6 +4906,19 @@ def _resume_smoke_reservation(
     )
     if first != second:
         raise RuntimeError("smoke reservation authority changed during read")
+    return first
+
+
+def _resume_smoke_reservation(
+    runner: MulticaRunner,
+    github: GitHubRunner,
+    parent_key: str,
+    reservation: dict[str, object],
+    effects: list[int],
+) -> SmokeExecutionResult:
+    first = _require_stable_smoke_reservation_authority(
+        runner, github, parent_key, reservation
+    )
     if not any(
         item["stage"] == reservation["next_stage"] for item in first[2]
     ):
@@ -4814,14 +4939,9 @@ def _resume_smoke_reservation(
             )
         except RuntimeError:
             pass
-        first = _read_smoke_reservation_authority(
+        first = _require_stable_smoke_reservation_authority(
             runner, github, parent_key, reservation
         )
-        second = _read_smoke_reservation_authority(
-            runner, github, parent_key, reservation
-        )
-        if first != second:
-            raise RuntimeError("smoke child creation authority changed during read")
         created = [
             item for item in first[2]
             if item["stage"] == reservation["next_stage"]
@@ -4838,19 +4958,19 @@ def _resume_smoke_reservation(
     expected_items = sorted(_smoke_child_metadata(reservation).items())
     prefix_length = len(first[4])
     for index in range(prefix_length, len(expected_items)):
-        before = _read_smoke_reservation_authority(
+        before = _require_stable_smoke_reservation_authority(
             runner, github, parent_key, reservation
         )
         if len(before[4]) != index:
             raise RuntimeError("smoke metadata prefix changed before write")
         key, value = expected_items[index]
         effects[0] += _metadata_set_observed(runner, child_key, key, value)
-        after = _read_smoke_reservation_authority(
+        after = _require_stable_smoke_reservation_authority(
             runner, github, parent_key, reservation
         )
         if len(after[4]) != index + 1:
             raise RuntimeError("smoke metadata prefix reconciliation failed")
-    initialized = _read_smoke_reservation_authority(
+    initialized = _require_stable_smoke_reservation_authority(
         runner, github, parent_key, reservation
     )
     detail = parse_issue_detail(initialized[3], child_key)
@@ -4880,15 +5000,32 @@ def _resume_smoke_reservation(
             ) != 1
         ):
             raise RuntimeError("smoke child promotion effect was not observed")
+        _require_stable_smoke_reservation_authority(
+            runner, github, parent_key, reservation
+        )
     desired_parent = {
         "eventra.workflow.next_stage": str(int(reservation["next_stage"]) + 1),
         "eventra.workflow.last_action": str(reservation["action_key"]),
     }
     for key, value in desired_parent.items():
+        _require_stable_smoke_reservation_authority(
+            runner, github, parent_key, reservation
+        )
         effects[0] += _metadata_set_observed(runner, parent_key, key, value)
-    _read_smoke_reservation_authority(runner, github, parent_key, reservation)
+        _require_stable_smoke_reservation_authority(
+            runner, github, parent_key, reservation
+        )
+    _require_stable_smoke_reservation_authority(
+        runner, github, parent_key, reservation
+    )
     effects[0] += _metadata_delete_observed(
         runner, parent_key, SMOKE_RESERVATION_KEY
+    )
+    _require_stable_parent_control_authority(
+        runner,
+        parent_key,
+        reservation_key=SMOKE_RESERVATION_KEY,
+        reservation_value=None,
     )
     final = load_parent_snapshot(runner, github, parent_key)
     current = tuple(
