@@ -9,6 +9,11 @@ phase, role, Project, Agent, candidate SHAs, pull request, and authoritative
 creation action must exactly match the current parent assignment. Repair also
 requires its exact immutable source candidate map, FailureBundle digest,
 assigned evidence partition, round, and round-3 authorization when applicable.
+The command's first Project is the sole parent/control Project. The second
+Project is only for backend repository children; a parent in that Project is
+foreign workflow state and is never a recovery target. Backend implementation,
+review, QA, and repair children remain eligible only when their exact typed
+assignment requires that backend Project.
 Before either child or parent recovery, require the exact provisioned Delivery
 Squad, its exact Delivery Lead leader and five-agent Squad membership: Delivery
 Lead as `leader`, the frontend/backend engineers, Integration QA, and Independent

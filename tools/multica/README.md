@@ -344,6 +344,11 @@ Provisioning reconciles one run-only **Eventra · Stalled Work Watcher** with a
 Projects. It performs at most one verified rerun and is a recovery fallback,
 not a second coordinator.
 
+For `watch`, the first Project is the sole parent/control Project. The second
+Project is only for backend repository children. A parent observed in the
+backend Project is never recoverable; exact backend implementation, review, QA,
+or repair children retain their repository-specific backend Project authority.
+
 The scheduled recovery is assigned to the independent **Eventra Workflow
 Watcher** Agent. It is not a member of `Eventra Local Delivery`, runs with
 concurrency 1 (`--max-concurrent-tasks 1`), and does not receive backend

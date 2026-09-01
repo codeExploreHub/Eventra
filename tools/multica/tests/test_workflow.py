@@ -4148,6 +4148,7 @@ def stalled_workflow(**overrides):
     values["children"] = children
     values["parent"] = parent
     values["project_ids"] = (PROJECT_ID, BACKEND_PROJECT_ID)
+    values["parent_project_id"] = PROJECT_ID
     values["agent_ids"] = (
         ("backend_engineer", BACKEND_AGENT_ID),
         ("frontend_engineer", AGENT_ID),
@@ -4620,7 +4621,7 @@ class FakeWatchRunner:
             }[parent_version]
             issues = (
                 [self.parent]
-                if flags["--project"] == PROJECT_ID
+                if flags["--project"] == self.parent["project_id"]
                 and flags["--status"] == "in_progress"
                 and flags["--metadata"] == expected_filter
                 else []
@@ -4976,6 +4977,20 @@ class WatchWorkflowTests(unittest.TestCase):
         )
         return runner
 
+    def _initial_parent_runner(self):
+        runner = FakeWatchRunner()
+        runner.children = []
+        runner.metadata.pop("PRO-36")
+        runner.runs.pop("PRO-36")
+        runner.metadata["PRO-35"].update(
+            {
+                "eventra.workflow.next_stage": "1",
+                "eventra.workflow.attempt": "0",
+            }
+        )
+        runner.metadata["PRO-35"].pop("eventra.workflow.last_action")
+        return runner
+
     def _terminal_smoke_runner(self):
         snapshot = parent_snapshot(
             merge_state="merged",
@@ -5272,6 +5287,39 @@ class WatchWorkflowTests(unittest.TestCase):
                     )
                 )
 
+    def test_watcher_requires_frontend_control_project_for_every_parent_recovery(self):
+        runners = (
+            FakeWatchRunner(),
+            self._terminal_implementation_runner(),
+            self._initial_parent_runner(),
+        )
+        for runner in runners:
+            with self.subTest(children=len(runner.children)):
+                runner.parent["project_id"] = BACKEND_PROJECT_ID
+
+                result = self._watch(runner, apply=True)
+
+                self.assertEqual(result, WatchResult(1, 0, 0, "noop"))
+                self.assertFalse(
+                    any(call[:2] == ("issue", "rerun") for call in runner.calls)
+                )
+
+    def test_recovery_decision_rejects_missing_or_foreign_parent_project(self):
+        for parent_project_id in (
+            "",
+            "00000000-0000-4000-8000-000000000099",
+        ):
+            with self.subTest(parent_project_id=parent_project_id):
+                snapshot = replace(
+                    stalled_workflow(),
+                    parent_project_id=parent_project_id,
+                )
+
+                decision = decide_recovery(snapshot)
+
+                self.assertEqual(decision.kind, "noop")
+                self.assertIn("Project", decision.reason)
+
     def test_watcher_parent_rerun_rechecks_delivery_squad_after_effect(self):
         corruptions = (
             ({"assignee_id": AGENT_ID, "assignee_type": "agent"}, None),
@@ -5551,13 +5599,19 @@ class WatchWorkflowTests(unittest.TestCase):
                     self._watch(runner, apply=True)
 
     def test_watcher_rejects_post_rerun_parent_project_drift(self):
-        runner = FakeWatchRunner()
-        runner.post_rerun_parent_detail = {
-            "project_id": "00000000-0000-4000-8000-000000000099",
-        }
+        for project_id in (
+            BACKEND_PROJECT_ID,
+            "00000000-0000-4000-8000-000000000099",
+            "",
+        ):
+            with self.subTest(project_id=project_id):
+                runner = FakeWatchRunner()
+                runner.post_rerun_parent_detail = {"project_id": project_id}
 
-        with self.assertRaisesRegex(RuntimeError, "recovery verification failed"):
-            self._watch(runner, apply=True)
+                with self.assertRaisesRegex(
+                    RuntimeError, "recovery verification failed"
+                ):
+                    self._watch(runner, apply=True)
 
     def test_watcher_allows_completion_metadata_on_exact_active_assignment(self):
         runner = FakeWatchRunner()
@@ -5585,7 +5639,7 @@ class WatchWorkflowTests(unittest.TestCase):
 
     def test_watcher_recovers_each_typed_current_gate_assignment(self):
         snapshot = self._cross_stack_gate_snapshot()
-        for target_key in ("PRO-36", "PRO-37", "PRO-40"):
+        for target_key in ("PRO-36", "PRO-37", "PRO-38", "PRO-39", "PRO-40"):
             with self.subTest(target=target_key):
                 runner = FakeWatchRunner()
                 runner.install_parent_snapshot(snapshot, target_key)

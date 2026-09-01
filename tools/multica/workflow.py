@@ -1682,6 +1682,11 @@ def _parent_assignment_problem(snapshot: WorkflowSnapshot) -> str | None:
         )
     )
     if (
+        len(snapshot.project_ids) != 2
+        or snapshot.parent_project_id != snapshot.project_ids[0]
+    ):
+        return "parent control Project authority is conflicting"
+    if (
         not _is_uuid(snapshot.delivery_squad_id)
         or not _is_uuid(snapshot.delivery_lead_id)
         or snapshot.delivery_squad_leader_id != snapshot.delivery_lead_id
@@ -5144,7 +5149,7 @@ def load_workflow_snapshot(
         or (bool(staged) and not current_stage_children)
         or (
             bool(project_ids)
-            and str(parent["project_id"]) not in set(project_ids)
+            and str(parent["project_id"]) != project_ids[0]
         )
         or decoded_parent is None
         or (bool(project_ids) and not assignment_agent_ids)

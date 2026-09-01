@@ -84,6 +84,7 @@ class OperatorDocsTests(unittest.TestCase):
         frontend = rendered["frontend_engineer"]
         backend = rendered["backend_engineer"]
         watcher = rendered["workflow_watcher"]
+        readme = " ".join(Path("tools/multica/README.md").read_text().split())
 
         self.assertIn("wait for every current Gate Stage child to become terminal", lead)
         self.assertIn("exact returned immutable FailureBundle", lead)
@@ -118,6 +119,15 @@ class OperatorDocsTests(unittest.TestCase):
             "exact Delivery Lead leader and five-agent Squad membership",
             watcher,
         )
+        for contract in (watcher, readme):
+            self.assertIn(
+                "first Project is the sole parent/control Project",
+                contract,
+            )
+            self.assertIn(
+                "second Project is only for backend repository children",
+                contract,
+            )
 
         forbidden = (
             "Route failures to the owning implementer",
