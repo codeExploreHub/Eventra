@@ -5260,6 +5260,8 @@ class FakeRepairRunner:
             }
         }
         self.comments = []
+        self.authorization_comment_reads = 0
+        self.authorization_drift_after_first_read = False
         self.evidence_comments = {}
         self.evidence_reads = {}
         self.evidence_drift_after_first_read = set()
@@ -5270,6 +5272,9 @@ class FakeRepairRunner:
         self.next_child_number = 80
         self.fail_once_parent_key = None
         self.fail_once_create = False
+        self.hard_interrupt_after_create = False
+        self.hard_interrupt_after_child_metadata_writes = None
+        self.child_metadata_writes = 0
         self.lost_ack_once = set()
         self.committed_mutations = 0
         self.drift_reservation_after_parent_metadata_reads = None
@@ -5466,6 +5471,12 @@ class FakeRepairRunner:
                     self.drift_reservation_after_parent_metadata_reads = None
             return value
         if call[:4] == ("issue", "comment", "list", "PRO-65"):
+            self.authorization_comment_reads += 1
+            if (
+                self.authorization_drift_after_first_read
+                and self.authorization_comment_reads >= 2
+            ):
+                return []
             return copy.deepcopy(self.comments)
         if call[:3] == ("issue", "comment", "list"):
             identifier = call[3]
@@ -5508,6 +5519,8 @@ class FakeRepairRunner:
             self.metadata[identifier] = {}
             self.runs[identifier] = []
             self.committed_mutations += 1
+            if self.hard_interrupt_after_create:
+                raise KeyboardInterrupt("injected hard interruption after create")
             self._maybe_lose_ack("create")
             return copy.deepcopy(child)
         if call[:3] == ("issue", "metadata", "set"):
@@ -5520,6 +5533,15 @@ class FakeRepairRunner:
             if self.metadata[identifier].get(key) != value:
                 self.metadata[identifier][key] = value
                 self.committed_mutations += 1
+            if identifier != "PRO-65":
+                self.child_metadata_writes += 1
+                if (
+                    self.hard_interrupt_after_child_metadata_writes
+                    == self.child_metadata_writes
+                ):
+                    raise KeyboardInterrupt(
+                        "injected hard interruption during child initialization"
+                    )
             self._maybe_lose_ack(
                 f"set:{identifier}:{key}",
                 f"set-child:{key}" if identifier != "PRO-65" else "",
@@ -5593,6 +5615,268 @@ class RepairExecutionTests(unittest.TestCase):
         self.assertEqual(args.command, "execute-parent-repair")
         self.assertEqual(args.parent, "PRO-65")
         self.assertTrue(args.expected_action_key.startswith("2:PRO-65:"))
+
+    def test_reserved_repair_child_metadata_prefixes_converge_without_duplicates(self):
+        for persisted_key_count in range(15):
+            with self.subTest(persisted_key_count=persisted_key_count):
+                runner, github, decision = self._planned(attempt=0)
+                if persisted_key_count == 0:
+                    runner.hard_interrupt_after_create = True
+                else:
+                    runner.hard_interrupt_after_child_metadata_writes = (
+                        persisted_key_count
+                    )
+
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt,
+                    "injected hard interruption",
+                ):
+                    execute_parent_repair(
+                        runner,
+                        github,
+                        "PRO-65",
+                        expected_action_key=decision.action_key,
+                    )
+
+                runner.hard_interrupt_after_create = False
+                runner.hard_interrupt_after_child_metadata_writes = None
+                committed_before_retry = runner.committed_mutations
+                retry = execute_parent_repair(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+                repair_children = [
+                    child
+                    for child in runner.children
+                    if child["stage"] == 3
+                ]
+
+                self.assertEqual(retry.next_action, "repair", retry.reason)
+                self.assertEqual(len(repair_children), 1)
+                self.assertEqual(repair_children[0]["status"], "todo")
+                self.assertEqual(
+                    retry.mutation_count,
+                    runner.committed_mutations - committed_before_retry,
+                )
+                self.assertNotIn(
+                    "eventra.workflow.repair_reservation",
+                    runner.metadata["PRO-65"],
+                )
+
+    def test_empty_reserved_repair_child_converges_in_all_repair_rounds(self):
+        for attempt, expected_stage in ((0, 3), (1, 5), (2, 7)):
+            with self.subTest(attempt=attempt):
+                runner, github, decision = self._planned(attempt=attempt)
+                runner.hard_interrupt_after_create = True
+
+                with self.assertRaises(KeyboardInterrupt):
+                    execute_parent_repair(
+                        runner,
+                        github,
+                        "PRO-65",
+                        expected_action_key=decision.action_key,
+                    )
+
+                runner.hard_interrupt_after_create = False
+                retry = execute_parent_repair(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+                repair_children = [
+                    child
+                    for child in runner.children
+                    if child["stage"] == expected_stage
+                ]
+
+                self.assertEqual(retry.next_action, "repair", retry.reason)
+                self.assertEqual(len(repair_children), 1)
+
+    def test_quarantined_repair_child_conflicts_never_overwrite_or_duplicate(self):
+        cases = (
+            "extra metadata",
+            "conflicting prefix",
+            "wrong title",
+            "wrong project",
+            "active status",
+            "existing run",
+            "duplicate child",
+        )
+        for label in cases:
+            with self.subTest(label=label):
+                runner, github, decision = self._planned(attempt=0)
+                runner.hard_interrupt_after_create = True
+                with self.assertRaises(KeyboardInterrupt):
+                    execute_parent_repair(
+                        runner,
+                        github,
+                        "PRO-65",
+                        expected_action_key=decision.action_key,
+                    )
+                runner.hard_interrupt_after_create = False
+                child = next(item for item in runner.children if item["stage"] == 3)
+                key = child["identifier"]
+                if label == "extra metadata":
+                    runner.metadata[key]["manual.unbound"] = "value"
+                elif label == "conflicting prefix":
+                    runner.metadata[key]["eventra.phase.attempt"] = "99"
+                elif label == "wrong title":
+                    child["title"] = "foreign repair"
+                elif label == "wrong project":
+                    child["project_id"] = BACKEND_PROJECT_ID
+                elif label == "active status":
+                    child["status"] = "todo"
+                elif label == "existing run":
+                    runner.runs[key] = [
+                        {
+                            "id": "foreign-run",
+                            "issue_id": child["id"],
+                            "status": "queued",
+                            "created_at": "2026-08-25T09:00:00Z",
+                            "dispatched_at": None,
+                            "started_at": None,
+                            "completed_at": None,
+                        }
+                    ]
+                else:
+                    duplicate = copy.deepcopy(child)
+                    duplicate["identifier"] = "PRO-999"
+                    duplicate["id"] = "01a00000-0000-7000-8000-000000000999"
+                    runner.children.append(duplicate)
+                    runner.metadata["PRO-999"] = {}
+                    runner.runs["PRO-999"] = []
+                committed_before_retry = runner.committed_mutations
+
+                retry = execute_parent_repair(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+
+                self.assertEqual(retry.next_action, "block", retry.reason)
+                self.assertEqual(retry.mutation_count, 0)
+                self.assertEqual(runner.committed_mutations, committed_before_retry)
+
+    def test_multiowner_quarantine_recovers_full_and_prefix_children(self):
+        runner, github, decision, _ = (
+            self._planned_cross_stack_integration_failure(attempt=0)
+        )
+        runner.hard_interrupt_after_child_metadata_writes = 19
+        with self.assertRaises(KeyboardInterrupt):
+            execute_parent_repair(
+                runner,
+                github,
+                "PRO-65",
+                expected_action_key=decision.action_key,
+            )
+        runner.hard_interrupt_after_child_metadata_writes = None
+        committed_before_retry = runner.committed_mutations
+
+        retry = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+        repair_children = [
+            child for child in runner.children if child["stage"] == 3
+        ]
+
+        self.assertEqual(retry.next_action, "repair", retry.reason)
+        self.assertEqual(len(repair_children), 2)
+        self.assertEqual(
+            {runner.metadata[item["identifier"]]["eventra.repair.repository"]
+             for item in repair_children},
+            {"backend", "frontend"},
+        )
+        self.assertEqual(
+            retry.mutation_count,
+            runner.committed_mutations - committed_before_retry,
+        )
+
+    def test_quarantine_retry_rechecks_parent_gate_and_round3_comment_authority(self):
+        cases = ("parent reservation drift", "gate evidence deleted", "round3 auth drift")
+        for label in cases:
+            with self.subTest(label=label):
+                attempt = 2 if label == "round3 auth drift" else 0
+                runner, github, decision = self._planned(attempt=attempt)
+                runner.hard_interrupt_after_create = True
+                with self.assertRaises(KeyboardInterrupt):
+                    execute_parent_repair(
+                        runner,
+                        github,
+                        "PRO-65",
+                        expected_action_key=decision.action_key,
+                    )
+                runner.hard_interrupt_after_create = False
+                if label == "parent reservation drift":
+                    runner.drift_reservation_after_parent_metadata_reads = 1
+                elif label == "gate evidence deleted":
+                    source = next(
+                        child
+                        for child in runner.children
+                        if child["stage"] == 2
+                        and runner.metadata[child["identifier"]][
+                            "eventra.phase.kind"
+                        ] == "review"
+                    )
+                    runner.evidence_comments[source["identifier"]] = []
+                else:
+                    runner.authorization_comment_reads = 0
+                    runner.authorization_drift_after_first_read = True
+                committed_before_retry = runner.committed_mutations
+
+                retry = execute_parent_repair(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+
+                self.assertEqual(retry.next_action, "block", retry.reason)
+                self.assertEqual(retry.mutation_count, 0)
+                self.assertEqual(runner.committed_mutations, committed_before_retry)
+
+    def test_quarantine_can_be_interrupted_repeatedly_and_remains_decision_inert(self):
+        runner, github, decision = self._planned(attempt=1)
+        runner.hard_interrupt_after_create = True
+        with self.assertRaises(KeyboardInterrupt):
+            execute_parent_repair(
+                runner,
+                github,
+                "PRO-65",
+                expected_action_key=decision.action_key,
+            )
+        runner.hard_interrupt_after_create = False
+        runner.hard_interrupt_after_child_metadata_writes = 4
+        with self.assertRaises(KeyboardInterrupt):
+            execute_parent_repair(
+                runner,
+                github,
+                "PRO-65",
+                expected_action_key=decision.action_key,
+            )
+        runner.hard_interrupt_after_child_metadata_writes = None
+
+        snapshot = load_parent_snapshot(runner, github, "PRO-65")
+        blocked = decide_parent_action(snapshot)
+        retry = execute_parent_repair(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(snapshot.children[-1].stage, 4)
+        self.assertEqual(len(snapshot.quarantined_repair_children), 1)
+        self.assertEqual(blocked.kind, "block_parent")
+        self.assertIn("reservation", blocked.reason)
+        self.assertEqual(retry.next_action, "repair", retry.reason)
+        self.assertEqual(len([item for item in runner.children if item["stage"] == 5]), 1)
 
     def _planned(self, *, attempt=2):
         runner = FakeRepairRunner(attempt=attempt)

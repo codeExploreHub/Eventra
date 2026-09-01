@@ -154,8 +154,12 @@ deterministic repair handoff has been persisted and reread; that handoff binds
 parent/action/bundle, source and next Stage, candidate and rejected SHAs,
 managed PR, source children, and assigned canonical evidence. `mutation_count`
 reports authoritatively observed effects, including a committed effect after a
-lost acknowledgement. Conflicting or partial state blocks visibly; exact
-retries resume or no-op. This Eventra adapter relies on a single serialized Delivery
+lost acknowledgement. An exact reserved backlog child interrupted during its
+canonical metadata writes is quarantined from Stage fan-in; retry verifies the
+immutable issue identity, no-run state, source evidence/authorization, and exact
+sorted prefix before writing only the missing suffix. Extra or conflicting
+metadata is never overwritten. Other conflicting or partial state blocks
+visibly; exact retries resume or no-op. This Eventra adapter relies on a single serialized Delivery
 Lead (`max_concurrent_tasks=1`) and is not generic CAS or transaction safety.
 
 The rejected source map remains immutable across execution and replay. A

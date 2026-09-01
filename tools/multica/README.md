@@ -264,7 +264,13 @@ and next Stage, candidate and rejected SHAs, managed PR, source children, and
 assigned canonical evidence. The reservation is cleared last. `mutation_count`
 reports authoritatively observed effects, including committed effects after a
 lost acknowledgement. Exact retries resume or no-op, while conflicts and
-partial mismatches block visibly.
+partial mismatches block visibly. If the process stops after an exact reserved
+backlog child is created but before all canonical metadata is written, retry
+quarantines that child from Stage fan-in, verifies its immutable issue identity,
+empty run set, current reservation, source evidence, authorization, and exact
+sorted metadata prefix, then writes only the missing suffix. Conflicting or
+extra metadata is never overwritten. This recovery relies on the same single
+serialized Delivery Lead boundary; it does not add CAS semantics.
 
 A version-2 repair PASS must replace its owned rejected SHA; an unchanged SHA
 is not a successful repair. `finish-phase` may change only that child's owned

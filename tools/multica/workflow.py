@@ -173,6 +173,13 @@ class AuthorizingComment:
 
 
 @dataclass(frozen=True)
+class QuarantinedRepairChild:
+    issue_key: str
+    repository: str
+    metadata_prefix_length: int
+
+
+@dataclass(frozen=True)
 class ParentSnapshot:
     identifier: str
     classification: str
@@ -191,6 +198,7 @@ class ParentSnapshot:
     authorizing_comment: AuthorizingComment | None = None
     repair_reservation: dict[str, object] | None = None
     parent_id: str = ""
+    quarantined_repair_children: tuple[QuarantinedRepairChild, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2560,6 +2568,7 @@ def load_parent_snapshot(
         str(parent["id"]),
     )
     phases: list[PhaseSnapshot] = []
+    quarantined: list[QuarantinedRepairChild] = []
     child_metadata_by_key: dict[str, dict[str, str]] = {}
     pr_candidates: dict[str, tuple[int, str]] = {}
     for child in children:
@@ -2574,6 +2583,18 @@ def load_parent_snapshot(
             )
         )
         child_metadata_by_key[str(child["identifier"])] = child_metadata
+        reservation = metadata["repair_reservation"]
+        if reservation is not None:
+            incomplete = _quarantined_repair_child(
+                runner,
+                str(parent["id"]),
+                child,
+                child_metadata,
+                reservation,
+            )
+            if incomplete is not None:
+                quarantined.append(incomplete)
+                continue
         phases.append(_phase_snapshot(child, child_metadata))
         pr_url = child_metadata.get("eventra.phase.pr")
         if pr_url is not None:
@@ -2584,6 +2605,20 @@ def load_parent_snapshot(
                 pr_candidates[repository] = candidate
             elif candidate[0] == previous[0] and candidate[1] != previous[1]:
                 raise RuntimeError("conflicting phase pull requests")
+
+    reservation = metadata["repair_reservation"]
+    if reservation is not None and quarantined:
+        reserved_repositories = [item.repository for item in quarantined]
+        reserved_repositories.extend(
+            item.repair_repository
+            for item in phases
+            if item.stage == reservation["next_stage"] and item.kind == "repair"
+        )
+        if (
+            any(repository not in REPAIR_ASSIGNEES for repository in reserved_repositories)
+            or len(reserved_repositories) != len(set(reserved_repositories))
+        ):
+            raise RuntimeError("repair reservation has ambiguous child effects")
 
     evidence_before = _read_gate_evidence_set(runner, children, phases)
     if evidence_before:
@@ -2624,6 +2659,7 @@ def load_parent_snapshot(
             or stable_child_metadata != child_metadata_by_key
         ):
             raise RuntimeError("Gate evidence parent authority changed")
+        quarantined_keys = {item.issue_key for item in quarantined}
         stable_phases = tuple(
             _phase_snapshot(
                 child,
@@ -2631,6 +2667,7 @@ def load_parent_snapshot(
             )
             for child in stable_children
             if child["stage"] is not None
+            and str(child["identifier"]) not in quarantined_keys
         )
         evidence_after = _read_gate_evidence_set(
             runner,
@@ -2639,6 +2676,32 @@ def load_parent_snapshot(
         )
         if evidence_after != evidence_before:
             raise RuntimeError("Gate evidence comment changed during read")
+
+    if quarantined and authorization_comment_uuid:
+        stable_raw_comment = parse_authorizing_comment(
+            runner.run(
+                [
+                    "issue",
+                    "comment",
+                    "list",
+                    parent_key,
+                    "--thread",
+                    authorization_comment_uuid,
+                    "--full",
+                    "--compact",
+                    "--output",
+                    "json",
+                ]
+            ),
+            authorization_comment_uuid,
+        )
+        stable_authorizing_comment = AuthorizingComment(
+            comment_uuid=stable_raw_comment["comment_uuid"],
+            author_type=stable_raw_comment["author_type"],
+            content=stable_raw_comment["content"],
+        )
+        if stable_authorizing_comment != authorizing_comment:
+            raise RuntimeError("repair authorization changed during recovery read")
 
     pull_requests = []
     for repository, (_, url) in sorted(pr_candidates.items()):
@@ -2650,7 +2713,7 @@ def load_parent_snapshot(
             ]
         )
         pull_requests.append(_parse_pull_request(raw, url, repository))
-    return ParentSnapshot(
+    snapshot = ParentSnapshot(
         identifier=parent_key,
         classification=str(metadata["classification"]),
         attempt=int(metadata["attempt"]),
@@ -2670,7 +2733,17 @@ def load_parent_snapshot(
         authorizing_comment=authorizing_comment,
         repair_reservation=metadata["repair_reservation"],
         parent_id=str(parent["id"]),
+        quarantined_repair_children=tuple(quarantined),
     )
+    if quarantined:
+        if snapshot.repair_reservation is None:
+            raise RuntimeError("quarantined repair child lacks a reservation")
+        _validate_repair_reservation(
+            snapshot,
+            snapshot.repair_reservation,
+            str(snapshot.repair_reservation["action_key"]),
+        )
+    return snapshot
 
 
 def _repair_child_specs(
@@ -3130,6 +3203,215 @@ def _repair_issue_detail(
     return detail, title, description
 
 
+def _repair_metadata_prefix_length(
+    metadata: dict[str, str],
+    expected: dict[str, str],
+) -> int | None:
+    ordered = sorted(expected.items())
+    for length in range(len(ordered)):
+        if metadata == dict(ordered[:length]):
+            return length
+    return None
+
+
+def _quarantined_repair_child(
+    runner: MulticaRunner,
+    parent_id: str,
+    child: dict[str, object],
+    metadata: dict[str, str],
+    reservation: dict[str, object],
+) -> QuarantinedRepairChild | None:
+    if child["stage"] != reservation["next_stage"]:
+        return None
+    matches: list[tuple[dict[str, object], int]] = []
+    for spec in reservation["child_specs"]:
+        expected = _repair_child_metadata(reservation, spec)
+        prefix_length = _repair_metadata_prefix_length(metadata, expected)
+        if prefix_length is not None:
+            matches.append((spec, prefix_length))
+    if not matches:
+        return None
+    detail, title, description = _repair_issue_detail(
+        runner, str(child["identifier"])
+    )
+    exact_matches = [
+        (spec, prefix_length)
+        for spec, prefix_length in matches
+        if (
+            detail["id"] == child["id"]
+            and detail["identifier"] == child["identifier"]
+            and detail["parent_issue_id"] == parent_id
+            and detail["stage"] == reservation["next_stage"]
+            and detail["status"] == "backlog"
+            and detail["project_id"] == spec["project_id"]
+            and detail["assignee_id"] == spec["assignee_id"]
+            and detail["assignee_type"] == "agent"
+            and title == _repair_child_title(reservation, spec)
+            and description == _render_repair_handoff(reservation, spec)
+        )
+    ]
+    if len(exact_matches) != 1:
+        return None
+    issue_id = str(detail["id"])
+    runs = parse_issue_runs(
+        runner.run(
+            ["issue", "runs", str(child["identifier"]), "--output", "json"]
+        ),
+        issue_id,
+    )
+    if runs:
+        return None
+    spec, prefix_length = exact_matches[0]
+    return QuarantinedRepairChild(
+        issue_key=str(child["identifier"]),
+        repository=str(spec["repository"]),
+        metadata_prefix_length=prefix_length,
+    )
+
+
+def _read_repair_prefix_authority(
+    runner: MulticaRunner,
+    parent_key: str,
+    parent_id: str,
+    reservation: dict[str, object],
+    spec: dict[str, object],
+    child_key: str,
+    prefix_length: int,
+) -> tuple[object, ...]:
+    parent = parse_issue_detail(
+        runner.run(["issue", "get", parent_key, "--output", "json"]),
+        parent_key,
+    )
+    parent_metadata = _parent_metadata(
+        parse_issue_metadata(
+            runner.run(
+                ["issue", "metadata", "list", parent_key, "--output", "json"]
+            )
+        )
+    )
+    children = parse_issue_children(
+        runner.run(["issue", "children", parent_key, "--output", "json"]),
+        parent_id,
+    )
+    matching = [
+        item for item in children if str(item["identifier"]) == child_key
+    ]
+    if len(matching) != 1:
+        raise RuntimeError("quarantined repair child identity changed")
+    child = matching[0]
+    detail, title, description = _repair_issue_detail(runner, child_key)
+    child_metadata = parse_issue_metadata(
+        runner.run(
+            ["issue", "metadata", "list", child_key, "--output", "json"]
+        )
+    )
+    expected_metadata = _repair_child_metadata(reservation, spec)
+    expected_prefix = dict(sorted(expected_metadata.items())[:prefix_length])
+    runs = parse_issue_runs(
+        runner.run(["issue", "runs", child_key, "--output", "json"]),
+        str(detail["id"]),
+    )
+    if (
+        parent["id"] != parent_id
+        or parent["parent_issue_id"] is not None
+        or parent["stage"] is not None
+        or parent["status"] not in {"in_progress", "in_review"}
+        or parent_metadata["repair_reservation"] != reservation
+        or detail["id"] != child["id"]
+        or detail["identifier"] != child["identifier"]
+        or detail["parent_issue_id"] != parent_id
+        or detail["stage"] != reservation["next_stage"]
+        or detail["status"] != "backlog"
+        or detail["project_id"] != spec["project_id"]
+        or detail["assignee_id"] != spec["assignee_id"]
+        or detail["assignee_type"] != "agent"
+        or title != _repair_child_title(reservation, spec)
+        or description != _render_repair_handoff(reservation, spec)
+        or child_metadata != expected_prefix
+        or runs
+    ):
+        raise RuntimeError("quarantined repair child authority changed")
+    return (
+        parent,
+        parent_metadata,
+        children,
+        detail,
+        title,
+        description,
+        child_metadata,
+        runs,
+    )
+
+
+def _require_stable_repair_prefix_authority(
+    runner: MulticaRunner,
+    parent_key: str,
+    parent_id: str,
+    reservation: dict[str, object],
+    spec: dict[str, object],
+    child_key: str,
+    prefix_length: int,
+) -> None:
+    first = _read_repair_prefix_authority(
+        runner,
+        parent_key,
+        parent_id,
+        reservation,
+        spec,
+        child_key,
+        prefix_length,
+    )
+    second = _read_repair_prefix_authority(
+        runner,
+        parent_key,
+        parent_id,
+        reservation,
+        spec,
+        child_key,
+        prefix_length,
+    )
+    if first != second:
+        raise RuntimeError("quarantined repair child authority changed during read")
+
+
+def _initialize_reserved_repair_child(
+    runner: MulticaRunner,
+    parent_key: str,
+    parent_id: str,
+    reservation: dict[str, object],
+    spec: dict[str, object],
+    child_key: str,
+    prefix_length: int,
+    observed_effects: list[int],
+) -> None:
+    expected_items = sorted(_repair_child_metadata(reservation, spec).items())
+    if prefix_length < 0 or prefix_length > len(expected_items):
+        raise RuntimeError("invalid repair child metadata prefix")
+    for index in range(prefix_length, len(expected_items)):
+        _require_stable_repair_prefix_authority(
+            runner,
+            parent_key,
+            parent_id,
+            reservation,
+            spec,
+            child_key,
+            index,
+        )
+        key, value = expected_items[index]
+        observed_effects[0] += _metadata_set_observed(
+            runner, child_key, key, value
+        )
+        _require_stable_repair_prefix_authority(
+            runner,
+            parent_key,
+            parent_id,
+            reservation,
+            spec,
+            child_key,
+            index + 1,
+        )
+
+
 def _repair_children_for_reservation(
     runner: MulticaRunner,
     snapshot: ParentSnapshot,
@@ -3213,9 +3495,25 @@ def _create_reserved_repair_children(
         raise RuntimeError("authoritative repair reservation changed before child creation")
     _validate_repair_reservation(snapshot, reservation, str(reservation["action_key"]))
     observed = _repair_children_for_reservation(runner, snapshot, reservation)
+    quarantined = {
+        item.repository: item for item in snapshot.quarantined_repair_children
+    }
     for spec in reservation["child_specs"]:
         repository = str(spec["repository"])
         if repository in observed:
+            continue
+        if repository in quarantined:
+            incomplete = quarantined[repository]
+            _initialize_reserved_repair_child(
+                runner,
+                parent_key,
+                snapshot.parent_id,
+                reservation,
+                spec,
+                incomplete.issue_key,
+                incomplete.metadata_prefix_length,
+                observed_effects,
+            )
             continue
         before_children = parse_issue_children(
             runner.run(["issue", "children", parent_key, "--output", "json"]),
@@ -3265,10 +3563,16 @@ def _create_reserved_repair_children(
             or observed_description != description
         ):
             raise RuntimeError("repair child creation persistence conflicts")
-        for key, value in sorted(_repair_child_metadata(reservation, spec).items()):
-            observed_effects[0] += _metadata_set_observed(
-                runner, child_key, key, value
-            )
+        _initialize_reserved_repair_child(
+            runner,
+            parent_key,
+            snapshot.parent_id,
+            reservation,
+            spec,
+            child_key,
+            0,
+            observed_effects,
+        )
         detail, observed_title, observed_description = _repair_issue_detail(
             runner, child_key
         )

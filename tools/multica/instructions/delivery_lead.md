@@ -117,8 +117,12 @@ next barrier group, then advance `next_stage` and record `last_action`.
   canonical evidence). It clears the reservation last. `mutation_count` reports
   authoritatively observed effects, including a committed effect whose command
   acknowledgement was lost. A retry may resume only that exact reservation/action.
-  Conflicts, partial provenance, duplicate owner children, or head drift block
-  visibly. This local adapter depends on a single serialized Delivery Lead
+  An exact reserved backlog child interrupted during canonical metadata setup is
+  quarantined from Stage fan-in; retry verifies its immutable issue identity,
+  empty run set, source evidence/authorization, and exact sorted metadata prefix,
+  then writes only the missing suffix. Extra/conflicting metadata, duplicate
+  owner children, or head drift block without overwrite. This local adapter
+  depends on a single serialized Delivery Lead
   (`max_concurrent_tasks=1`); it is not generic CAS or transaction safety.
   Automatic repair rounds are exactly 1 and 2.
   A repair PASS must record a real replacement commit for its one owned
