@@ -186,6 +186,9 @@ class FakeWorkflowRunner:
         self.drift_child_before_status = False
         self.drift_post_done_metadata = False
         self.drift_post_done_detail = False
+        self.after_metadata_set_number = None
+        self.after_metadata_set = None
+        self._metadata_sets = 0
         self._post_write_metadata_reads = 0
         self._post_done_metadata_reads = 0
         self._post_done_detail_reads = 0
@@ -296,6 +299,12 @@ class FakeWorkflowRunner:
             if key == self.fail_metadata_key:
                 raise RuntimeError("Multica command failed with exit 1")
             self.metadata[key] = call[7]
+            self._metadata_sets += 1
+            if (
+                self.after_metadata_set_number == self._metadata_sets
+                and self.after_metadata_set is not None
+            ):
+                self.after_metadata_set(self)
             return {"ignored": "mutation acknowledgement"}
         if call == (
             "issue", "status", "PRO-36", "done", "--no-start", "--output", "json"
@@ -347,6 +356,9 @@ class FakeSnapshotFinishRunner:
         self.assignment_drift_after_first_read = False
         self.post_status_parent_updates = None
         self.post_status_squad_members = None
+        self.after_metadata_set_number = None
+        self.after_metadata_set = None
+        self._metadata_sets = 0
         for index, item in enumerate(snapshot.children, start=100):
             issue_id = f"01a00000-0000-7000-8000-{index:012d}"
             self.issues[item.issue_key] = raw_issue(
@@ -618,6 +630,12 @@ class FakeSnapshotFinishRunner:
                 args,
                 "--value",
             )
+            self._metadata_sets += 1
+            if (
+                self.after_metadata_set_number == self._metadata_sets
+                and self.after_metadata_set is not None
+            ):
+                self.after_metadata_set(self)
             return {"ok": True}
         if call[:3] == ("issue", "comment", "list"):
             identifier = call[3]
@@ -995,6 +1013,93 @@ class PhaseCompletionTests(unittest.TestCase):
                     self.assertNotEqual(runner.issue["status"], "done")
                 else:
                     self.assertEqual(len(status_calls), 1)
+
+    def test_finish_phase_rechecks_parent_authority_after_every_metadata_write(self):
+        for boundary in range(1, 9):
+            with self.subTest(boundary=boundary):
+                runner = FakeWorkflowRunner()
+                runner.after_metadata_set_number = boundary
+                runner.after_metadata_set = lambda current: current.parent.__setitem__(
+                    "project_id",
+                    BACKEND_PROJECT_ID,
+                )
+
+                with self.assertRaises(RuntimeError):
+                    finish_phase(runner, "PRO-36", implementation_completion())
+
+                metadata_sets = tuple(
+                    call
+                    for call in runner.calls
+                    if call[:3] == ("issue", "metadata", "set")
+                )
+                self.assertEqual(len(metadata_sets), boundary)
+                self.assertFalse(
+                    any(call[:2] == ("issue", "status") for call in runner.calls)
+                )
+                self.assertNotEqual(runner.issue["status"], "done")
+
+    def test_finish_phase_stops_after_evidence_or_assignment_authority_drifts(self):
+        review = phase(
+            "PRO-36",
+            2,
+            "review",
+            result=None,
+            status="in_review",
+            evidence_comment="00000000-0000-4000-8000-000000000031",
+        )
+        qa = phase(
+            "PRO-38",
+            2,
+            "qa",
+            evidence_comment="00000000-0000-4000-8000-000000000032",
+        )
+        snapshot = parent_snapshot(children=(review, qa))
+        completion = PhaseCompletion(
+            "review",
+            "pass",
+            0,
+            "00000000-0000-4000-8000-000000000031",
+            FRONTEND_SHA,
+            None,
+            None,
+        )
+        corruptions = {
+            "evidence comment": lambda runner: runner.evidence_comments.__setitem__(
+                "PRO-36",
+                [],
+            ),
+            "configured reviewer": lambda runner: runner.assignment_agents[4].__setitem__(
+                "id",
+                "00000000-0000-4000-8000-000000000099",
+            ),
+            "squad leader": lambda runner: runner.assignment_squad_detail.__setitem__(
+                "leader_id",
+                WATCHER_ID,
+            ),
+            "squad member": lambda runner: runner.assignment_squad_members[1].__setitem__(
+                "role",
+                "backend_engineer",
+            ),
+        }
+        for label, corrupt in corruptions.items():
+            with self.subTest(label=label):
+                runner = FakeSnapshotFinishRunner(snapshot, "PRO-36")
+                runner.after_metadata_set_number = 1
+                runner.after_metadata_set = corrupt
+
+                with self.assertRaises(RuntimeError):
+                    finish_phase(runner, "PRO-36", completion)
+
+                metadata_sets = tuple(
+                    call
+                    for call in runner.calls
+                    if call[:3] == ("issue", "metadata", "set")
+                )
+                self.assertEqual(len(metadata_sets), 1)
+                self.assertFalse(
+                    any(call[:2] == ("issue", "status") for call in runner.calls)
+                )
+                self.assertNotEqual(runner.issues["PRO-36"]["status"], "done")
 
     def test_finish_phase_rejects_noncurrent_stage_attempt_and_membership_without_mutation(self):
         cases = {

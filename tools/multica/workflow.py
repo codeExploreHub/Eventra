@@ -6334,7 +6334,37 @@ def finish_phase(
     ):
         raise RuntimeError("phase metadata conflicts with request")
 
+    def require_stable_write_authority(boundary: str) -> None:
+        try:
+            current_parent_authority = _finish_parent_authority_envelope(
+                runner,
+                detail,
+            )
+            current_assignment_authority = (
+                _exact_assignment_authority(runner)
+                if assignment_authority is not None
+                else None
+            )
+            current_evidence_authority = _finish_gate_evidence_authority(
+                runner,
+                detail,
+                value,
+            )
+        except (RuntimeError, TypeError, ValueError):
+            raise RuntimeError(
+                f"phase authority changed {boundary} metadata mutation"
+            ) from None
+        if (
+            current_parent_authority != authority_envelope
+            or current_assignment_authority != assignment_authority
+            or current_evidence_authority != evidence_before
+        ):
+            raise RuntimeError(
+                f"phase authority changed {boundary} metadata mutation"
+            )
+
     for key, item in wanted.items():
+        require_stable_write_authority("before")
         runner.run(
             [
                 "issue",
@@ -6351,6 +6381,7 @@ def finish_phase(
                 "json",
             ]
         )
+        require_stable_write_authority("after")
     expected_authority = _controlled_phase_authority(before)
     expected_authority.update(wanted)
     observed_authorities = tuple(
