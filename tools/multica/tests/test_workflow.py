@@ -293,6 +293,10 @@ class FakeSnapshotFinishRunner:
         self.evidence_comments = {}
         self.evidence_reads = {}
         self.evidence_drift_after_first_read = set()
+        self.assignment_agents = assignment_agents()
+        self.assignment_projects = assignment_projects()
+        self.assignment_read_count = 0
+        self.assignment_drift_after_first_read = False
         for index, item in enumerate(snapshot.children, start=100):
             issue_id = f"01a00000-0000-7000-8000-{index:012d}"
             self.issues[item.issue_key] = raw_issue(
@@ -521,9 +525,17 @@ class FakeSnapshotFinishRunner:
         call = tuple(args)
         self.calls.append(call)
         if call == ("agent", "list", "--output", "json"):
-            return assignment_agents()
+            self.assignment_read_count += 1
+            if (
+                self.assignment_drift_after_first_read
+                and self.assignment_read_count >= 2
+            ):
+                changed = copy.deepcopy(self.assignment_agents)
+                changed[4]["id"] = "00000000-0000-4000-8000-000000000099"
+                return changed
+            return copy.deepcopy(self.assignment_agents)
         if call == ("project", "list", "--output", "json"):
-            return assignment_projects()
+            return copy.deepcopy(self.assignment_projects)
         if call[:2] == ("issue", "get"):
             identifier = call[2]
             if identifier in {PARENT_ID, self.snapshot.identifier}:
@@ -996,6 +1008,174 @@ class PhaseCompletionTests(unittest.TestCase):
         runner = FakeSnapshotFinishRunner(valid, "PRO-36")
         result = finish_phase(runner, "PRO-36", completion)
         self.assertEqual(result.status, "done")
+
+    def test_finish_phase_rejects_coherent_foreign_gate_assignments(self):
+        foreign_reviewer = "00000000-0000-4000-8000-000000000090"
+        foreign_qa = "00000000-0000-4000-8000-000000000091"
+        foreign_project = "00000000-0000-4000-8000-000000000092"
+        frontend_review_uuid = "00000000-0000-4000-8000-000000000031"
+        frontend_qa_uuid = "00000000-0000-4000-8000-000000000032"
+
+        for kind, target_key in (("review", "PRO-36"), ("qa", "PRO-38")):
+            with self.subTest(kind=kind):
+                gates = (
+                    phase(
+                        "PRO-36", 2, "review",
+                        result=None if kind == "review" else "pass",
+                        status="in_review" if kind == "review" else "done",
+                        evidence_comment=frontend_review_uuid,
+                        project_id=foreign_project,
+                        assignee_id=foreign_reviewer,
+                    ),
+                    phase(
+                        "PRO-38", 2, "qa",
+                        result=None if kind == "qa" else "pass",
+                        status="in_review" if kind == "qa" else "done",
+                        evidence_comment=frontend_qa_uuid,
+                        project_id=foreign_project,
+                        assignee_id=foreign_qa,
+                    ),
+                )
+                snapshot = parent_snapshot(children=gates)
+                runner = FakeSnapshotFinishRunner(snapshot, target_key)
+                completion = PhaseCompletion(
+                    kind=kind,
+                    result="pass",
+                    attempt=0,
+                    evidence_comment=(
+                        frontend_review_uuid if kind == "review" else frontend_qa_uuid
+                    ),
+                    frontend_sha=FRONTEND_SHA,
+                    backend_sha=None,
+                    pr_url=None,
+                )
+
+                with self.assertRaises(RuntimeError):
+                    finish_phase(runner, target_key, completion)
+
+                self.assertEqual(runner.mutation_count, 0)
+
+        backend_sha = "b" * 40
+        foreign_gates = (
+            phase(
+                "PRO-40", 2, "review",
+                evidence_comment="00000000-0000-4000-8000-000000000041",
+                project_id=foreign_project,
+                assignee_id=foreign_reviewer,
+            ),
+            phase(
+                "PRO-41", 2, "qa",
+                evidence_comment="00000000-0000-4000-8000-000000000042",
+                project_id=foreign_project,
+                assignee_id=foreign_qa,
+            ),
+            phase(
+                "PRO-42", 2, "review",
+                frontend_sha=None,
+                backend_sha=backend_sha,
+                evidence_comment="00000000-0000-4000-8000-000000000043",
+                project_id=foreign_project,
+                assignee_id=foreign_reviewer,
+            ),
+            phase(
+                "PRO-43", 2, "qa",
+                frontend_sha=None,
+                backend_sha=backend_sha,
+                evidence_comment="00000000-0000-4000-8000-000000000044",
+                project_id=foreign_project,
+                assignee_id=foreign_qa,
+            ),
+            phase(
+                "PRO-44", 2, "integration_qa",
+                result=None,
+                status="in_review",
+                backend_sha=backend_sha,
+                evidence_comment="00000000-0000-4000-8000-000000000045",
+                project_id=foreign_project,
+                assignee_id=foreign_qa,
+            ),
+        )
+        backend_pr = PullRequestSnapshot(
+            "backend",
+            "https://github.com/codeExploreHub/Eventra-Backend/pull/7",
+            backend_sha,
+            "open",
+            True,
+            True,
+        )
+        snapshot = parent_snapshot(
+            classification="cross-stack",
+            candidate_backend_sha=backend_sha,
+            children=foreign_gates,
+            pull_requests=(frontend_pr(), backend_pr),
+        )
+        runner = FakeSnapshotFinishRunner(snapshot, "PRO-44")
+        completion = PhaseCompletion(
+            kind="integration_qa",
+            result="pass",
+            attempt=0,
+            evidence_comment="00000000-0000-4000-8000-000000000045",
+            frontend_sha=FRONTEND_SHA,
+            backend_sha=backend_sha,
+            pr_url=None,
+        )
+
+        with self.assertRaises(RuntimeError):
+            finish_phase(runner, "PRO-44", completion)
+
+        self.assertEqual(runner.mutation_count, 0)
+
+    def test_gate_finish_requires_stable_configured_agent_and_project_authority(self):
+        review = phase(
+            "PRO-36", 2, "review", result=None, status="in_review",
+            evidence_comment="00000000-0000-4000-8000-000000000031",
+        )
+        qa = phase(
+            "PRO-38", 2, "qa",
+            evidence_comment="00000000-0000-4000-8000-000000000032",
+        )
+        snapshot = parent_snapshot(children=(review, qa))
+        completion = PhaseCompletion(
+            "review", "pass", 0,
+            "00000000-0000-4000-8000-000000000031",
+            FRONTEND_SHA, None, None,
+        )
+        cases = {
+            "missing reviewer": lambda runner: setattr(
+                runner,
+                "assignment_agents",
+                [
+                    item for item in runner.assignment_agents
+                    if item["name"] != "Eventra Independent Reviewer"
+                ],
+            ),
+            "duplicate reviewer": lambda runner: runner.assignment_agents.append(
+                {
+                    "id": "00000000-0000-4000-8000-000000000099",
+                    "name": "Eventra Independent Reviewer",
+                }
+            ),
+            "missing frontend project": lambda runner: setattr(
+                runner,
+                "assignment_projects",
+                [
+                    item for item in runner.assignment_projects
+                    if item["title"] != "Eventra Local Development"
+                ],
+            ),
+            "assignment drift": lambda runner: setattr(
+                runner, "assignment_drift_after_first_read", True
+            ),
+        }
+        for label, corrupt in cases.items():
+            with self.subTest(label=label):
+                runner = FakeSnapshotFinishRunner(snapshot, "PRO-36")
+                corrupt(runner)
+
+                with self.assertRaises(RuntimeError):
+                    finish_phase(runner, "PRO-36", completion)
+
+                self.assertEqual(runner.mutation_count, 0)
 
     def test_finish_phase_accepts_valid_repository_qa_and_integration_suite(self):
         backend_sha = "b" * 40
@@ -3930,6 +4110,77 @@ class ParentDecisionTests(unittest.TestCase):
             "block_parent",
         )
 
+    def test_current_gate_rejects_a_coherent_foreign_assignment_group(self):
+        backend_sha = "b" * 40
+        backend_pr = "https://github.com/codeExploreHub/Eventra-Backend/pull/7"
+        foreign_reviewer = "00000000-0000-4000-8000-000000000090"
+        foreign_qa = "00000000-0000-4000-8000-000000000091"
+        foreign_project = "00000000-0000-4000-8000-000000000092"
+        for result in ("pass", "fail", "blocked"):
+            with self.subTest(result=result):
+                review_uuid = "00000000-0000-4000-8000-000000000081"
+                gates = (
+                    phase(
+                        "PRO-80", 2, "review", result=result,
+                        evidence_comment=review_uuid,
+                        responsible_repositories=(
+                            ("frontend",) if result != "pass" else ()
+                        ),
+                        evidence_comment_url=(
+                            f"https://multica.example/comments/{review_uuid}"
+                            if result != "pass" else None
+                        ),
+                        project_id=foreign_project,
+                        assignee_id=foreign_reviewer,
+                    ),
+                    phase(
+                        "PRO-81", 2, "qa",
+                        evidence_comment="00000000-0000-4000-8000-000000000082",
+                        project_id=foreign_project,
+                        assignee_id=foreign_qa,
+                    ),
+                    phase(
+                        "PRO-82", 2, "review",
+                        frontend_sha=None,
+                        backend_sha=backend_sha,
+                        evidence_comment="00000000-0000-4000-8000-000000000083",
+                        project_id=foreign_project,
+                        assignee_id=foreign_reviewer,
+                    ),
+                    phase(
+                        "PRO-83", 2, "qa",
+                        frontend_sha=None,
+                        backend_sha=backend_sha,
+                        evidence_comment="00000000-0000-4000-8000-000000000084",
+                        project_id=foreign_project,
+                        assignee_id=foreign_qa,
+                    ),
+                    phase(
+                        "PRO-84", 2, "integration_qa",
+                        backend_sha=backend_sha,
+                        evidence_comment="00000000-0000-4000-8000-000000000085",
+                        project_id=foreign_project,
+                        assignee_id=foreign_qa,
+                    ),
+                )
+                snapshot = parent_snapshot(
+                    classification="cross-stack",
+                    candidate_backend_sha=backend_sha,
+                    children=gates,
+                    pull_requests=(
+                        frontend_pr(),
+                        PullRequestSnapshot(
+                            "backend", backend_pr, backend_sha,
+                            "open", True, True,
+                        ),
+                    ),
+                )
+
+                decision = decide_parent_action(snapshot)
+
+                self.assertEqual(decision.kind, "block_parent")
+                self.assertIsNone(decision.action_key)
+
 
     def test_partial_merge_blocks_while_merged_state_routes_smoke_then_done(self):
         self.assertEqual(
@@ -6143,7 +6394,7 @@ class FakeRepairRunner:
             parent_issue_id=PARENT_ID,
             stage=stage,
             status="done",
-            project_id="00000000-0000-4000-8000-000000000040",
+            project_id=BACKEND_PROJECT_ID,
             assignee_id=(
                 REVIEWER_ID if kind == "review" else QA_ID
             ),
@@ -6802,7 +7053,7 @@ class RepairExecutionTests(unittest.TestCase):
                 elif label == "wrong title":
                     child["title"] = "foreign repair"
                 elif label == "wrong project":
-                    child["project_id"] = BACKEND_PROJECT_ID
+                    child["project_id"] = PROJECT_ID
                 elif label == "active status":
                     child["status"] = "todo"
                 elif label == "existing run":

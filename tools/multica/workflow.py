@@ -900,10 +900,13 @@ def _historical_gate_identity_matches(
         "create_gate_stage",
         snapshot.attempt,
     )
-    return _strict_gate_identity_matches(
-        snapshot,
-        phases,
-        expected_action=expected_action,
+    return (
+        _strict_gate_identity_matches(
+            snapshot,
+            phases,
+            expected_action=expected_action,
+        )
+        and _configured_gate_assignment_problem(snapshot, phases) is None
     )
 
 
@@ -1412,6 +1415,10 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
         assignment_problem = _smoke_assignment_problem(snapshot, latest)
         if assignment_problem is not None:
             return ParentDecision("block_parent", None, assignment_problem)
+    elif current_kinds and current_kinds <= {"review", "qa", "integration_qa"}:
+        assignment_problem = _configured_gate_assignment_problem(snapshot, latest)
+        if assignment_problem is not None:
+            return ParentDecision("block_parent", None, assignment_problem)
     if current_repair_stage:
         repair_problem = _current_repair_provenance_problem(snapshot, latest)
         if repair_problem is not None:
@@ -1852,35 +1859,55 @@ def _smoke_assignment_problem(
     return None
 
 
+def _configured_gate_assignment_problem(
+    parent: ParentSnapshot,
+    phases: tuple[PhaseSnapshot, ...],
+) -> str | None:
+    authority_problem = _parent_assignment_authority_problem(parent)
+    if authority_problem is not None:
+        return authority_problem
+    projects = dict(parent.assignment_project_ids)
+    agents = dict(parent.assignment_agent_ids)
+    for phase in phases:
+        repositories = tuple(
+            repository
+            for repository, sha in (
+                ("frontend", phase.frontend_sha),
+                ("backend", phase.backend_sha),
+            )
+            if sha is not None
+        )
+        if phase.kind == "review" and len(repositories) == 1:
+            expected_agent = agents["independent_reviewer"]
+            expected_project = projects[repositories[0]]
+        elif phase.kind == "qa" and len(repositories) == 1:
+            expected_agent = agents["integration_qa"]
+            expected_project = projects[repositories[0]]
+        elif phase.kind == "integration_qa":
+            expected_agent = agents["integration_qa"]
+            expected_project = projects["frontend"]
+        else:
+            return "current Gate assignment configured identity is malformed"
+        if (
+            phase.assignee_type != "agent"
+            or phase.assignee_id != expected_agent
+            or phase.project_id != expected_project
+        ):
+            return "current Gate assignment configured identity is conflicting"
+    return None
+
+
 def _gate_assignment_problem(
-    snapshot: WorkflowSnapshot,
     parent: ParentSnapshot,
     phases: tuple[PhaseSnapshot, ...],
 ) -> str | None:
     if not _gate_coverage(parent, phases, strict_identity=True):
         return "current Gate assignment provenance is conflicting"
+    problem = _configured_gate_assignment_problem(parent, phases)
+    if problem is not None:
+        return problem
     if _assignment_pull_request_problem(parent) is not None:
         return "current Gate pull-request authority is conflicting"
-    if len(snapshot.project_ids) == 2:
-        projects = dict(
-            zip(("frontend", "backend"), snapshot.project_ids, strict=True)
-        )
-        for phase in phases:
-            repositories = tuple(
-                repository
-                for repository, sha in (
-                    ("frontend", phase.frontend_sha),
-                    ("backend", phase.backend_sha),
-                )
-                if sha is not None
-            )
-            expected_project = (
-                projects["frontend"]
-                if phase.kind == "integration_qa"
-                else projects[repositories[0]]
-            )
-            if phase.project_id != expected_project:
-                return "current Gate assignment project provenance is conflicting"
     return None
 
 
@@ -1939,7 +1966,7 @@ def _current_assignment_provenance_problem(
     elif kinds == {"smoke"}:
         problem = _smoke_assignment_problem(parent, phases)
     elif kinds <= {"review", "qa", "integration_qa"}:
-        problem = _gate_assignment_problem(snapshot, parent, phases)
+        problem = _gate_assignment_problem(parent, phases)
     elif kinds == {"repair"}:
         problem = _current_repair_provenance_problem(parent, phases)
     else:
@@ -2889,10 +2916,7 @@ def load_parent_snapshot(
     current_kinds = {
         item.kind for item in phases if item.stage == current_stage
     }
-    needs_assignment_authority = current_kinds in (
-        {"implementation"},
-        {"smoke"},
-    )
+    needs_assignment_authority = int(metadata["workflow_version"]) == 2
     assignment_authority_before = (
         _exact_assignment_authority(runner)
         if needs_assignment_authority
@@ -4551,6 +4575,7 @@ def _read_smoke_reservation_authority(
         )
         for item in reservation["pull_requests"]
     )
+    assignment_authority = _exact_assignment_authority(runner)
     source_snapshot = ParentSnapshot(
         identifier=parent_key,
         classification=str(parent_metadata["classification"]),
@@ -4562,6 +4587,8 @@ def _read_smoke_reservation_authority(
         children=source_phases,
         pull_requests=pull_requests,
         next_stage=smoke_stage,
+        assignment_agent_ids=assignment_authority[0],
+        assignment_project_ids=assignment_authority[1],
     )
     if (
         not _historical_gate_identity_matches(source_snapshot, source_gate)
@@ -4574,7 +4601,6 @@ def _read_smoke_reservation_authority(
     ):
         raise RuntimeError("smoke reservation source merge authority conflicts")
     evidence = _read_gate_evidence_set(runner, source_children, source_phases)
-    assignment_authority = _exact_assignment_authority(runner)
     if (
         dict(assignment_authority[0]).get("integration_qa")
         != reservation["assignee_id"]
@@ -5795,6 +5821,7 @@ def _finish_phase_authority_problem(
         )
     if value.kind in {"review", "qa", "integration_qa"}:
         try:
+            assignment_authority = _exact_assignment_authority(runner)
             current_children = tuple(
                 child for child in children if child["stage"] == current_stage
             )
@@ -5830,6 +5857,8 @@ def _finish_phase_authority_problem(
                 parent_status=str(parent["status"]),
                 next_stage=next_stage,
                 parent_id=str(parent["id"]),
+                assignment_agent_ids=assignment_authority[0],
+                assignment_project_ids=assignment_authority[1],
             )
         except (RuntimeError, TypeError, ValueError):
             return "authoritative current Gate metadata is malformed"
@@ -5864,6 +5893,11 @@ def _finish_phase_authority_problem(
                 current_phases,
                 strict_identity=True,
             )
+            or _configured_gate_assignment_problem(
+                gate_snapshot,
+                current_phases,
+            )
+            is not None
             or not _phase_shas_match(gate_snapshot, current_phases)
         ):
             return "phase completion conflicts with current Gate authority"
@@ -5957,7 +5991,8 @@ def finish_phase(
         if controlled_before == wanted:
             assignment_authority = (
                 _exact_assignment_authority(runner)
-                if value.kind in {"implementation", "smoke"}
+                if value.kind
+                in {"implementation", "smoke", "review", "qa", "integration_qa"}
                 else None
             )
             evidence_before = _finish_gate_evidence_authority(
@@ -6012,7 +6047,8 @@ def finish_phase(
         raise RuntimeError("version 1 workflow requires explicit migration")
     assignment_authority = (
         _exact_assignment_authority(runner)
-        if value.kind in {"implementation", "smoke"}
+        if value.kind
+        in {"implementation", "smoke", "review", "qa", "integration_qa"}
         else None
     )
     evidence_before = _finish_gate_evidence_authority(runner, detail, value)
