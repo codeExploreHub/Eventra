@@ -267,13 +267,56 @@ class ContractAuditTests(unittest.TestCase):
             ]
         )
         self.assertTrue(
-            report["autopilots"]["detail"]["fields"]["autopilot"]["fields"]["id"][
+            report["autopilots"]["details"][0]["fields"]["autopilot"]["fields"]["id"][
                 "target_id_matches"
             ]
         )
         self.assertEqual(
-            report["autopilots"]["detail"]["fields"]["triggers"]["length"],
+            report["autopilots"]["details"][0]["fields"]["triggers"]["length"],
             1,
+        )
+
+    def test_audit_reads_all_present_target_automations_in_stable_key_order(self):
+        replies = audit_replies()
+        curator_id = "CURATOR_AUTOPILOT_ID_SENTINEL"
+        curator_trigger_id = "CURATOR_TRIGGER_ID_SENTINEL"
+        listing = replies[("autopilot", "list", "--output", "json")]
+        curator = copy.deepcopy(listing["autopilots"][0])
+        curator.update(
+            id=curator_id,
+            title="Eventra · Knowledge Curator",
+        )
+        listing["autopilots"].append(curator)
+        listing["total"] = 2
+        detail = copy.deepcopy(
+            replies[("autopilot", "get", SENTINELS["autopilot_id"], "--output", "json")]
+        )
+        detail["autopilot"].update(
+            id=curator_id,
+            title="Eventra · Knowledge Curator",
+        )
+        detail["triggers"][0].update(
+            id=curator_trigger_id,
+            autopilot_id=curator_id,
+            cron_expression="17 2 * * *",
+            label="Eventra repository knowledge curation",
+        )
+        replies[("autopilot", "get", curator_id, "--output", "json")] = detail
+        runner = RecordingRunner(replies)
+
+        report = collect_contract_audit(
+            SENTINELS["runtime_id"], SENTINELS["daemon_id"], runner
+        )
+
+        self.assertEqual(len(report["autopilots"]["details"]), 2)
+        get_calls = [
+            args[2]
+            for args, _ in runner.calls
+            if args[:2] == ["autopilot", "get"]
+        ]
+        self.assertEqual(
+            get_calls,
+            [curator_id, SENTINELS["autopilot_id"]],
         )
 
     def test_audit_commands_are_fixed_reads_with_no_mutation_prefix(self):
