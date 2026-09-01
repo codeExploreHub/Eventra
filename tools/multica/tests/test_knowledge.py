@@ -1518,6 +1518,24 @@ class KnowledgeCurationRecoveryTests(unittest.TestCase):
     projects = KnowledgeCurationApplyTests.projects
     curator_id = KnowledgeCurationApplyTests.curator_id
 
+    def test_existing_issue_with_server_trimmed_description_is_reused(self):
+        runner = CurationApplyRunner()
+        planned = curate_once(
+            runner, self.projects, self.curator_id, False, **self.roots
+        )
+        issue = runner.seed_action_issue(planned.action_key)
+        issue["description"] = issue["description"].rstrip("\n")
+
+        result = curate_once(
+            runner, self.projects, self.curator_id, True, **self.roots
+        )
+
+        self.assertEqual(result.decision, "dispatched")
+        self.assertEqual(result.knowledge_issue_identifier, issue["identifier"])
+        self.assertEqual(result.created, 0)
+        self.assertEqual(runner.create_attempts, 0)
+        self.assertEqual(len(runner.created_issues), 1)
+
     def test_ambiguous_committed_create_is_recovered_without_duplicate(self):
         runner = CurationApplyRunner()
         runner.raise_after_committed_issue_create = True

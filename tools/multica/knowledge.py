@@ -932,6 +932,14 @@ def _knowledge_issue_description(
     )
 
 
+def _issue_description_matches(raw_description: Any, expected: str) -> bool:
+    """Match the server's lossless body form apart from terminal newlines."""
+    return (
+        isinstance(raw_description, str)
+        and raw_description.rstrip("\r\n") == expected.rstrip("\r\n")
+    )
+
+
 def _action_issue_matches(
     raw: Any,
     normalized: Mapping[str, Any],
@@ -946,7 +954,7 @@ def _action_issue_matches(
         and raw.get("id") == normalized["id"]
         and raw.get("identifier") == normalized["identifier"]
         and raw.get("title") == title
-        and raw.get("description") == description
+        and _issue_description_matches(raw.get("description"), description)
         and normalized["project_id"] == project_id
         and normalized["assignee_id"] == curator_agent_id
         and normalized["assignee_type"] == "agent"
