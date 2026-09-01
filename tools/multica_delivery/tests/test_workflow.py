@@ -157,7 +157,7 @@ def completion_for(
         candidate_sha=sha or SHA.get(repository, "e" * 40),
         pull_request_url=pull_request_url,
         evidence_comment_uuid=comment_uuid,
-        evidence_comment_url=f"https://example.test/evidence/{comment_uuid}",
+        evidence_comment_url=f"https://example.test/comments/{comment_uuid}",
         suite_key=suite_key,
         candidate_shas=candidate_shas or {},
         responsible_repositories=responsible_repositories,
@@ -500,7 +500,7 @@ class FakeWorkflowStore:
                             evidence_comment_uuid=comment_uuid,
                             creation_candidate_shas=snapshot.candidate_shas,
                             phase_result="pass",
-                            evidence_comment_url=f"https://example.test/evidence/{comment_uuid}",
+                            evidence_comment_url=f"https://example.test/comments/{comment_uuid}",
                         )
                     )
             for suite in self.manifest.integration_suites:
@@ -526,7 +526,7 @@ class FakeWorkflowStore:
                         evidence_comment_uuid=comment_uuid,
                         creation_candidate_shas=snapshot.candidate_shas,
                         phase_result="pass",
-                        evidence_comment_url=f"https://example.test/evidence/{comment_uuid}",
+                        evidence_comment_url=f"https://example.test/comments/{comment_uuid}",
                     )
                 )
             children = children + tuple(additions)
@@ -658,7 +658,7 @@ class FakeWorkflowStore:
                             creation_candidate_shas=implementation_candidates,
                             phase_result="pass",
                             evidence_comment_url=(
-                                f"https://example.test/evidence/{comment_uuid}"
+                                f"https://example.test/comments/{comment_uuid}"
                             ),
                         )
                     )
@@ -1829,6 +1829,27 @@ class WorkflowValueValidationTests(unittest.TestCase):
                 with self.assertRaises(WorkflowError):
                     replace(reference, **changes)
 
+    def test_failure_evidence_url_is_canonically_bound_to_uuid(self):
+        reference = self.failure_ref(
+            "PRO-201", "api", phase="review", comment_digit="1"
+        )
+        comment_uuid = reference.evidence_comment_uuid
+        invalid_urls = (
+            f"https://multica.example:443/comments/{comment_uuid}",
+            "https://multica.example/comments/"
+            "123e4567-e89b-42d3-a456-426614174002",
+            f"https://multica.example/evidence/{comment_uuid}",
+            f"https://multica.example/comments%2F{comment_uuid}",
+            f"https://multica.example/%2e%2e/comments/{comment_uuid}",
+            f"https://multica.example/../comments/{comment_uuid}",
+            f"https://multica.example//comments/{comment_uuid}",
+            f"https://multica.example/comments/{comment_uuid}/extra",
+        )
+        for evidence_url in invalid_urls:
+            with self.subTest(evidence_url=evidence_url):
+                with self.assertRaises(WorkflowError):
+                    replace(reference, evidence_comment_url=evidence_url)
+
     def test_failure_bundle_rejects_forged_digest(self):
         failure = self.failure_ref("PRO-201", "api", phase="review", comment_digit="1")
         bundle = FailureBundle.build("PRO-200", 2, 7, 3, SHA, (failure,))
@@ -1900,6 +1921,42 @@ class WorkflowCompletionSchemaTests(unittest.TestCase):
             _phase_completion_schema_problem(completion, manifest=self.manifest),
             "PASS gate completion cannot name responsible repositories",
         )
+
+    def test_phase_completion_evidence_url_is_canonically_bound_to_uuid(self):
+        completion = completion_for("api", phase="review", result="pass")
+        comment_uuid = completion.evidence_comment_uuid
+        canonical = replace(
+            completion,
+            evidence_comment_url=(
+                "https://multica.example/issues/PRO-201/comments/"
+                + comment_uuid
+            ),
+        )
+        self.assertIsNone(
+            _phase_completion_schema_problem(canonical, manifest=self.manifest)
+        )
+        invalid_urls = (
+            f"https://multica.example:443/comments/{comment_uuid}",
+            f"https://user@multica.example/comments/{comment_uuid}",
+            f"https://user:pass@multica.example/comments/{comment_uuid}",
+            f"https://multica.example/comments/{comment_uuid}?raw=1",
+            f"https://multica.example/comments/{comment_uuid}#raw",
+            "https://multica.example/comments/"
+            "00000000-0000-4000-8000-000000000099",
+            f"https://multica.example/evidence/{comment_uuid}",
+            f"https://multica.example/comments%2F{comment_uuid}",
+            f"https://multica.example/%2e%2e/comments/{comment_uuid}",
+            f"https://multica.example/../comments/{comment_uuid}",
+            f"https://multica.example//comments/{comment_uuid}",
+            f"https://multica.example/comments/{comment_uuid}/extra",
+        )
+        for evidence_url in invalid_urls:
+            with self.subTest(evidence_url=evidence_url):
+                observed = _phase_completion_schema_problem(
+                    replace(canonical, evidence_comment_url=evidence_url),
+                    manifest=self.manifest,
+                )
+                self.assertEqual(observed, "phase completion evidence is malformed")
 
     def test_integration_gate_ownership_is_a_nonempty_manifest_suite_subset(self):
         for owners in (("api",), ("api", "web")):
@@ -1986,7 +2043,7 @@ class TaskFourWorkflowFixture:
             evidence_comment_uuid=review_uuid,
             creation_candidate_shas=snapshot.candidate_shas,
             phase_result="fail",
-            evidence_comment_url=f"https://example.test/evidence/{review_uuid}",
+            evidence_comment_url=f"https://example.test/comments/{review_uuid}",
             responsible_repositories=("api",),
         )
         self.store.add_state(
@@ -2016,7 +2073,7 @@ class TaskFourWorkflowFixture:
             3,
         )
         bundle = self.workflow._failure_bundle(state, decision)
-        comment_url = f"https://example.test/authorization/{comment_uuid}"
+        comment_url = f"https://example.test/comments/{comment_uuid}"
         assert isinstance(state.metadata, ParentMetadata)
         self.store.states["PRO-200"] = replace(
             state,
@@ -2031,11 +2088,14 @@ class TaskFourWorkflowFixture:
             ),
         )
         if add_authoritative_comment:
-            self.store.authorizing_comments[("PRO-200", comment_uuid)] = AuthorizingComment(
+            authoritative = AuthorizingComment(
                 comment_uuid,
-                authoritative_url or comment_url,
+                comment_url,
                 author_type,
             )
+            if authoritative_url is not None:
+                object.__setattr__(authoritative, "comment_url", authoritative_url)
+            self.store.authorizing_comments[("PRO-200", comment_uuid)] = authoritative
         return bundle
 
     def dispatch_authorized_repair(self) -> FailureBundle:
@@ -2419,7 +2479,7 @@ class WorkflowRepairAuthorizationTests(TaskFourWorkflowFixture, unittest.TestCas
 
     def test_extra_round_rejects_wrong_authoritative_url_and_skipped_round(self):
         self.authorize_extra_round(
-            authoritative_url="https://example.test/authorization/different"
+            authoritative_url="https://example.test/comments/different"
         )
         wrong_url = self.workflow.resume_parent("PRO-200")
         self.assertEqual(wrong_url.next_action, "block")
@@ -2588,7 +2648,7 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                     evidence_comment_uuid=comment_uuid,
                     creation_candidate_shas=source,
                     phase_result="fail" if failed else "pass",
-                    evidence_comment_url=f"https://example.test/evidence/{comment_uuid}",
+                    evidence_comment_url=f"https://example.test/comments/{comment_uuid}",
                     responsible_repositories=(repository,) if failed else (),
                 )
                 gates.append(child)
@@ -2628,7 +2688,7 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                     evidence_comment_uuid=comment_uuid,
                     creation_candidate_shas=source,
                     phase_result="pass",
-                    evidence_comment_url=f"https://example.test/evidence/{comment_uuid}",
+                    evidence_comment_url=f"https://example.test/comments/{comment_uuid}",
                 )
             )
         completion_actions = frozenset(
@@ -2772,7 +2832,7 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
         assert isinstance(state.metadata, ParentMetadata)
         if repair_round == 3:
             authorization_url = (
-                f"https://example.test/evidence/{authorization_uuid}"
+                f"https://example.test/comments/{authorization_uuid}"
             )
             self.store.authorizing_comments[
                 ("PRO-200", authorization_uuid)
@@ -2851,7 +2911,7 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
         authorization = None
         if repair_round == 3:
             comment_uuid = evidence_uuid("partial-repair-round-three")
-            comment_url = f"https://example.test/evidence/{comment_uuid}"
+            comment_url = f"https://example.test/comments/{comment_uuid}"
             authorization = RepairAuthorization(
                 comment_uuid,
                 comment_url,
@@ -3661,7 +3721,7 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
             identifier=f"{original.identifier}-ATTEMPT-{wrong_attempt}",
             attempt=wrong_attempt,
             evidence_comment_uuid=foreign_uuid,
-            evidence_comment_url=f"https://example.test/evidence/{foreign_uuid}",
+            evidence_comment_url=f"https://example.test/comments/{foreign_uuid}",
             authorizing_comment_uuid=authorization_uuid,
         )
         self.store.states["PRO-200"] = replace(
@@ -4135,7 +4195,7 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                         self.store.completions[api_key] = replace(
                             self.store.completions[api_key],
                             evidence_comment_url=(
-                                "https://example.test/evidence/forged"
+                                "https://example.test/comments/forged"
                             ),
                         )
 
@@ -4556,7 +4616,7 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                         creation_candidate_shas=source,
                         phase_result="pass" if terminal else "",
                         evidence_comment_url=(
-                            f"https://example.test/evidence/{completion_uuid}"
+                            f"https://example.test/comments/{completion_uuid}"
                             if terminal
                             else ""
                         ),
@@ -4699,7 +4759,7 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                                     first_gate,
                                     evidence_comment_uuid=forged_uuid,
                                     evidence_comment_url=(
-                                        f"https://example.test/evidence/{forged_uuid}"
+                                        f"https://example.test/comments/{forged_uuid}"
                                     ),
                                 ),
                                 *gates[1:],
@@ -4823,7 +4883,7 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                 "PRO-200-API", "api", "api", "", "implementation", 1, 0,
                 "done", creation_action, False, evidence_comment_uuid=api_evidence,
                 creation_candidate_shas=base_candidates, phase_result="pass",
-                evidence_comment_url=f"https://example.test/evidence/{api_evidence}",
+                evidence_comment_url=f"https://example.test/comments/{api_evidence}",
             ),
             WorkflowChild(
                 "PRO-200-WEB", "web", "web", "", "implementation", 1, 0,
@@ -5019,7 +5079,7 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                 "PRO-200-API-REPAIR", "api", "api", "", "repair", 6, 1,
                 "done", action_key, False, evidence_comment_uuid=api_evidence,
                 creation_candidate_shas=base, phase_result="pass",
-                evidence_comment_url=f"https://example.test/evidence/{api_evidence}",
+                evidence_comment_url=f"https://example.test/comments/{api_evidence}",
                 failure_bundle_digest=bundle_digest,
                 failure_evidence_uuids=tuple(
                     failure.evidence_comment_uuid
@@ -5081,7 +5141,7 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
             candidate_sha=REPLACEMENT_SHA,
             pull_request_url=pull_request_targets()["api"].url,
             evidence_comment_uuid=api_evidence,
-            evidence_comment_url=f"https://example.test/evidence/{api_evidence}",
+            evidence_comment_url=f"https://example.test/comments/{api_evidence}",
             failure_bundle_digest=bundle_digest,
         )
 
@@ -5262,7 +5322,7 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                     },
                     "evidence": {
                         "evidence_comment_url": (
-                            "https://example.test/evidence/forged"
+                            "https://example.test/comments/forged"
                         ),
                     },
                 }
@@ -5271,16 +5331,18 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                         repair_round=repair_round,
                         corruption=corruption,
                     ):
-                        corrupted_children = tuple(
-                            replace(child, **changes)
-                            if child.phase == "repair"
-                            and child.repository_key == "web"
-                            else child
-                            for child in current.children
-                        )
+                        corrupted_children = []
+                        for child in current.children:
+                            if child.phase != "repair" or child.repository_key != "web":
+                                corrupted_children.append(child)
+                                continue
+                            corrupted = replace(child)
+                            for field_name, value in changes.items():
+                                object.__setattr__(corrupted, field_name, value)
+                            corrupted_children.append(corrupted)
                         self.store.states["PRO-200"] = replace(
                             current,
-                            children=corrupted_children,
+                            children=tuple(corrupted_children),
                         )
                         forged_replay = self.workflow.record_phase_completion(
                             completion_for(
@@ -5536,7 +5598,7 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                         creation_candidate_shas=source,
                         phase_result="pass" if api_done else "",
                         evidence_comment_url=(
-                            f"https://example.test/evidence/{api_evidence_uuid}"
+                            f"https://example.test/comments/{api_evidence_uuid}"
                             if api_done
                             else ""
                         ),
@@ -5619,7 +5681,7 @@ class WorkflowTaskFourFixRoundOneTests(TaskFourWorkflowFixture, unittest.TestCas
                             ("PRO-200", authorization_uuid)
                         ] = AuthorizingComment(
                             authorization_uuid,
-                            f"https://example.test/evidence/{authorization_uuid}",
+                            f"https://example.test/comments/{authorization_uuid}",
                             "member",
                         )
                     self.store.events.clear()
@@ -5849,7 +5911,7 @@ class GenericWorkflowTests(unittest.TestCase):
                 creation_candidate_shas=snapshot.candidate_shas,
                 phase_result=result,
                 evidence_comment_url=(
-                    f"https://example.test/evidence/{str(uuid.UUID(digit * 32))}"
+                    f"https://example.test/comments/{str(uuid.UUID(digit * 32))}"
                 ),
                 responsible_repositories=("api",) if result == "fail" else (),
             )
@@ -7274,7 +7336,7 @@ class GenericWorkflowTests(unittest.TestCase):
             evidence_comment_uuid=comment_uuid,
             creation_candidate_shas=snapshot.candidate_shas,
             phase_result="fail",
-            evidence_comment_url=f"https://example.test/evidence/{comment_uuid}",
+            evidence_comment_url=f"https://example.test/comments/{comment_uuid}",
             responsible_repositories=("api",),
         )
         self.store.add_state(
@@ -7305,7 +7367,7 @@ class GenericWorkflowTests(unittest.TestCase):
             evidence_comment_uuid=comment_uuid,
             creation_candidate_shas=snapshot.candidate_shas,
             phase_result="fail",
-            evidence_comment_url=f"https://example.test/evidence/{comment_uuid}",
+            evidence_comment_url=f"https://example.test/comments/{comment_uuid}",
             responsible_repositories=("api",),
         )
         self.store.add_state(
@@ -7484,7 +7546,7 @@ class GenericWorkflowTests(unittest.TestCase):
                 creation_candidate_shas=snapshot.candidate_shas,
                 phase_result="fail",
                 evidence_comment_url=(
-                    f"https://example.test/evidence/{str(uuid.UUID(digit * 32))}"
+                    f"https://example.test/comments/{str(uuid.UUID(digit * 32))}"
                 ),
                 responsible_repositories=("api",),
             )
@@ -7601,7 +7663,7 @@ class GenericWorkflowTests(unittest.TestCase):
             evidence_comment_uuid=comment_uuid,
             creation_candidate_shas=snapshot.candidate_shas,
             phase_result="fail",
-            evidence_comment_url=f"https://example.test/evidence/{comment_uuid}",
+            evidence_comment_url=f"https://example.test/comments/{comment_uuid}",
             responsible_repositories=("api",),
         )
         corrupt_successor = WorkflowChild(
@@ -7643,7 +7705,7 @@ class GenericWorkflowTests(unittest.TestCase):
             evidence_comment_uuid=comment_uuid,
             creation_candidate_shas=snapshot.candidate_shas,
             phase_result="fail",
-            evidence_comment_url=f"https://example.test/evidence/{comment_uuid}",
+            evidence_comment_url=f"https://example.test/comments/{comment_uuid}",
             responsible_repositories=("api",),
         )
         self.store.add_state(
@@ -7789,7 +7851,7 @@ class GenericWorkflowTests(unittest.TestCase):
                 evidence_comment_uuid=str(uuid.UUID("1" * 32)),
                 creation_candidate_shas=snapshot.candidate_shas,
                 phase_result="fail",
-                evidence_comment_url="https://example.test/evidence/11111111-1111-1111-1111-111111111111",
+                evidence_comment_url="https://example.test/comments/11111111-1111-1111-1111-111111111111",
                 responsible_repositories=("web",),
             ),
             WorkflowChild(
@@ -7849,7 +7911,7 @@ class GenericWorkflowTests(unittest.TestCase):
                     active=False,
                     evidence_comment_uuid=str(uuid.UUID("2" * 32)),
                     phase_result="pass",
-                    evidence_comment_url="https://example.test/evidence/22222222-2222-2222-2222-222222222222",
+                    evidence_comment_url="https://example.test/comments/22222222-2222-2222-2222-222222222222",
                 ),
                 *state.children[2:],
             ),
@@ -7951,7 +8013,7 @@ class GenericWorkflowTests(unittest.TestCase):
                     evidence_comment_uuid=str(uuid.UUID("5" * 32)),
                     creation_candidate_shas=snapshot.candidate_shas,
                     phase_result="fail",
-                    evidence_comment_url="https://example.test/evidence/55555555-5555-5555-5555-555555555555",
+                    evidence_comment_url="https://example.test/comments/55555555-5555-5555-5555-555555555555",
                     responsible_repositories=("web",),
                 )
                 historical = WorkflowChild(
@@ -8072,7 +8134,7 @@ class GenericWorkflowTests(unittest.TestCase):
             evidence_comment_uuid=str(uuid.UUID("8" * 32)),
             creation_candidate_shas=snapshot.candidate_shas,
             phase_result="fail",
-            evidence_comment_url="https://example.test/evidence/88888888-8888-8888-8888-888888888888",
+            evidence_comment_url="https://example.test/comments/88888888-8888-8888-8888-888888888888",
             responsible_repositories=("web",),
         )
         self.store.add_state(
@@ -8156,7 +8218,7 @@ class GenericWorkflowTests(unittest.TestCase):
             evidence_comment_uuid=str(uuid.UUID("9" * 32)),
             creation_candidate_shas=snapshot.candidate_shas,
             phase_result="fail",
-            evidence_comment_url="https://example.test/evidence/99999999-9999-9999-9999-999999999999",
+            evidence_comment_url="https://example.test/comments/99999999-9999-9999-9999-999999999999",
             responsible_repositories=("web",),
         )
         self.store.add_state(
@@ -8380,7 +8442,7 @@ class GenericWorkflowTests(unittest.TestCase):
             evidence_comment_uuid=comment_uuid,
             creation_candidate_shas=passing_snapshot().candidate_shas,
             phase_result="pass",
-            evidence_comment_url=f"https://example.test/evidence/{comment_uuid}",
+            evidence_comment_url=f"https://example.test/comments/{comment_uuid}",
         )
         self.store.add_state(
             "PRO-101", passing_snapshot(), children=(seed,),
@@ -10100,7 +10162,7 @@ class GenericWorkflowTests(unittest.TestCase):
             "completion identity": {
                 "evidence_comment_uuid": drift_uuid,
                 "phase_result": "pass",
-                "evidence_comment_url": f"https://example.test/evidence/{drift_uuid}",
+                "evidence_comment_url": f"https://example.test/comments/{drift_uuid}",
             },
             "responsible owners": {"responsible_repositories": ("api",)},
             "failure bundle": {"failure_bundle_digest": "f" * 64},
@@ -10625,7 +10687,7 @@ class GenericWorkflowTests(unittest.TestCase):
             evidence_comment_uuid=comment_uuid,
             creation_candidate_shas=snapshot.candidate_shas,
             phase_result="fail",
-            evidence_comment_url=f"https://example.test/evidence/{comment_uuid}",
+            evidence_comment_url=f"https://example.test/comments/{comment_uuid}",
             responsible_repositories=("api",),
         )
         corruptions = {
