@@ -4,6 +4,58 @@ from pathlib import Path
 
 
 class OperatorDocsTests(unittest.TestCase):
+    def test_repository_knowledge_loop_pilot_runbook_is_guarded_and_operable(self):
+        readme = Path("tools/multica/README.md").read_text()
+        normalized = " ".join(readme.split())
+        for fragment in (
+            "## Repository knowledge loop pilot runbook",
+            "Eventra Knowledge Curator",
+            "Eventra · Knowledge Curator",
+            "17 2 * * *",
+            "Asia/Shanghai",
+            "at most one candidate",
+            "does not block delivery",
+            "python3 -B -m tools.multica.knowledge verify",
+            "python3 -B -m tools.multica.knowledge scan",
+            "python3 -B -m tools.multica.knowledge plan",
+            "python3 -B -m tools.multica.knowledge curate",
+            "python3 -m tools.multica.contract_audit",
+            "python3 -m tools.multica.provision",
+            "explicit live-mutation approval",
+            "pause only the Curator",
+            "Eventra · Stalled Work Watcher remains active",
+            "`multica-multi-repo-delivery` remains unchanged",
+            "candidate acceptance rate",
+            "business delivery delay",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, normalized)
+
+    def test_knowledge_loop_runbook_covers_eight_pilot_scenarios(self):
+        pilot = Path("docs/multica/pilot-issues.md").read_text()
+        section = pilot.split("## Repository knowledge loop scenarios", 1)[1]
+        for title in (
+            "### K1 — no-candidate frontend delivery",
+            "### K2 — backend incident learning",
+            "### K3 — cross-repository contract",
+            "### K4 — duplicate candidate",
+            "### K5 — concurrent Curator triggers",
+            "### K6 — business-code path rejection",
+            "### K7 — stale knowledge correction",
+            "### K8 — paused Curator continuity",
+        ):
+            with self.subTest(title=title):
+                self.assertIn(title, section)
+        normalized = " ".join(section.split())
+        for fragment in (
+            "at most one candidate",
+            "human review",
+            "never merge",
+            "existing Watcher",
+            "production deployment",
+        ):
+            self.assertIn(fragment, normalized)
+
     def test_curator_and_reviewer_enforce_knowledge_only_human_review(self):
         instructions = Path("tools/multica/instructions")
         curator = " ".join(

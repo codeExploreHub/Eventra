@@ -254,6 +254,149 @@ Frontend Engineer records the real build result, posts evidence, and calls
 `finish-phase`. Native Stages then drive review, QA, bounded repair, merge, and
 local smoke. Production remains untouched.
 
+## Repository knowledge loop pilot runbook
+
+This pilot adds one independent **Eventra Knowledge Curator** Agent and one
+run-only **Eventra · Knowledge Curator** Autopilot to the two existing Eventra
+Projects. The Curator is outside `Eventra Local Delivery`, receives no backend
+environment, and runs at `17 2 * * *` in `Asia/Shanghai`. Each scheduled or
+manual control pass handles at most one candidate. Candidate production and
+curation are asynchronous: an absent, rejected, paused, or delayed candidate
+does not block delivery. The existing **Eventra · Stalled Work Watcher remains
+active** and retains its own schedule and recovery authority.
+
+This is an Eventra-only trial. The generic `multica-multi-repo-delivery`
+remains unchanged; do not copy pilot IDs, paths, schedules, or state into it. The
+Curator can create one knowledge Issue after validated evidence, while the
+assigned Curator task may prepare a knowledge-only pull request. It cannot
+approve, merge, deploy, edit business code, or change delivery state.
+
+### Read-only preflight
+
+From the frontend control worktree, first verify both repositories and inspect
+pending evidence. These commands do not mutate Multica or GitHub:
+
+```bash
+python3 -B -m tools.multica.knowledge verify \
+  --frontend-root FRONTEND_ROOT \
+  --backend-root BACKEND_ROOT
+python3 -B -m tools.multica.knowledge scan \
+  --project-id FRONTEND_PROJECT_ID \
+  --backend-project-id BACKEND_PROJECT_ID
+python3 -B -m tools.multica.knowledge plan \
+  --project-id FRONTEND_PROJECT_ID \
+  --backend-project-id BACKEND_PROJECT_ID
+```
+
+Then audit the live contract shapes and render the desired reconciliation. Both
+commands are read-only; scalar-free audit output is evidence about structure,
+not permission to infer missing IDs:
+
+```bash
+python3 -m tools.multica.contract_audit \
+  --runtime-id RUNTIME_ID \
+  --daemon-id DAEMON_ID
+python3 -m tools.multica.provision \
+  --runtime-id RUNTIME_ID \
+  --daemon-id DAEMON_ID
+```
+
+Stop if either Eventra Project, either exact repository resource, the existing
+Watcher, or the five-member Squad cannot be resolved unambiguously. A valid dry
+run proposes only the missing or drifted Curator objects, preserves Watcher and
+trigger IDs, leaves the Squad at five members, and makes no operational-agent
+environment change.
+
+### Approval, apply, and authoritative reread
+
+Stop for **explicit live-mutation approval** before adding/updating the Curator,
+running `curate --apply`, triggering an Autopilot, creating a knowledge Issue or
+pull request, or changing an Autopilot status. After that approval, reconcile
+once while preserving the existing backend environment in-process:
+
+```bash
+python3 -m tools.multica.provision \
+  --runtime-id RUNTIME_ID \
+  --daemon-id DAEMON_ID \
+  --apply \
+  --reuse-backend-env
+```
+
+Use only IDs returned by that apply and reread the result:
+
+```bash
+multica agent get KNOWLEDGE_CURATOR_AGENT_ID --output json
+multica squad member list SQUAD_ID --output json
+multica autopilot get KNOWLEDGE_CURATOR_AUTOPILOT_ID --output json
+multica autopilot get WATCHER_AUTOPILOT_ID --output json
+```
+
+Require the Curator Agent to be absent from the Squad, the Curator Autopilot to
+be active/run-only and assigned to it, the schedule to remain `17 2 * * *` in
+`Asia/Shanghai`, and the Watcher IDs/schedule to be unchanged. Re-run the normal
+apply without an environment-mode flag; it must report a `mutation_count` of
+`0`.
+
+### One bounded curation pass and PR handoff
+
+The scheduled description invokes this exact mutation after approval:
+
+```bash
+python3 -B -m tools.multica.knowledge curate \
+  --project-id FRONTEND_PROJECT_ID \
+  --backend-project-id BACKEND_PROJECT_ID \
+  --curator-agent-id KNOWLEDGE_CURATOR_AGENT_ID \
+  --apply
+```
+
+For a manual scenario, trigger only the known Curator Autopilot and then reread
+its run history and the affected Issue metadata:
+
+```bash
+multica autopilot trigger KNOWLEDGE_CURATOR_AUTOPILOT_ID --output json
+multica autopilot runs KNOWLEDGE_CURATOR_AUTOPILOT_ID --limit 5 --output json
+```
+
+One pass may create at most one deterministic knowledge Issue. The assigned
+Curator rereads source evidence, changes only the repository knowledge
+allowlist, runs `check-change`, opens one source-linked PR, records the canonical
+`eventra.knowledge.pr` state, and stops at `pr_open` for human review. A human
+may reject or merge; the Curator never does either. `verified` is recorded only
+after a read-only PR observation and exact merged-SHA index verification.
+
+### Pause, rollback, and continuity
+
+The safe operational rollback is to pause only the Curator after explicit
+approval, not to delete Agents, Issues, comments, PRs, triggers, or Git history:
+
+```bash
+multica autopilot update KNOWLEDGE_CURATOR_AUTOPILOT_ID \
+  --status paused \
+  --output json
+multica autopilot get KNOWLEDGE_CURATOR_AUTOPILOT_ID --output json
+```
+
+Confirm it is paused and that **Eventra · Stalled Work Watcher remains active**.
+Delivery, Stage barriers, local smoke, and Watcher recovery continue normally;
+new candidates remain durable and pending. Resume only after separate approval
+with `multica autopilot update KNOWLEDGE_CURATOR_AUTOPILOT_ID --status active
+--output json`, reread it, and let oldest-first bounded processing continue.
+Repository rollback, PR revert, production deployment, and candidate deletion
+are not automatic rollback actions.
+
+### Pilot measures
+
+For every scenario record: retrieved-entry relevance, Context Receipt count,
+candidate count, candidate acceptance rate, duplicate rate, human review
+correction rate, stale-entry rate, candidate-to-reviewed-knowledge latency,
+Curator failure/retry count, and business delivery delay. Compare delivery
+lead time with the Curator active and paused. A useful pilot improves future
+retrieval without increasing delivery delay, leaking sensitive data, or
+creating duplicate Issues/PRs.
+
+The eight knowledge-specific scenarios and expected evidence are in
+[the pilot Issue runbook](../../docs/multica/pilot-issues.md#repository-knowledge-loop-scenarios).
+
 ## Pilot dispatch and evidence runbook
 
 Use [the pilot Issue bodies](../../docs/multica/pilot-issues.md) to exercise
