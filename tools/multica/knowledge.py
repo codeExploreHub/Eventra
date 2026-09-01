@@ -752,10 +752,14 @@ def load_candidate_snapshot(
     if len(candidate_comments) != 1:
         raise RuntimeError("invalid knowledge evidence")
     candidate_comment = candidate_comments[0]
+    comments_by_id = {item["id"]: item for item in evidence_comments}
+    ancestor_id = candidate_comment["id"]
+    while ancestor_id != pointer.evidence_comment_uuid:
+        ancestor = comments_by_id.get(ancestor_id)
+        if ancestor is None or ancestor.get("parent_id") is None:
+            raise RuntimeError("invalid knowledge evidence")
+        ancestor_id = ancestor["parent_id"]
     if (
-        candidate_comment["id"] != pointer.evidence_comment_uuid
-        and candidate_comment.get("parent_id") != pointer.evidence_comment_uuid
-    ) or (
         candidate_comment["author_id"] != evidence_comment["author_id"]
         or candidate_comment["author_type"] != evidence_comment["author_type"]
     ):

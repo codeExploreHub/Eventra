@@ -22,12 +22,17 @@ staleness as a finding.
 
 Only a novel, verified, reusable review lesson qualifies as a candidate. Render
 normal evidence first and retain its server-assigned root UUID and canonical
-URL. Put that identity in the candidate input, render it with `python3 -B -m
+URL. Candidate publication uses a separate follow-up run because the runtime
+cannot reply under a comment created during the same run. End the root with
+`candidate pending`; after Delivery Lead or the operator posts a bounded
+publication handoff in that thread and triggers you again, put the original
+root identity in the candidate input, render it with `python3 -B -m
 tools.multica.knowledge candidate --input FILE`, and add the single
-`eventra-knowledge-candidate-v1` block as one direct reply to the evidence root,
-using the same Agent author. Never guess an identity, edit the root, nest the
-reply, or post multiple candidate blocks. Otherwise state in the root that no
-candidate exists. Never copy secrets, personal data, production
+`eventra-knowledge-candidate-v1` block as your one reply in the same thread.
+The root and candidate must have the same Agent author. Never guess an identity,
+edit the root, publish outside its thread, or post multiple candidate blocks.
+Otherwise state in the root that no candidate exists. Never copy secrets,
+personal data, production
 payloads, or raw logs. Do not mix knowledge edits into the reviewed business
 change: they require a separate knowledge pull request reviewed and merged by
 a human other than the candidate author.

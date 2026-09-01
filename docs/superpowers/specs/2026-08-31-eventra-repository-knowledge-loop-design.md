@@ -211,11 +211,15 @@ reviewers can see what context informed the work.
 Agents do not edit canonical knowledge as an incidental side effect of a
 business-code task. When delivery reveals a novel, verified, reusable fact,
 the Agent first posts its normal evidence root, retains the server-assigned
-comment UUID and canonical URL, and then posts one structured
-`KnowledgeCandidate` as a direct reply in that evidence thread. The root and
-reply have the same Agent author. This two-phase protocol avoids guessing a
-comment identity that Multica assigns only after creation. Ordinary code facts,
-task-specific commentary, guesses, and
+comment UUID and canonical URL, and ends that run with `candidate pending`.
+A coordinator then posts a bounded publication handoff in the evidence thread
+and triggers the same Agent in a second run. The Agent posts one structured
+`KnowledgeCandidate` as its reply in that same thread. The evidence and
+candidate have the same Agent author; the coordinator does not author candidate
+content. This cross-run protocol avoids both guessing a comment identity that
+Multica assigns only after creation and replying under a comment outside the
+current run's authorized set. Ordinary code facts, task-specific commentary,
+guesses, and
 duplicated documentation do not qualify.
 
 A candidate contains:
@@ -241,12 +245,12 @@ candidate supported by this pilot it contains exactly one fenced
 `eventra-knowledge-summary-v1` JSON pointer with schema version, child Issue
 identifier, evidence comment UUID, and candidate digest. The Curator follows
 the pointer to the original child evidence root and accepts the candidate only
-when the parent metadata, summary pointer, root identity, single direct
-candidate reply, author identity, candidate evidence identity, and candidate
-digest all match. For compatibility, a candidate already present in the root
-remains valid. Nested, foreign-author, missing, or multiple candidate blocks
-fail closed. Multiple candidates per parent are deferred until the generic
-workflow is designed.
+when the parent metadata, summary pointer, root identity, candidate ancestry,
+author identity, candidate evidence identity, and candidate digest all match.
+For compatibility, a candidate already present in the root or directly beneath
+it remains valid. A candidate outside the evidence thread, foreign-author,
+missing, or multiple candidate blocks fail closed. Multiple candidates per
+parent are deferred until the generic workflow is designed.
 
 The Delivery Lead aggregates candidate references when it closes or blocks a
 parent. It writes one immutable knowledge summary comment and only flat pointer
@@ -347,7 +351,8 @@ python3 -B -m tools.multica.knowledge verify
 
 `context`, `candidate`, `scan`, `plan`, and `verify` are read-only.
 `candidate` validates, canonicalizes, and prints the digest-bearing JSON block
-that an Agent places in one direct reply to its immutable evidence root.
+that the evidence Agent places in its immutable evidence thread during a
+separate follow-up run.
 `curate --apply` performs
 only the single planned mutation chain and verifies every authoritative
 acknowledgement by rereading it.
@@ -391,8 +396,9 @@ The end-to-end flow is:
 2. The Agent performs its existing implementation, review, QA, or coordination
    work and attaches normal exact-SHA evidence.
 3. If the work reveals reusable verified knowledge, the Agent retains the
-   evidence root UUID and URL, then adds exactly one typed candidate as a direct
-   reply in that thread.
+   evidence UUID and URL and reports `candidate pending`. A coordinator posts a
+   bounded handoff in that thread and triggers the same Agent, which adds
+   exactly one typed candidate as its reply in the same thread.
 4. The Delivery Lead aggregates candidate references on the parent and closes
    the delivery without waiting for curation.
 5. The Curator scans `pending` completed or blocked parents in deterministic

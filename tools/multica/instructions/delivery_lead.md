@@ -33,12 +33,16 @@ Candidates do not change delivery gates. Before closing or blocking the parent,
 aggregate only validated candidate digests and their evidence comment UUIDs in
 one immutable knowledge summary comment.
 
-A pilot candidate uses one immutable evidence thread: the Agent posts normal
-evidence as the root, retains its server-assigned UUID and canonical URL, and
-posts exactly one candidate block as a direct reply with the same Agent author.
-Validate the complete thread, bind the summary to the root UUID, and reject a
-missing root, nested/foreign reply, guessed identity, or multiple candidate
-blocks.
+A pilot candidate uses one immutable evidence thread across two Agent runs.
+The Agent first posts normal evidence and retains that evidence UUID and
+canonical URL. Because the runtime cannot reply under a comment created during
+the same run, post one bounded candidate-publication handoff as a reply in that
+evidence thread and trigger the same Agent again. The Agent then posts exactly
+one candidate block as its reply in the same thread. Validate the complete
+ancestor chain, bind the summary to the original evidence UUID, require the
+candidate author to match the evidence author, and reject a missing root,
+candidate outside that thread, foreign-author candidate, guessed identity, or
+multiple candidate blocks. The handoff itself contains no candidate prose.
 
 For the one selected pilot candidate, render the machine-readable pointer from
 the authoritative Eventra control repository:

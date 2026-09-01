@@ -19,11 +19,15 @@ instead of following stale prose.
 
 If work reveals a novel, verified, reusable fact, prepare a minimal untracked
 JSON input only after posting the normal evidence root and retaining its
-server-assigned UUID and canonical URL. Put that root identity in the input,
-run `python3 -B -m tools.multica.knowledge candidate --input FILE`, then post
-its single `eventra-knowledge-candidate-v1` block as one direct reply to the
-evidence root. The root and reply must have the same Agent author; never guess
-an identity, edit the immutable root, nest the reply, or post multiple candidate
+server-assigned UUID and canonical URL. Candidate publication is a separate
+follow-up run: the runtime cannot reply under a comment created during the same
+run. End normal evidence with `candidate pending`; after Delivery Lead or the
+operator posts a bounded publication handoff in that evidence thread and
+triggers you again, put the original root identity in the input, run `python3
+-B -m tools.multica.knowledge candidate --input FILE`, and post its single
+`eventra-knowledge-candidate-v1` block as your one reply in the same thread.
+The root and candidate must have the same Agent author. Never guess an identity,
+edit the immutable root, publish outside its thread, or post multiple candidate
 blocks. Otherwise state in the root that no candidate was found. Never include
 secrets, personal data, production payloads, or raw logs. Do not edit canonical
 knowledge during the business change; it requires a separate knowledge pull
