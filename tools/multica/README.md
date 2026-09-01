@@ -561,8 +561,12 @@ multica autopilot trigger KNOWLEDGE_CURATOR_AUTOPILOT_ID --output json
 multica autopilot runs KNOWLEDGE_CURATOR_AUTOPILOT_ID --limit 5 --output json
 ```
 
-One pass may create at most one deterministic knowledge Issue. The assigned
-Curator rereads source evidence, changes only the repository knowledge
+One pass may create at most one deterministic knowledge Issue. Cross-run
+uniqueness relies on the deterministic action-key title, Multica's default
+active-duplicate rejection (the command never passes `--allow-duplicate`), and
+the Curator Agent's configured concurrency of 1. A loser or lost acknowledgement
+is recovered by authoritative search; this is not a generic client-side CAS for
+arbitrary callers. The assigned Curator rereads source evidence, changes only the repository knowledge
 allowlist, runs `check-change`, opens one source-linked PR, records the canonical
 `eventra.knowledge.pr` state, and stops at `pr_open` for human review. A human
 may reject or merge; the Curator never does either. `verified` is recorded only

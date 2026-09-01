@@ -414,6 +414,21 @@ def compact_comment(comment_id, content, *, parent_id=None, created_at="2026-08-
     return value
 
 
+def canonical_pr_record(digest, *, repository="frontend", **overrides):
+    repository_name = "Eventra-Backend" if repository == "backend" else "Eventra"
+    value = {
+        "candidate_digest": digest,
+        "head_sha": "a" * 40,
+        "merge_sha": None,
+        "repository": repository,
+        "source_branch": f"eventra-knowledge/{digest}",
+        "status": "pr_open",
+        "url": f"https://github.com/codeExploreHub/{repository_name}/pull/1",
+    }
+    value.update(overrides)
+    return json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+
 class KnowledgeSummaryTests(unittest.TestCase):
     def test_summary_pointer_round_trip_is_canonical_and_contains_no_claim(self):
         rendered = render_summary_pointer(
@@ -613,6 +628,17 @@ def parent_ref():
 
 
 class KnowledgeCandidateSnapshotTests(unittest.TestCase):
+    def test_rejects_member_authored_candidate_even_when_author_matches(self):
+        runner = CandidateEvidenceRunner()
+        runner.evidence["author_type"] = "member"
+
+        with self.assertRaisesRegex(RuntimeError, "invalid knowledge evidence"):
+            load_candidate_snapshot(
+                runner,
+                parent_ref(),
+                {"frontend": FRONTEND_PROJECT_ID, "backend": BACKEND_PROJECT_ID},
+            )
+
     def test_loads_candidate_from_single_reply_in_evidence_thread(self):
         runner = CandidateEvidenceRunner()
         candidate_reply_uuid = "01a00000-0000-7000-8000-000000000204"
@@ -932,6 +958,7 @@ class CurationApplyRunner(CombinedKnowledgeRunner):
         self.description_paths = []
         self.descriptions = []
         self.raise_after_committed_issue_create = False
+        self.concurrent_issue_create_wins = False
         self.fail_issue_create = False
         self.change_parent_on_get = None
         self.parent_gets = 0
@@ -1047,6 +1074,10 @@ class CurationApplyRunner(CombinedKnowledgeRunner):
                 raise RuntimeError("Multica command failed with exit 1")
             project_id = self._flag(call, "--project")
             action_key = self._flag(call, "--title").rsplit(" ", 1)[1]
+            if self.concurrent_issue_create_wins:
+                self.concurrent_issue_create_wins = False
+                self.seed_action_issue(action_key, project_id=project_id)
+                raise RuntimeError("active duplicate rejected")
             issue = self.seed_action_issue(action_key, project_id=project_id)
             issue["description"] = description
             if self.raise_after_committed_issue_create:
@@ -1542,7 +1573,7 @@ class KnowledgeCurationRecoveryTests(unittest.TestCase):
             runner, self.projects, self.curator_id, False, **self.roots
         )
         issue = runner.seed_action_issue(planned.action_key)
-        pr_record = '{"status":"pr_open"}'
+        pr_record = canonical_pr_record(runner.payload["digest"])
         runner.issue_metadata[issue["identifier"]]["eventra.knowledge.pr"] = pr_record
 
         result = curate_once(
@@ -1560,6 +1591,37 @@ class KnowledgeCurationRecoveryTests(unittest.TestCase):
             "eventra.knowledge.transition",
             runner.issue_metadata[issue["identifier"]],
         )
+
+    def test_malformed_or_mismatched_pr_metadata_blocks_transition_recovery(self):
+        for build_pr_record in (
+            lambda runner: '{"status":"pr_open"}',
+            lambda runner: canonical_pr_record("e" * 64),
+            lambda runner: canonical_pr_record(
+                runner.payload["digest"], repository="backend"
+            ),
+            lambda runner: canonical_pr_record(
+                runner.payload["digest"],
+                source_branch=f"eventra-knowledge/{'e' * 64}",
+            ),
+        ):
+            runner = CurationApplyRunner()
+            pr_record = build_pr_record(runner)
+            planned = curate_once(
+                runner, self.projects, self.curator_id, False, **self.roots
+            )
+            issue = runner.seed_action_issue(planned.action_key)
+            runner.issue_metadata[issue["identifier"]]["eventra.knowledge.pr"] = pr_record
+
+            with self.subTest(pr_record=pr_record):
+                result = curate_once(
+                    runner, self.projects, self.curator_id, True, **self.roots
+                )
+                self.assertEqual(result.decision, "needs_human")
+                self.assertEqual(result.mutation_count, 0)
+                self.assertNotIn(
+                    "eventra.knowledge.transition",
+                    runner.issue_metadata[issue["identifier"]],
+                )
 
     def test_unknown_knowledge_metadata_still_blocks_transition_recovery(self):
         runner = CurationApplyRunner()
@@ -1593,6 +1655,20 @@ class KnowledgeCurationRecoveryTests(unittest.TestCase):
         self.assertEqual(second.created, 0)
         self.assertEqual(len(runner.created_issues), 1)
         self.assertEqual(runner.create_attempts, 1)
+
+    def test_concurrent_create_winner_is_recovered_after_duplicate_rejection(self):
+        runner = CurationApplyRunner()
+        runner.concurrent_issue_create_wins = True
+
+        result = curate_once(
+            runner, self.projects, self.curator_id, True, **self.roots
+        )
+
+        self.assertEqual(result.decision, "dispatched")
+        self.assertEqual(len(runner.created_issues), 1)
+        self.assertEqual(runner.create_attempts, 1)
+        create = next(call for call in runner.calls if call[:2] == ("issue", "create"))
+        self.assertNotIn("--allow-duplicate", create)
 
     def test_partial_dispatch_record_resumes_but_malformed_record_stops_before_create(self):
         runner = CurationApplyRunner()

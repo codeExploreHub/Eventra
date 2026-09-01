@@ -760,7 +760,9 @@ def load_candidate_snapshot(
             raise RuntimeError("invalid knowledge evidence")
         ancestor_id = ancestor["parent_id"]
     if (
-        candidate_comment["author_id"] != evidence_comment["author_id"]
+        evidence_comment["author_type"] != "agent"
+        or candidate_comment["author_type"] != "agent"
+        or candidate_comment["author_id"] != evidence_comment["author_id"]
         or candidate_comment["author_type"] != evidence_comment["author_type"]
     ):
         raise RuntimeError("invalid knowledge evidence")
@@ -1153,11 +1155,59 @@ def _controlled_knowledge_metadata(metadata: Mapping[str, str]) -> dict[str, str
 
 def _controlled_issue_transition_metadata(
     metadata: Mapping[str, str],
+    *,
+    candidate_digest_value: str,
+    target_repository: str,
 ) -> dict[str, str]:
     controlled = _controlled_knowledge_metadata(metadata)
     allowed = {"eventra.knowledge.transition", "eventra.knowledge.pr"}
     if not set(controlled).issubset(allowed):
         raise RuntimeError("invalid knowledge transition")
+    pr_record = controlled.get("eventra.knowledge.pr")
+    if pr_record is not None:
+        try:
+            payload = json.loads(pr_record)
+        except (TypeError, json.JSONDecodeError):
+            raise RuntimeError("invalid knowledge transition") from None
+        required = {
+            "repository", "candidate_digest", "url", "source_branch",
+            "head_sha", "status", "merge_sha",
+        }
+        repository = payload.get("repository") if isinstance(payload, dict) else None
+        digest = payload.get("candidate_digest") if isinstance(payload, dict) else None
+        branch = payload.get("source_branch") if isinstance(payload, dict) else None
+        head_sha = payload.get("head_sha") if isinstance(payload, dict) else None
+        status = payload.get("status") if isinstance(payload, dict) else None
+        merge_sha = payload.get("merge_sha") if isinstance(payload, dict) else None
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != required
+            or json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ) != pr_record
+            or repository != target_repository
+            or digest != candidate_digest_value
+            or _DIGEST.fullmatch(digest) is None
+            or branch != f"eventra-knowledge/{digest}"
+            or not isinstance(head_sha, str)
+            or _SHA.fullmatch(head_sha) is None
+            or not _knowledge_pr_url(repository, payload.get("url"))
+            or status
+            not in {"pr_open", "rejected", "merged", "verified", "needs_human"}
+            or (status in {"merged", "verified"} and merge_sha is None)
+            or (status in {"pr_open", "rejected"} and merge_sha is not None)
+            or (
+                merge_sha is not None
+                and (
+                    not isinstance(merge_sha, str)
+                    or _SHA.fullmatch(merge_sha) is None
+                )
+            )
+        ):
+            raise RuntimeError("invalid knowledge transition")
     return {
         key: value
         for key, value in controlled.items()
@@ -1381,6 +1431,10 @@ def curate_once(
                 description_path = Path(handle.name)
             raw_created = runner.run(
                 [
+                    # The deterministic action-key title plus Multica's default
+                    # active-duplicate rejection is the server-side uniqueness
+                    # boundary. Never add --allow-duplicate here; the recovery
+                    # search below handles the concurrent winner or a lost ack.
                     "issue", "create",
                     "--title", title,
                     "--description-file", str(description_path),
@@ -1455,7 +1509,9 @@ def curate_once(
             snapshot, decision, identifier, "issue_created"
         )
         target_metadata = _controlled_issue_transition_metadata(
-            _load_metadata(runner, identifier)
+            _load_metadata(runner, identifier),
+            candidate_digest_value=snapshot.candidate.digest,
+            target_repository=decision.target_repository,
         )
         expected_target = {"eventra.knowledge.transition": issue_transition}
         if target_metadata not in ({}, expected_target):
@@ -1468,7 +1524,9 @@ def curate_once(
                 issue_transition,
             )
         if _controlled_issue_transition_metadata(
-            _load_metadata(runner, identifier)
+            _load_metadata(runner, identifier),
+            candidate_digest_value=snapshot.candidate.digest,
+            target_repository=decision.target_repository,
         ) != expected_target:
             raise RuntimeError("invalid knowledge transition")
 
