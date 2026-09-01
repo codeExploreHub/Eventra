@@ -1,0 +1,292 @@
+# Generic Multica multi-repository delivery core
+
+This document is the operator contract for the Plan 1 Python core in
+`tools/multica_delivery`. The core models and coordinates one GitHub product
+made of one or more repositories, one control Project, one Project and one
+Engineer per managed repository, and one Multica daemon. It is a library
+boundary, not the reusable onboarding skill or its command-line interface.
+
+No generic user-facing CLI is implemented in this core. Plan 2 owns the
+user-facing CLI confirmation boundary and the reusable
+`multica-multi-repo-delivery` skill. Do not invent a command around a private
+function or treat the module names below as executable entry points.
+
+## Control repository inputs
+
+The reviewed product manifest is authoritative and is stored at
+`delivery-control/delivery.yaml`. Generated identities, compatibility
+versions, and the manifest digest are stored separately at
+`delivery-control/framework.lock`. Secret values belong in neither file: the
+manifest names only environment variables and their permitted Agent roles.
+
+`delivery.yaml` declares the instance and control repository, an
+operator-approved skill registry, one to N managed repositories, local
+commands and services, dependency edges, integration suites, merge order, and
+policy. `framework.lock` records generated resource identities and version
+compatibility; it is not a second source of desired state.
+
+The manifest boundary is strict. It rejects unknown or duplicate fields,
+invalid or duplicate repository/Project/path/port identities, missing required
+commands, undeclared secrets or skills, non-public skill origins, invalid
+dependency graphs and orders, an invalid repair budget, deployment, and
+production automatic merge. Repository commands are argument arrays rather
+than shell text.
+
+Skill sources are operator-approved public GitHub URLs only. The framework
+does not query or import from the company-internal SkillsHub. A same-name skill
+from a different origin is a hard stop rather than an implicit replacement.
+
+## Install and verify
+
+From the control-repository root, install the one pinned dependency:
+
+```bash
+python3 -m pip install -r requirements-multica.txt
+```
+
+The pin is `PyYAML==6.0.2`. Run the complete legacy and generic test suite and
+then compile both packages:
+
+```bash
+python3 -B -m unittest discover -s tools -p 'test_*.py' -v
+python3 -B -m compileall -q tools/multica tools/multica_delivery
+```
+
+Importing modules and running tests never mutate Multica, GitHub, local
+services, or secrets. Tests use in-memory fakes and temporary runtime state;
+they do not contact live services.
+
+## Public core boundary
+
+Plan 2 may compose these tested interfaces without reading implementation
+internals:
+
+- `manifest.load_manifest`, `load_manifest_text`, `manifest_digest`, and
+  `load_lock` decode the immutable `DeliveryManifest` and `FrameworkLock`.
+- `topology.topological_waves` and `merge_order` enforce dependency-closed,
+  deterministic execution and merge order.
+- `metadata.encode_*` and `decode_*` exchange strict canonical JSON envelopes.
+  Secrets, raw Issue bodies, tokens, and arbitrary object strings are not valid
+  metadata.
+- `decisions.decide_parent_action` is the pure parent state machine. Its
+  evidence is tied to exact candidate SHAs and its repair budget is exactly two
+  attempts.
+- `contract_audit.audit_contracts` performs fixed, read-only capability and
+  contract probes and returns pass/warn/fail entries.
+- `Provisioner.reconcile(manifest, lock, apply=False, secret_lookup=...)`
+  performs authoritative reads and returns a deterministic, redacted plan.
+  It does not create or update Multica resources. Provisioning live effects
+  require an explicit `apply=True` call where `apply` is an exact `bool`;
+  strings, integers, and bool-like values fail before any read. A converged second apply has
+  `mutation_count == 0`; duplicate, foreign, malformed, or non-convergent state
+  fails closed.
+- `GenericWorkflow` consumes typed snapshots and injected adapters to intake a
+  Backlog-to-Todo transition, dispatch dependency waves, record phase
+  completion, resume the parent, merge an already-gated plan, run local smoke,
+  and perform bounded stalled-work recovery. Its effects occur only when its
+  explicit workflow methods are called; importing the module has no effect.
+  Parent progression is authorized only from the manifest's exact control
+  Project. Before any decision or state-changing block, one guarded schema gate
+  revalidates every metadata field and every nested snapshot, evidence, child,
+  and pull-request target value; constructor identity alone is not authority.
+  Phase-completion and smoke DTOs are fully validated before the first store
+  read. New phase evidence must name the active, current-stage child whose
+  creation candidate map and exact creation action are already authoritative;
+  historical or post-merge evidence is replay-only and requires the one exact
+  completion action key.
+- `ProcessManager` starts, reuses, and stops local services only when its
+  manifest binding and private runtime registry prove the same instance owner, Run, repository,
+  exact SHA, PID, port, health URL, launch argv, and launch cwd. Service set and
+  launch identity must match the manifest before registry access or spawn. The
+  launch-provenance fields are required registry schema; older records are
+  invalid rather than migrated or reused. An unknown or partially owned process
+  blocks the operation and is never reused or terminated.
+
+`MulticaClient` and `GitHubClient` are strict subprocess boundaries, not
+general-purpose command runners. They accept closed argument shapes, validate
+JSON responses, retry only bounded safe reads, redact failures, and restrict
+GitHub operations to the manifest allowlist. Required checks, review, QA, and
+merge evidence name the exact candidate SHA. No secret value belongs in argv,
+logs, exceptions, Issues, comments, pull requests, reports, or the lock file.
+Exception relays discard raw traceback, cause, and context graphs through
+non-throwing cleanup that contains even hostile `BaseException` behavior; the
+new safe exception is raised only after caught raw references have left scope.
+
+Public one-ID reads accept only the exact full-match identifier grammar
+`[A-Za-z0-9][A-Za-z0-9._:-]{0,255}`. Empty, option-like,
+whitespace-containing, slash-containing, overlength, and extra-token forms are
+rejected before the runner is called. Identifiers are not normalized,
+lowercased, split, or aliased.
+For runtime lookup, configured runtime and daemon IDs are defaults only when
+the corresponding argument is exactly `None`; every explicit falsy or
+otherwise invalid value is validated and rejected before runner execution.
+
+## Effect, merge, deployment, and Watcher policy
+
+Dry-run is the default onboarding posture: audit contracts, validate local
+inputs, and inspect `Provisioner.reconcile(..., apply=False, ...)` before any
+approved apply. Only `Provisioner.reconcile(..., apply=True, ...)` authorizes
+the planned Multica resource reconciliation. That approval does not authorize
+GitHub repository creation, commit, push, business-code changes, pull-request
+merge, or deployment.
+
+Eventra provision dry-run is read-only; a later `--apply` is a separate explicit
+authorization with fresh authoritative preflight and revalidation. Eventra
+provision does not accept, bind, or validate a dry-run plan ID or hash. Push,
+tag, release, and deployment require separate authority. Version 2 parent
+metadata requires Stage fan-in before any gate decision. Core/plan-parent is the
+sole fan-in, canonical FailureBundle producer, and decision authority; it
+returns canonical JSON with the exact `failure_bundle` and digest, but does not
+create a Stage or child. Delivery Lead is the sole execution actor: after
+validating Core's canonical JSON, it uses the exact returned `failure_bundle`
+and digest without reconstruction. The sole operational repair command is
+`python3 -B -m tools.multica.workflow execute-parent-repair PRO-M
+--expected-action-key ACTION_KEY`; do not create repair children manually. It
+freshly rereads and replans, writes `eventra.workflow.repair_reservation`, parks
+one child per owner in backlog, persists and rereads
+`eventra.repair.creation_action`, `eventra.repair.failure_bundle_digest`, sorted
+evidence UUIDs, stage/round, managed PR, and
+`eventra.repair.authorizing_comment_uuid`, plus the canonical immutable
+`eventra.repair.source_candidates` rejected-SHA map, commits parent state and consumed
+authorization provenance, promotes only exact bound children, and clears the
+reservation last. Promotion starts the assigned agent only after the exact
+deterministic repair handoff has been persisted and reread; that handoff binds
+parent/action/bundle, source and next Stage, candidate and rejected SHAs,
+managed PR, source children, and assigned canonical evidence. `mutation_count`
+reports authoritatively observed effects, including a committed effect after a
+lost acknowledgement. An exact reserved backlog child interrupted during its
+canonical metadata writes is quarantined from Stage fan-in; retry verifies the
+immutable issue identity, no-run state, source evidence/authorization, and exact
+sorted prefix before writing only the missing suffix. Extra or conflicting
+metadata is never overwritten. Other conflicting or partial state blocks
+visibly; exact retries resume or no-op. This Eventra adapter relies on a single serialized Delivery
+Lead (`max_concurrent_tasks=1`) and is not generic CAS or transaction safety.
+
+The rejected source map remains immutable across execution and replay. A
+version-2 repair PASS must produce a different SHA for its owned repository;
+`finish-phase` changes only that child's owned `eventra.phase.sha.*` once and
+does not rewrite repair provenance or parent candidates. Once every owner child
+passes, Delivery Lead copies the exact replacement map to parent candidate
+metadata while preserving untouched source SHAs, then plans again. A plan made
+before that copy waits visibly. Fresh gates require the copied parent map and
+authoritative managed PR heads to match every completed replacement exactly.
+
+For round 3 the only caller-supplied authority locator is an authoritative
+parent-scoped comment UUID. The adapter rereads that parent thread and requires
+authoritative `author_type=member` plus an exact canonical body containing only
+the current bundle digest and `granted_round=3`; caller-supplied body and author
+identity are never trusted. A valid FailureBundle binds the version-2 parent and Gate Stage/action identity, exact
+candidate SHA map, current child identities, canonical managed PR URLs,
+non-PASS verdicts, evidence UUIDs, canonical HTTPS evidence-comment URLs, legal
+owners, and remaining repair budget. The Core decision waits for every current
+Gate Stage child to become terminal; it neither trusts a partial Stage nor
+accepts prose in place of canonical JSON. Automatic repair rounds are exactly 1
+and 2. A member comment may authorize only the exact current FailureBundle's
+exact next round 3, once. If round 3 fails, block the parent; do not create
+another repair child.
+
+In a development instance, development/local quality gates may authorize
+automatic merge. Before merging, the current Core proves exact-SHA
+implementation PASS evidence, independent review and repository/integration QA
+evidence, required GitHub checks, and merge preflight. Multi-repository gates
+pass before the first merge; merges then follow the confirmed
+dependency-compatible order. The candidate, gate-evidence, child, and exact PR
+target authority is frozen across merge reservation and reread before every
+GitHub mutation. Any current-stage work is an unconditional barrier, including
+merge recovery. A partial merge blocks without rollback.
+
+`focused_test`, `test`, and `build` are manifest and Agent contracts, and
+inputs for a future executor; the current Core neither executes them nor
+records structured exact-SHA results for them. It accepts the implementation
+phase verdict and evidence UUID that an Agent records for the candidate SHA;
+it does not infer command execution from that PASS. After merging,
+`OwnedSmokeExecutor` runs declared repository smoke and applicable integration
+commands against the authoritative merged SHA map. Before starting any service,
+and again after startup, it binds every local checkout with the closed argv
+`git rev-parse HEAD`; stale or incomplete checkout evidence blocks command
+execution. Every command result must also carry the same structured exact-SHA
+map. `OwnedSmokeExecutor` trusts only the concrete
+`LocalExactShaCommandRunner`; tests may inject only its closed command backend,
+so a self-reporting runner cannot create authoritative smoke evidence. The
+workflow likewise accepts only the concrete manifest-bound
+`OwnedSmokeExecutor`; the public smoke-record method can replay an already
+persisted exact observation but cannot mint one. Its concrete `ProcessManager`
+must return registry- and host-verified ownership records covering every
+declared service. Startup or ownership failure records all affected repository
+and integration results as blocked and nonauthoritative, then human-blocks the
+parent. The concrete boundary never checks out or resets a repository; operators or Agents
+must place every checkout at the exact merged candidate. Unverified
+owner-checked cleanup blocks every smoke result. It starts declared local
+services only through `ProcessManager`, which blocks unknown or mismatched
+process ownership. Merge write acknowledgements are never sufficient evidence:
+the workflow authoritatively rereads the pull request and records its merged
+timestamp and merge-commit SHA before advancing the ordered merge prefix.
+
+This framework never deploys; deployment is always a separate, manually
+triggered external action. The manifest requires `deployment: forbidden`.
+In particular, production forbids automatic merge and deployment; Plan 1
+contains no switch that weakens that restriction.
+
+Each product has an independent Workflow Watcher Agent with concurrency one.
+It is outside the delivery Squad, so its scheduled recovery cannot consume the
+Delivery Lead's slot. The Watcher may reread only the configured Projects and
+rerun at most one already-intended stalled assignment. It never creates work,
+changes a repair attempt, waives a gate, edits business code, merges, rolls
+back, or deploys. Recovery selects only the current stage/attempt child with
+matching repository, phase, suite, and authoritative creation action, and the
+expected phase is derived from current parent evidence rather than from the
+available child alone. A historical or wrong-phase child can never be rerun.
+If every repository is already merged, any pure missing, pending, failed, or
+stale pre-merge-evidence decision is propagated as a zero-mutation human block;
+the recovery path never converts it to a noop or rerun.
+
+The Watcher cannot create a FailureBundle or dispatch repair. It may recover one
+existing current assignment only after its version, Stage, attempt, repository,
+phase, suite, and authoritative creation action match. Malformed bundles,
+version mismatch, and PR drift are human-visible blocks. A gate comment, PR
+mention, or completed child cannot create repair or coding authority.
+
+## Eventra compatibility and migration boundary
+
+The Eventra compatibility adapter remains operational at
+`tools.multica.eventra_adapter`. `eventra_manifest(workspace)` translates the
+existing local frontend/backend product into the generic immutable manifest;
+the reviewed Eventra fixture verifies the same repositories, dependency and
+merge order, local commands, public skill bindings, secret names, and
+development/manual-deployment policy. Its pinned live IDs are immutable data;
+loading the adapter or fixture performs no live call.
+
+The existing `tools.multica` entry points remain the operational Eventra path
+until the frontend-only, backend-only, and cross-repository compatibility
+pilots demonstrate parity. Plan 1 does not migrate live resources, rewrite
+active Issue metadata, create a control repository, push commits, or replace
+the legacy entry points. Those actions require a later migration plan and
+their own approval.
+
+Completed version 1 metadata is read-only history. Active version 1 work
+requires an explicit migration to version 2 before it can create a Stage, fan
+in gate results, dispatch repair, merge, or complete a parent. Historical
+inspection can read a completed version-1 record and its evidence, but cannot
+rerun it or create a child from it.
+
+## Plan 2 lifecycle names
+
+The approved Plan 2 public lifecycle reserves exactly these command names:
+
+- `discover`: read selected repositories and classify findings as confirmed,
+  inferred, or unknown;
+- `init`: create only the approved local scaffold and manifest draft;
+- `validate`: validate the manifest and local contracts without mutation;
+- `plan`: perform read-only audits and produce a fresh mutation-free plan;
+- `apply`: require the matching fresh plan plus explicit operator approval
+  before external reconciliation;
+- `doctor`: inspect contracts, instance health, recipient coverage, Watcher
+  state, and convergence; and
+- `upgrade`: plan a compatible framework/schema migration, verify it, and wait
+  for approval before applying it.
+
+These names are reservations, not currently runnable generic commands. Plan 2
+must keep discovery and validation read-only, expose the current phase, reject
+inferred/unknown values until confirmed, and require a fresh plan hash and
+explicit confirmation for `apply`. GitHub repository creation, commit, push,
+production changes, and deployment remain separate authority boundaries.

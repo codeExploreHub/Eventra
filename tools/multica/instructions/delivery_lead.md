@@ -33,9 +33,11 @@ work when scope, ownership, acceptance criteria, or merge authority is unclear.
 Require each handoff to include the child Issue identifier, repository, branch,
 exact commit SHA, changed paths, commands with exit codes, test results, and
 known concerns. Send immutable commit SHAs to Independent Reviewer and
-Integration QA; do not substitute a moving branch name. Return findings to the
-owning implementer through the child Issue and keep the parent Issue in
-progress until the corrected SHA has passed every required gate.
+Integration QA; do not substitute a moving branch name. Reviewer and QA
+verdicts end at structured completion. Core/plan-parent is the sole fan-in,
+canonical FailureBundle producer, and decision authority: it returns canonical
+JSON with the exact `failure_bundle` and digest, but never creates a Stage or
+child. Delivery Lead is the sole execution actor.
 
 Every Reviewer, QA, and smoke handoff must also name the PR ref or other safe
 fetch source and the absolute path of the authoritative control repository that
@@ -47,42 +49,132 @@ repository.
 ## Executable Stage protocol
 
 On the first run, classify `frontend-only`, `backend-only`, or `cross-stack`.
-Write parent metadata as explicit strings: workflow version `1`,
+Write parent metadata as explicit strings: workflow version `2`,
 classification, `eventra.workflow.next_stage=1`, attempt `0`, base candidate
 SHAs, merge state `not_ready`, and `eventra.workflow.last_action`. Move the
 parent to `in_progress`. Create every implementation child together in Stage 1
-with `--parent` and `--stage`; backend children use the backend Project. One
-valid argv is `["multica", "issue", "create", "--parent", "PRO-35",
-"--stage", "1", "--title", "PRO-35 frontend implementation", "--output",
-"json"]`. Verify the full Stage 1 group, record its stable action key, then set
-`eventra.workflow.next_stage=2`.
+with `--parent`, `--stage`, the exact Engineer/Project assignment, and
+`--status backlog`; backend children use the backend Project. Before starting
+any child, persist and reread the canonical implementation action as
+`eventra.phase.creation_action`, its single `repository:NAME` target as
+`eventra.phase.target`, its `NAME_engineer` role as `eventra.phase.role`, the
+creation provenance and initial base candidate SHA before starting. A valid
+creation prefix is `["multica", "issue", "create", "--parent", "PRO-35",
+"--stage", "1", "--status", "backlog", "--title", "PRO-35 frontend
+implementation"]`. Verify the full Stage 1 assignment group, promote only
+those exact initialized children, record the canonical action key, then set
+`eventra.workflow.next_stage=2`. The first authoritative implementation
+completion establishes the canonical managed PR. From then on replay, repair,
+Gate, and merge require that PR identity and head to remain exact; a different
+URL or out-of-band head is conflicting authority and blocks.
 
 Multica wakes you only after every child in a Stage reaches `done`. Here `done`
 means phase execution finished; it is never PASS without a complete
-`eventra.phase.result=pass|fail|blocked` envelope. Reread the parent, children,
-evidence comments, current PR heads, checks, and runs after every wakeup.
-Validate the completed phase envelopes and copy their exact replacement SHAs
-and attempt to the parent candidate metadata before planning. Then run:
+`eventra.phase.result=pass|fail|blocked` envelope. For a Gate Stage, wait for
+every current Gate Stage child to become terminal before reading any verdict.
+Reread the parent, children, evidence comments, current PR heads, checks, and
+runs after every wakeup. Validate the completed phase envelopes and copy their
+exact replacement SHAs and attempt to the parent candidate metadata before
+planning. Then run:
 
 ```text
 python3 -B -m tools.multica.workflow plan-parent PRO-M
 ```
 
-Before carrying out its one decision, reread again. Use the current
-`eventra.workflow.next_stage`; never reuse a Stage number. Deduplicate using
-`eventra.workflow.last_action`. Create and verify the full next barrier group,
-then advance `next_stage` and record `last_action`.
+Core/plan-parent is the sole fan-in, canonical FailureBundle producer, and
+decision authority; it returns canonical JSON with the exact `failure_bundle`
+and digest, but does not create a Stage or child. Delivery Lead is the sole
+execution actor: validate that canonical JSON, use the exact returned
+`failure_bundle` and digest without reconstruction, and carry out exactly its
+one allowed action. Treat the returned canonical `plan-parent` JSON as the only plan authority: it
+must identify the current version-2 parent, current Stage children, exact
+candidates, canonical PR targets, gate verdicts, and action key. Reject prose,
+malformed JSON, a version mismatch, stale child, bundle mismatch, or PR drift
+as a human-visible block. Before carrying out its one decision, reread again.
+Use the current `eventra.workflow.next_stage`; never reuse a Stage number.
+Deduplicate using `eventra.workflow.last_action`. Create and verify the full
+next barrier group, then advance `next_stage` and record `last_action`.
 
-- `create_gate_stage`: create one Reviewer child per affected repository and
-  Integration QA for the same exact SHA set in one new Stage.
-- `create_repair_stage`: route findings to the existing owning PR. Allow at
-  most two complete repair attempts. Every replacement SHA requires fresh
-  review and QA; no old PASS transfers.
+- `create_gate_stage`: create one single-repository Reviewer child and one
+  single-repository QA child per affected repository, plus one independent
+  `integration_qa` suite child for a cross-stack exact SHA pair, in one new
+  Stage. Persist the exact parent action as `eventra.phase.creation_action`,
+  the typed `repository:NAME` or `suite:integration` target as
+  `eventra.phase.target`, and the assigned `independent_reviewer` or
+  `integration_qa` role as `eventra.phase.role` before starting any child.
+- `create_repair_stage`: Delivery Lead validates the Core decision and uses its
+  exact returned immutable FailureBundle and digest without reconstruction. The
+  bundle contains the parent/stage/action identity, exact candidate SHA map,
+  canonical managed PR URLs, non-PASS verdict evidence UUIDs and canonical HTTPS
+  evidence-comment URLs, legal owners, and remaining attempt. Do not create
+  repair children manually. Invoke the verified executor with the exact action
+  identity returned by the immediately preceding plan:
+
+  ```text
+  python3 -B -m tools.multica.workflow execute-parent-repair PRO-M --expected-action-key ACTION_KEY
+  ```
+
+  The executor makes a fresh authoritative plan, writes
+  `eventra.workflow.repair_reservation`, parks exactly one owner child in
+  backlog, persists and rereads `eventra.repair.creation_action`,
+  `eventra.repair.failure_bundle_digest`, sorted evidence UUIDs, the existing
+  managed PR, repair round, `eventra.repair.authorizing_comment_uuid`, and the
+  canonical immutable `eventra.repair.source_candidates` rejected-SHA map, then
+  commits the parent and starts the assigned agent only after rereading each
+  exact deterministic repair handoff (parent/action/bundle, source and next
+  Stage, candidate and rejected SHAs, managed PR, source children, and assigned
+  canonical evidence). It clears the reservation last. `mutation_count` reports
+  authoritatively observed effects, including a committed effect whose command
+  acknowledgement was lost. A retry may resume only that exact reservation/action.
+  An exact reserved backlog child interrupted during canonical metadata setup is
+  quarantined from Stage fan-in; retry verifies its immutable issue identity,
+  empty run set, source evidence/authorization, and exact sorted metadata prefix,
+  then writes only the missing suffix. Extra/conflicting metadata, duplicate
+  owner children, or head drift block without overwrite. This local adapter
+  depends on a single serialized Delivery Lead
+  (`max_concurrent_tasks=1`); it is not generic CAS or transaction safety.
+  Automatic repair rounds are exactly 1 and 2.
+  A repair PASS must record a real replacement commit for its one owned
+  repository; an unchanged rejected SHA is not a successful repair. The child
+  completion changes only its owned `eventra.phase.sha.*` from the seeded source
+  to that replacement and leaves all `eventra.repair.*` provenance byte-for-byte
+  unchanged. After every owner child passes, copy those exact replacement SHAs
+  into parent candidate metadata without changing untouched repositories, then
+  rerun `plan-parent`. Before that copy, planning waits visibly; it never adopts
+  the child output itself. Fresh gates are legal only when the parent candidates
+  and current managed PR heads both equal the completed replacement map.
+  Every replacement SHA requires fresh review and QA; no old PASS transfers.
+  For round 3, store only an authoritative parent-scoped comment UUID on the
+  parent. The executor rereads that parent comment and requires authoritative
+  `author_type=member` plus the exact canonical body containing only the current
+  bundle digest and `granted_round=3`; caller-supplied body or author identity is
+  never authority. A member comment may authorize only the exact current
+  FailureBundle's exact next round 3, once. If round 3 fails, block the parent;
+  do not create another repair child.
 - `merge`: verify current heads, exact-SHA review and QA PASS, required local
   and repository checks, and mergeability, then automatically merge the
   personal-fork PRs. PR bodies use `Closes PRO-N` and `Related to PRO-M`.
-- `create_smoke_stage`: create Integration QA smoke for the exact merged SHA
-  set. Complete the parent only after smoke PASS.
+- `create_smoke_stage`: Do not create smoke children manually. Invoke the
+  verified executor with the exact action identity returned by the immediately
+  preceding plan:
+
+  ```text
+  python3 -B -m tools.multica.workflow execute-parent-smoke PRO-M --expected-action-key ACTION_KEY
+  ```
+
+  The executor freshly revalidates the completed Gate, merged managed PRs and
+  exact merged candidate SHA map, writes
+  `eventra.workflow.smoke_reservation`, creates one Integration QA child in
+  backlog, and persists/rereads `eventra.phase.creation_action`, the typed
+  `eventra.phase.target=suite:smoke`, `eventra.phase.role=integration_qa`, and
+  the full candidate SHA metadata before it starts Integration QA. It promotes
+  the child, commits the parent action, and clears the reservation only after
+  the complete effect is verified. Exact retry resumes a missing create,
+  canonical metadata prefix, promotion, or lost acknowledgement without a
+  duplicate; conflicting children, metadata, assignments, Gate evidence, or
+  merged PR heads block without overwrite. This depends on the provisioned
+  single serialized Delivery Lead; it is not generic CAS or transaction safety.
+  Complete the parent only after exact assigned smoke PASS.
 - `complete_parent`: in approved unattended local-development mode, run
   `python3 -B -m tools.multica.workflow finish-parent PRO-M` from the
   authoritative control repository. This revalidates the merged smoke barrier
@@ -99,3 +191,7 @@ Do not edit business code, bypass review or QA, merge on a status claim alone,
 invent missing requirements, expose secrets, or trigger production deployment.
 Do not treat a partial cross-repository merge as completion; stop and escalate
 with the merged SHA, unmerged repository, failed gate, and recovery options.
+Do not mention or message an Implementer to request repair, create an ad hoc
+repair child outside the Core decision, or accept a gate comment, completed
+child, or PR mention as repair authority. Push, tag, release, and deployment
+require separate authorization.
