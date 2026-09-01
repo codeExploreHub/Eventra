@@ -24,11 +24,15 @@ from tools.multica.knowledge import (
     main,
     render_candidate_block,
     render_summary_pointer,
+    record_knowledge_pr,
+    reconcile_knowledge_pr,
     select_knowledge,
     stable_curation_decision,
+    verify_knowledge_change,
+    verify_merged_knowledge,
     verify_indexes,
 )
-from tools.multica.knowledge_contracts import candidate_digest
+from tools.multica.knowledge_contracts import KnowledgePullRequestState, candidate_digest
 
 
 SHA = "a" * 40
@@ -1039,6 +1043,362 @@ class KnowledgeCurationApplyTests(unittest.TestCase):
         self.assertEqual(second.created, 0)
         self.assertEqual(len(runner.created_issues), 1)
         self.assertEqual(runner.mutation_count, mutations)
+
+
+class KnowledgeChangePolicyTests(unittest.TestCase):
+    def test_frontend_and_backend_allow_only_repository_knowledge_paths(self):
+        frontend = verify_knowledge_change(
+            "frontend",
+            (
+                "AGENTS.md",
+                "docs/agent-knowledge/invariants.md",
+                "docs/delivery-knowledge/dependency-graph.md",
+            ),
+            "# Safe knowledge\n",
+        )
+        backend = verify_knowledge_change(
+            "backend",
+            ("AGENTS.md", "docs/agent-knowledge/testing.md"),
+            "# Safe backend knowledge\n",
+        )
+        self.assertEqual(frontend[0], "AGENTS.md")
+        self.assertEqual(backend[-1], "docs/agent-knowledge/testing.md")
+
+        for repository, path in (
+            ("backend", "src/main/java/App.java"),
+            ("backend", "docs/delivery-knowledge/contract.md"),
+            ("frontend", "src/App.tsx"),
+            ("frontend", "../outside.md"),
+            ("frontend", "/tmp/outside.md"),
+            ("frontend", "docs/agent-knowledge//invariants.md"),
+        ):
+            with self.subTest(repository=repository, path=path):
+                with self.assertRaisesRegex(ValueError, "knowledge change"):
+                    verify_knowledge_change(repository, (path,), "safe")
+
+    def test_rejects_empty_binary_conflict_secret_and_symlink_escape_redacted(self):
+        secret = "ghp_" + "A" * 36
+        invalid_text = (
+            "",
+            "binary\x00payload",
+            "<<<<<<< HEAD\nleft\n=======\nright\n>>>>>>> branch",
+            f"token={secret}",
+            "xoxb-" + "A" * 32,
+            "eyJ" + "A" * 20 + "." + "B" * 20 + "." + "C" * 20,
+        )
+        for value in invalid_text:
+            with self.subTest(value=value[:10]):
+                with self.assertRaisesRegex(ValueError, "knowledge change") as caught:
+                    verify_knowledge_change(
+                        "frontend",
+                        ("docs/agent-knowledge/invariants.md",),
+                        value,
+                    )
+                self.assertNotIn(secret, str(caught.exception))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repo"
+            outside = Path(directory) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            (root / "docs").mkdir()
+            (root / "docs" / "agent-knowledge").symlink_to(outside)
+            with self.assertRaisesRegex(ValueError, "knowledge change"):
+                verify_knowledge_change(
+                    "frontend",
+                    ("docs/agent-knowledge/escape.md",),
+                    "safe",
+                    repository_root=root,
+                )
+
+    def test_check_change_cli_verifies_indexes_and_emits_paths_only(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            staged = Path(directory) / "staged.txt"
+            staged.write_text("# Safe knowledge\n", encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(
+                    main([
+                        "check-change",
+                        "--repository", "frontend",
+                        "--changed-path", "docs/agent-knowledge/invariants.md",
+                        "--staged-text-file", str(staged),
+                        "--repository-root", str(Path.cwd()),
+                        "--frontend-root", str(Path.cwd()),
+                        "--backend-root", "/Users/didi/Eventra-workspace/Eventra-Backend/.worktrees/eventra-knowledge-loop",
+                    ]),
+                    0,
+                )
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {"count": 1, "paths": ["docs/agent-knowledge/invariants.md"]},
+        )
+
+
+class FakeKnowledgeGitHub:
+    def __init__(self, *, repository="frontend"):
+        self.repository = repository
+        self.calls = []
+        repo_name = "Eventra-Backend" if repository == "backend" else "Eventra"
+        self.url = f"https://github.com/codeExploreHub/{repo_name}/pull/42"
+        self.value = {
+            "url": self.url,
+            "headRefName": "eventra-knowledge/" + "d" * 64,
+            "headRefOid": "a" * 40,
+            "state": "OPEN",
+            "mergedAt": None,
+            "mergeCommit": None,
+        }
+
+    def run(self, args):
+        call = tuple(args)
+        self.calls.append(call)
+        expected = (
+            "pr", "view", self.url,
+            "--json", "url,headRefName,headRefOid,state,mergedAt,mergeCommit",
+        )
+        if call != expected:
+            raise AssertionError(f"unsupported GitHub argv: {call!r}")
+        return copy.deepcopy(self.value)
+
+
+class KnowledgePullRequestStateTests(unittest.TestCase):
+    digest = "d" * 64
+    branch = "eventra-knowledge/" + digest
+
+    def test_records_only_matching_open_target_repository_pr(self):
+        github = FakeKnowledgeGitHub(repository="backend")
+        state = record_knowledge_pr(
+            github,
+            "backend",
+            self.digest,
+            github.url,
+            self.branch,
+        )
+        self.assertEqual(state.status, "pr_open")
+        self.assertEqual(state.head_sha, "a" * 40)
+        self.assertEqual(len(github.calls), 1)
+        self.assertTrue(all(call[:2] == ("pr", "view") for call in github.calls))
+
+        with self.assertRaisesRegex(ValueError, "knowledge pull request"):
+            record_knowledge_pr(
+                github,
+                "frontend",
+                self.digest,
+                github.url,
+                self.branch,
+            )
+
+    def test_pr_state_cli_uses_read_only_runner_and_emits_canonical_identity(self):
+        github = FakeKnowledgeGitHub()
+        output = io.StringIO()
+        with (
+            mock.patch("tools.multica.workflow.GitHubRunner", return_value=github),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(
+                main([
+                    "pr-state",
+                    "--repository", "frontend",
+                    "--candidate-digest", self.digest,
+                    "--pr-url", github.url,
+                    "--source-branch", self.branch,
+                    "--frontend-root", str(Path.cwd()),
+                    "--backend-root", str(Path.cwd()),
+                ]),
+                0,
+            )
+        record = json.loads(output.getvalue())
+        self.assertEqual(record["status"], "pr_open")
+        self.assertEqual(record["candidate_digest"], self.digest)
+        self.assertEqual(record["url"], github.url)
+        self.assertNotIn("claim", record)
+        self.assertTrue(all(call[:2] == ("pr", "view") for call in github.calls))
+
+    def test_pr_state_cli_continues_from_full_recorded_terminal_state(self):
+        github = FakeKnowledgeGitHub()
+        github.value.update(
+            state="MERGED",
+            mergedAt="2026-09-01T09:00:00Z",
+            mergeCommit={"oid": "b" * 40},
+        )
+        output = io.StringIO()
+        with (
+            mock.patch("tools.multica.workflow.GitHubRunner", return_value=github),
+            mock.patch(
+                "tools.multica.knowledge.verify_merged_knowledge",
+                return_value=True,
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(
+                main([
+                    "pr-state",
+                    "--repository", "frontend",
+                    "--candidate-digest", self.digest,
+                    "--pr-url", github.url,
+                    "--source-branch", self.branch,
+                    "--recorded-head-sha", "a" * 40,
+                    "--recorded-status", "verified",
+                    "--recorded-merge-sha", "b" * 40,
+                    "--frontend-root", str(Path.cwd()),
+                    "--backend-root", str(Path.cwd()),
+                ]),
+                0,
+            )
+        self.assertEqual(json.loads(output.getvalue())["status"], "verified")
+
+        with self.assertRaisesRegex(ValueError, "knowledge pull request"):
+            main([
+                "pr-state",
+                "--repository", "frontend",
+                "--candidate-digest", self.digest,
+                "--pr-url", github.url,
+                "--source-branch", self.branch,
+                "--recorded-status", "verified",
+                "--frontend-root", str(Path.cwd()),
+                "--backend-root", str(Path.cwd()),
+            ])
+
+    def test_malformed_recorded_state_fails_before_github_read(self):
+        github = FakeKnowledgeGitHub()
+        current = KnowledgePullRequestState(
+            repository="frontend",
+            candidate_digest=self.digest,
+            url=github.url,
+            source_branch=self.branch,
+            head_sha="a" * 40,
+            status="verified",
+            merge_sha=None,
+        )
+        with self.assertRaisesRegex(ValueError, "knowledge pull request"):
+            reconcile_knowledge_pr(github, current)
+        self.assertEqual(github.calls, [])
+
+    def test_reconciles_open_closed_merged_verified_and_digest_drift(self):
+        github = FakeKnowledgeGitHub()
+        state = record_knowledge_pr(
+            github, "frontend", self.digest, github.url, self.branch
+        )
+        self.assertEqual(
+            reconcile_knowledge_pr(github, state, merged_verifier=lambda *_: True),
+            state,
+        )
+
+        github.value["state"] = "CLOSED"
+        rejected = reconcile_knowledge_pr(
+            github, state, merged_verifier=lambda *_: True
+        )
+        self.assertEqual(rejected.status, "rejected")
+
+        github.value.update(
+            state="MERGED",
+            mergedAt="2026-09-01T09:00:00Z",
+            mergeCommit={"oid": "b" * 40},
+        )
+        merged = reconcile_knowledge_pr(github, state)
+        self.assertEqual(merged.status, "merged")
+        self.assertEqual(merged.merge_sha, "b" * 40)
+        self.assertEqual(reconcile_knowledge_pr(github, merged), merged)
+        verified = reconcile_knowledge_pr(
+            github, merged, merged_verifier=lambda repo, sha, digest: (
+                repo == "frontend" and sha == "b" * 40 and digest == self.digest
+            )
+        )
+        self.assertEqual(verified.status, "verified")
+        self.assertEqual(reconcile_knowledge_pr(github, verified), verified)
+        self.assertEqual(
+            reconcile_knowledge_pr(
+                github,
+                verified,
+                merged_verifier=lambda *_: True,
+            ),
+            verified,
+        )
+        drift = reconcile_knowledge_pr(
+            github, state, merged_verifier=lambda *_: False
+        )
+        self.assertEqual(drift.status, "needs_human")
+
+    def test_changed_head_or_malformed_merge_fails_closed_without_mutation_argv(self):
+        github = FakeKnowledgeGitHub()
+        state = record_knowledge_pr(
+            github, "frontend", self.digest, github.url, self.branch
+        )
+        github.value["headRefOid"] = "c" * 40
+        changed = reconcile_knowledge_pr(
+            github, state, merged_verifier=lambda *_: True
+        )
+        self.assertEqual(changed.status, "needs_human")
+
+        github.value.update(
+            headRefOid="a" * 40,
+            state="MERGED",
+            mergedAt="2026-09-01T09:00:00Z",
+            mergeCommit=42,
+        )
+        with self.assertRaisesRegex(RuntimeError, "knowledge pull request"):
+            reconcile_knowledge_pr(github, state, merged_verifier=lambda *_: True)
+        self.assertTrue(all(call[:2] == ("pr", "view") for call in github.calls))
+
+    def test_exact_merged_sha_requires_verified_index_candidate_digest(self):
+        entries = load_index(
+            Path("docs/agent-knowledge/index.yaml"), Path.cwd(), "frontend"
+        )
+        matching = replace(
+            entries[0],
+            source_candidate_digest=self.digest,
+            last_verified_sha="b" * 40,
+        )
+        completed = mock.Mock(returncode=0, stdout="b" * 40 + "\n")
+        with (
+            mock.patch(
+                "tools.multica.knowledge.subprocess.run",
+                return_value=completed,
+            ) as run,
+            mock.patch(
+                "tools.multica.knowledge.verify_indexes",
+                return_value=(matching,),
+            ),
+        ):
+            self.assertTrue(
+                verify_merged_knowledge(
+                    "frontend",
+                    "b" * 40,
+                    self.digest,
+                    frontend_root=Path.cwd(),
+                    backend_root=Path.cwd(),
+                )
+            )
+        self.assertEqual(
+            run.call_args.args[0][0:3],
+            ["git", "-C", str(Path.cwd().resolve())],
+        )
+
+        with (
+            mock.patch(
+                "tools.multica.knowledge.subprocess.run",
+                return_value=completed,
+            ),
+            mock.patch(
+                "tools.multica.knowledge.verify_indexes",
+                return_value=(replace(matching, source_candidate_digest="e" * 64),),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "merged knowledge"):
+                verify_merged_knowledge(
+                    "frontend",
+                    "b" * 40,
+                    self.digest,
+                    frontend_root=Path.cwd(),
+                    backend_root=Path.cwd(),
+                )
+
+
+class KnowledgeCurationRecoveryTests(unittest.TestCase):
+    roots = KnowledgeCurationApplyTests.roots
+    projects = KnowledgeCurationApplyTests.projects
+    curator_id = KnowledgeCurationApplyTests.curator_id
 
     def test_ambiguous_committed_create_is_recovered_without_duplicate(self):
         runner = CurationApplyRunner()

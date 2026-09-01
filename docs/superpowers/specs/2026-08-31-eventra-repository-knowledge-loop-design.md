@@ -333,6 +333,8 @@ python3 -B -m tools.multica.knowledge summary --child ISSUE --evidence-comment U
 python3 -B -m tools.multica.knowledge scan --project-id ID --backend-project-id ID
 python3 -B -m tools.multica.knowledge plan --project-id ID --backend-project-id ID
 python3 -B -m tools.multica.knowledge curate --project-id ID --backend-project-id ID --curator-agent-id ID --apply
+python3 -B -m tools.multica.knowledge check-change --repository frontend|backend --changed-path PATH --staged-text-file FILE --repository-root ROOT --frontend-root ROOT --backend-root ROOT
+python3 -B -m tools.multica.knowledge pr-state --repository frontend|backend --candidate-digest SHA256 --pr-url URL --source-branch BRANCH [--recorded-head-sha SHA --recorded-status STATUS --recorded-merge-sha SHA] --frontend-root ROOT --backend-root ROOT
 python3 -B -m tools.multica.knowledge verify
 ```
 
@@ -341,6 +343,14 @@ python3 -B -m tools.multica.knowledge verify
 that an Agent places in its normal evidence comment. `curate --apply` performs
 only the single planned mutation chain and verifies every authoritative
 acknowledgement by rereading it.
+
+`check-change` accepts only the target repository's knowledge paths, rejects
+binary/conflicted/secret-bearing staged text and path escape, and verifies all
+indexes and content digests. `pr-state` performs one strict `gh pr view` read;
+it has no create, review, close, merge, push, or deploy command surface. Its
+canonical state preserves repository, candidate digest, PR URL, source branch,
+head SHA, status, and optional merge SHA so another Agent can continue from
+identity rather than prose.
 
 ### Multiple operational automations
 

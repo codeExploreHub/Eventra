@@ -100,6 +100,19 @@ class CurationDecision:
     existing_knowledge_id: str | None = None
 
 
+@dataclass(frozen=True)
+class KnowledgePullRequestState:
+    repository: Literal["frontend", "backend"]
+    candidate_digest: str
+    url: str
+    source_branch: str
+    head_sha: str
+    status: Literal[
+        "pr_open", "rejected", "merged", "verified", "needs_human"
+    ]
+    merge_sha: str | None = None
+
+
 def _invalid() -> None:
     raise ValueError("invalid knowledge candidate")
 

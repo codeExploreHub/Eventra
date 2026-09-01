@@ -4,6 +4,36 @@ from pathlib import Path
 
 
 class OperatorDocsTests(unittest.TestCase):
+    def test_curator_and_reviewer_enforce_knowledge_only_human_review(self):
+        instructions = Path("tools/multica/instructions")
+        curator = " ".join(
+            (instructions / "knowledge_curator.md").read_text().split()
+        )
+        reviewer = " ".join(
+            (instructions / "independent_reviewer.md").read_text().split()
+        )
+        for fragment in (
+            "eventra-knowledge/CANDIDATE_DIGEST",
+            "tools.multica.knowledge check-change",
+            "tools.multica.knowledge pr-state",
+            "eventra.knowledge.pr",
+            "stop at `pr_open`",
+            "human review",
+            "do not automatically",
+            "exact local merge SHA",
+        ):
+            self.assertIn(fragment, curator)
+        for fragment in (
+            "repository knowledge pull request",
+            "candidate digest",
+            "evidence comment",
+            "changed-path allowlist",
+            "credentials",
+            "current-code claim",
+            "do not approve, merge, close, push, deploy, or recreate",
+        ):
+            self.assertIn(fragment, reviewer)
+
     def test_roles_require_repository_knowledge_receipts_and_candidates(self):
         instructions = Path("tools/multica/instructions")
         for name in (

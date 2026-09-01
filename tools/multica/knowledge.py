@@ -9,10 +9,11 @@ import hashlib
 import io
 import json
 import re
+import subprocess
 import tempfile
 import uuid
-from dataclasses import asdict, dataclass
-from datetime import date
+from dataclasses import asdict, dataclass, replace
+from datetime import date, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
 
@@ -23,6 +24,7 @@ from tools.multica.knowledge_contracts import (
     ContextReceipt,
     KnowledgeCandidate,
     KnowledgeIndexEntry,
+    KnowledgePullRequestState,
     candidate_digest,
     candidate_json,
     parse_candidate_json,
@@ -42,6 +44,20 @@ _ISSUE = re.compile(r"[A-Z][A-Z0-9]*-[1-9][0-9]*\Z")
 _ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 _REPOSITORIES = frozenset({"frontend", "backend"})
 _SCOPES = frozenset({"frontend", "backend", "cross_repo"})
+_KNOWLEDGE_PR_BRANCH = re.compile(r"eventra-knowledge/[0-9a-f]{64}\Z")
+_SECRET_PATTERNS = (
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{20,}"),
+    re.compile(
+        r"eyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"
+    ),
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
+    re.compile(
+        r"(?i)(?:password|secret|token|api[_-]?key)\s*[:=]\s*[\"']?[A-Za-z0-9/+_.-]{16,}"
+    ),
+)
 _BOOTSTRAP_DESIGN_PATH = "docs/superpowers/specs/2026-08-31-eventra-repository-knowledge-loop-design.md"
 _BOOTSTRAP_DESIGN_COMMIT = "32a150dfa"
 _CANDIDATE_FENCE = "eventra-knowledge-candidate-v1"
@@ -1479,6 +1495,304 @@ def curate_once(
     )
 
 
+def _invalid_knowledge_change() -> None:
+    raise ValueError("invalid knowledge change")
+
+
+def verify_knowledge_change(
+    repository: str,
+    changed_paths: Iterable[str],
+    staged_text: str,
+    *,
+    repository_root: Path | None = None,
+    frontend_root: Path | None = None,
+    backend_root: Path | None = None,
+) -> tuple[str, ...]:
+    """Validate a documentation-only knowledge diff without echoing its text."""
+    if repository not in _REPOSITORIES or not isinstance(staged_text, str):
+        _invalid_knowledge_change()
+    try:
+        paths = tuple(changed_paths)
+    except TypeError:
+        _invalid_knowledge_change()
+    if (
+        not paths
+        or not all(isinstance(item, str) and item for item in paths)
+        or len(paths) != len(set(paths))
+    ):
+        _invalid_knowledge_change()
+    normalized: list[str] = []
+    for item in paths:
+        if "\\" in item:
+            _invalid_knowledge_change()
+        path = PurePosixPath(item)
+        if item != path.as_posix():
+            _invalid_knowledge_change()
+        allowed = (
+            item == "AGENTS.md"
+            or (
+                len(path.parts) >= 3
+                and path.parts[:2] == ("docs", "agent-knowledge")
+            )
+            or (
+                repository == "frontend"
+                and len(path.parts) >= 3
+                and path.parts[:2] == ("docs", "delivery-knowledge")
+            )
+        )
+        if path.is_absolute() or ".." in path.parts or not allowed:
+            _invalid_knowledge_change()
+        normalized.append(path.as_posix())
+    if len(normalized) != len(set(normalized)):
+        _invalid_knowledge_change()
+    if repository_root is not None:
+        try:
+            root = repository_root.resolve(strict=True)
+            if not root.is_dir():
+                _invalid_knowledge_change()
+            for item in normalized:
+                target = (root / item).resolve(strict=False)
+                target.relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            _invalid_knowledge_change()
+    if (
+        not staged_text.strip()
+        or "\x00" in staged_text
+        or any(
+            line.startswith(("<<<<<<<", "=======", ">>>>>>>"))
+            for line in staged_text.splitlines()
+        )
+        or any(pattern.search(staged_text) for pattern in _SECRET_PATTERNS)
+    ):
+        _invalid_knowledge_change()
+    if (frontend_root is None) != (backend_root is None):
+        _invalid_knowledge_change()
+    if frontend_root is not None and backend_root is not None:
+        try:
+            entries = verify_indexes(frontend_root, backend_root)
+        except ValueError:
+            _invalid_knowledge_change()
+        indexed_paths = {item.relative_path for item in entries}
+        for item in normalized:
+            if (
+                item.startswith(("docs/agent-knowledge/", "docs/delivery-knowledge/"))
+                and not item.endswith("/index.yaml")
+                and item not in indexed_paths
+            ):
+                _invalid_knowledge_change()
+    return tuple(sorted(normalized))
+
+
+def _knowledge_pr_url(repository: str, value: str) -> bool:
+    name = "Eventra-Backend" if repository == "backend" else "Eventra"
+    return (
+        isinstance(value, str)
+        and re.fullmatch(
+            rf"https://github\.com/codeExploreHub/{name}/pull/[1-9][0-9]*",
+            value,
+        )
+        is not None
+    )
+
+
+def _read_knowledge_pr(github: Any, url: str) -> dict[str, Any]:
+    value = github.run(
+        [
+            "pr", "view", url,
+            "--json", "url,headRefName,headRefOid,state,mergedAt,mergeCommit",
+        ]
+    )
+    required = {
+        "url", "headRefName", "headRefOid", "state", "mergedAt", "mergeCommit"
+    }
+    if not isinstance(value, dict) or set(value) != required or value.get("url") != url:
+        raise RuntimeError("invalid knowledge pull request")
+    branch = value.get("headRefName")
+    head_sha = value.get("headRefOid")
+    state = value.get("state")
+    merged_at = value.get("mergedAt")
+    merge_commit = value.get("mergeCommit")
+    if (
+        not isinstance(branch, str)
+        or _KNOWLEDGE_PR_BRANCH.fullmatch(branch) is None
+        or not isinstance(head_sha, str)
+        or _SHA.fullmatch(head_sha) is None
+        or state not in {"OPEN", "CLOSED", "MERGED"}
+    ):
+        raise RuntimeError("invalid knowledge pull request")
+    merge_sha = None
+    if state == "MERGED":
+        if (
+            not isinstance(merged_at, str)
+            or not isinstance(merge_commit, dict)
+            or set(merge_commit) != {"oid"}
+        ):
+            raise RuntimeError("invalid knowledge pull request")
+        try:
+            timestamp = datetime.fromisoformat(merged_at.replace("Z", "+00:00"))
+        except ValueError:
+            raise RuntimeError("invalid knowledge pull request") from None
+        merge_sha = merge_commit.get("oid") if isinstance(merge_commit, dict) else None
+        if timestamp.tzinfo is None or not isinstance(merge_sha, str) or _SHA.fullmatch(merge_sha) is None:
+            raise RuntimeError("invalid knowledge pull request")
+    elif merged_at is not None or merge_commit is not None:
+        raise RuntimeError("invalid knowledge pull request")
+    return {
+        "branch": branch,
+        "head_sha": head_sha,
+        "state": state.lower(),
+        "merge_sha": merge_sha,
+    }
+
+
+def record_knowledge_pr(
+    github: Any,
+    repository: str,
+    candidate_digest_value: str,
+    pr_url: str,
+    expected_source_branch: str,
+) -> KnowledgePullRequestState:
+    """Record an exact open knowledge PR after one authoritative reread."""
+    if (
+        repository not in _REPOSITORIES
+        or not isinstance(candidate_digest_value, str)
+        or _DIGEST.fullmatch(candidate_digest_value) is None
+        or expected_source_branch != f"eventra-knowledge/{candidate_digest_value}"
+        or not _knowledge_pr_url(repository, pr_url)
+    ):
+        raise ValueError("invalid knowledge pull request")
+    value = _read_knowledge_pr(github, pr_url)
+    if value["state"] != "open" or value["branch"] != expected_source_branch:
+        raise RuntimeError("invalid knowledge pull request")
+    return KnowledgePullRequestState(
+        repository=repository,
+        candidate_digest=candidate_digest_value,
+        url=pr_url,
+        source_branch=expected_source_branch,
+        head_sha=value["head_sha"],
+        status="pr_open",
+    )
+
+
+def reconcile_knowledge_pr(
+    github: Any,
+    current: KnowledgePullRequestState,
+    *,
+    merged_verifier: Callable[[str, str, str], bool] | None = None,
+) -> KnowledgePullRequestState:
+    """Converge one recorded PR using only an authoritative GitHub read."""
+    if (
+        not isinstance(current, KnowledgePullRequestState)
+        or current.repository not in _REPOSITORIES
+        or not isinstance(current.candidate_digest, str)
+        or _DIGEST.fullmatch(current.candidate_digest) is None
+        or not _knowledge_pr_url(current.repository, current.url)
+        or not isinstance(current.source_branch, str)
+        or current.source_branch
+        != f"eventra-knowledge/{current.candidate_digest}"
+        or not isinstance(current.head_sha, str)
+        or _SHA.fullmatch(current.head_sha) is None
+        or current.status
+        not in {"pr_open", "rejected", "merged", "verified", "needs_human"}
+        or (
+            current.status in {"merged", "verified"}
+            and current.merge_sha is None
+        )
+        or (
+            current.status in {"pr_open", "rejected"}
+            and current.merge_sha is not None
+        )
+        or (
+            current.merge_sha is not None
+            and (
+                not isinstance(current.merge_sha, str)
+                or _SHA.fullmatch(current.merge_sha) is None
+            )
+        )
+    ):
+        raise ValueError("invalid knowledge pull request")
+    value = _read_knowledge_pr(github, current.url)
+    if (
+        value["branch"] != current.source_branch
+        or value["head_sha"] != current.head_sha
+    ):
+        return replace(current, status="needs_human")
+    if current.status == "needs_human":
+        return current
+    if current.merge_sha is not None and value["merge_sha"] != current.merge_sha:
+        return replace(current, status="needs_human")
+    if current.status == "rejected":
+        return current if value["state"] == "closed" else replace(
+            current, status="needs_human"
+        )
+    if value["state"] == "open":
+        return current if current.status == "pr_open" else replace(
+            current, status="needs_human"
+        )
+    if value["state"] == "closed":
+        return replace(current, status="rejected", merge_sha=None)
+    merged = replace(current, status="merged", merge_sha=value["merge_sha"])
+    if merged_verifier is None:
+        return current if current.status in {"merged", "verified"} else merged
+    try:
+        verified = merged_verifier(
+            current.repository,
+            value["merge_sha"],
+            current.candidate_digest,
+        )
+    except (RuntimeError, ValueError):
+        verified = False
+    return replace(merged, status="verified" if verified else "needs_human")
+
+
+def verify_merged_knowledge(
+    repository: str,
+    merge_sha: str,
+    candidate_digest_value: str,
+    *,
+    frontend_root: Path,
+    backend_root: Path,
+) -> bool:
+    """Verify the canonical indexes at the exact locally checked-out merge SHA."""
+    if (
+        repository not in _REPOSITORIES
+        or not isinstance(merge_sha, str)
+        or _SHA.fullmatch(merge_sha) is None
+        or not isinstance(candidate_digest_value, str)
+        or _DIGEST.fullmatch(candidate_digest_value) is None
+        or not isinstance(frontend_root, Path)
+        or not isinstance(backend_root, Path)
+    ):
+        raise ValueError("invalid merged knowledge")
+    target_root = frontend_root if repository == "frontend" else backend_root
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(target_root.resolve(strict=True)), "rev-parse", "HEAD"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise RuntimeError("merged knowledge verification failed") from None
+    if completed.returncode != 0 or completed.stdout.strip() != merge_sha:
+        raise RuntimeError("merged knowledge verification failed")
+    try:
+        entries = verify_indexes(frontend_root, backend_root)
+    except ValueError:
+        raise RuntimeError("merged knowledge verification failed") from None
+    matches = [
+        item
+        for item in entries
+        if item.status == "active"
+        and item.source_candidate_digest == candidate_digest_value
+        and repository in item.repositories
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("merged knowledge verification failed")
+    return True
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Eventra verified knowledge retrieval")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1516,6 +1830,26 @@ def _parser() -> argparse.ArgumentParser:
     curate.add_argument("--frontend-root", type=Path, default=Path.cwd())
     curate.add_argument("--backend-root", type=Path)
     curate.add_argument("--apply", action="store_true")
+    change = subparsers.add_parser("check-change")
+    change.add_argument("--repository", choices=sorted(_REPOSITORIES), required=True)
+    change.add_argument("--changed-path", action="append", required=True)
+    change.add_argument("--staged-text-file", type=Path, required=True)
+    change.add_argument("--repository-root", type=Path, required=True)
+    change.add_argument("--frontend-root", type=Path, required=True)
+    change.add_argument("--backend-root", type=Path, required=True)
+    pr_state = subparsers.add_parser("pr-state")
+    pr_state.add_argument("--repository", choices=sorted(_REPOSITORIES), required=True)
+    pr_state.add_argument("--candidate-digest", required=True)
+    pr_state.add_argument("--pr-url", required=True)
+    pr_state.add_argument("--source-branch", required=True)
+    pr_state.add_argument("--recorded-head-sha")
+    pr_state.add_argument(
+        "--recorded-status",
+        choices=["pr_open", "rejected", "merged", "verified", "needs_human"],
+    )
+    pr_state.add_argument("--recorded-merge-sha")
+    pr_state.add_argument("--frontend-root", type=Path, required=True)
+    pr_state.add_argument("--backend-root", type=Path, required=True)
     return parser
 
 
@@ -1545,6 +1879,72 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             render_summary_pointer(
                 args.child, args.evidence_comment, args.candidate_digest
+            )
+        )
+        return 0
+    if args.command == "check-change":
+        try:
+            staged_text = args.staged_text_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            raise ValueError("invalid knowledge change") from None
+        paths = verify_knowledge_change(
+            args.repository,
+            args.changed_path,
+            staged_text,
+            repository_root=args.repository_root,
+            frontend_root=args.frontend_root,
+            backend_root=args.backend_root,
+        )
+        print(
+            json.dumps(
+                {"count": len(paths), "paths": list(paths)},
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        return 0
+    if args.command == "pr-state":
+        from tools.multica.workflow import GitHubRunner
+
+        github = GitHubRunner()
+        if args.recorded_head_sha is None:
+            if args.recorded_status is not None or args.recorded_merge_sha is not None:
+                raise ValueError("invalid knowledge pull request")
+            state = record_knowledge_pr(
+                github,
+                args.repository,
+                args.candidate_digest,
+                args.pr_url,
+                args.source_branch,
+            )
+        else:
+            current = KnowledgePullRequestState(
+                repository=args.repository,
+                candidate_digest=args.candidate_digest,
+                url=args.pr_url,
+                source_branch=args.source_branch,
+                head_sha=args.recorded_head_sha,
+                status=args.recorded_status or "pr_open",
+                merge_sha=args.recorded_merge_sha,
+            )
+            state = reconcile_knowledge_pr(
+                github,
+                current,
+                merged_verifier=lambda repository, sha, digest: (
+                    verify_merged_knowledge(
+                        repository,
+                        sha,
+                        digest,
+                        frontend_root=args.frontend_root,
+                        backend_root=args.backend_root,
+                    )
+                ),
+            )
+        print(
+            json.dumps(
+                asdict(state),
+                separators=(",", ":"),
+                sort_keys=True,
             )
         )
         return 0

@@ -64,3 +64,13 @@ plus `fail`, not an Issue left `in_review`. Verify terminal state and metadata.
 Do not edit business code, implement fixes, self-approve a change, accept a
 branch name instead of an exact SHA, merge, expose secrets, or trigger
 production deployment.
+
+For a repository knowledge pull request, also verify the source parent,
+candidate digest, evidence comment, exact candidate SHA, target repository, and
+`eventra.knowledge.transition`. Require the changed-path allowlist enforced by
+`tools.multica.knowledge check-change`, inspect the complete staged text for
+credentials, conflict markers, binary content, and unsupported claims, and
+verify every knowledge index, content digest, link, ownership statement, and
+current-code claim. A knowledge review never authorizes business-code changes.
+Return findings for human review; do not approve, merge, close, push, deploy, or
+recreate the pull request.
