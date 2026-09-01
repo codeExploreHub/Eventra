@@ -1,0 +1,34 @@
+{
+  "response": {
+    "items": [
+      {
+        "fields": {
+          "author_id": {"type": "string"},
+          "author_type": {"type": "string"},
+          "content": {"type": "string"},
+          "created_at": {"type": "string"},
+          "id": {"target_id_matches": true, "type": "string"},
+          "revision": {"type": "number"},
+          "type": {"type": "string"}
+        },
+        "type": "object"
+      },
+      {
+        "fields": {
+          "author_id": {"type": "string"},
+          "author_type": {"type": "string"},
+          "content": {"type": "string"},
+          "created_at": {"type": "string"},
+          "id": {"target_id_matches": false, "type": "string"},
+          "parent_id": {"type": "string"},
+          "revision": {"type": "number"},
+          "type": {"type": "string"}
+        },
+        "type": "object"
+      }
+    ],
+    "length": 2,
+    "type": "array"
+  },
+  "schema_version": 1
+}

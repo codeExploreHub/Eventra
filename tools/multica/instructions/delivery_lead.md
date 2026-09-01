@@ -20,6 +20,54 @@ observation. After QA, ask the process owner to stop only that known service.
 If the service cannot be kept available across the two tasks, block the parent;
 do not waive integration QA or merge.
 
+## Knowledge evidence at parent completion
+
+At parent start, use `tools.multica.knowledge context` with task type
+`planning`, affected repository SHA set, and declared paths. Record the shared
+system/dependency Context Receipt and verify its material claims against the
+current manifests before classification and sequencing.
+
+Require every execution handoff to include its Context Receipt and either one
+validated `eventra-knowledge-candidate-v1` reference or an explicit `none`.
+Candidates do not change delivery gates. Before closing or blocking the parent,
+aggregate only validated candidate digests and their evidence comment UUIDs in
+one immutable knowledge summary comment.
+
+For the one selected pilot candidate, render the machine-readable pointer from
+the authoritative Eventra control repository:
+
+```text
+python3 -B -m tools.multica.knowledge summary --child PRO-N --evidence-comment COMMENT_UUID --candidate-digest SHA256
+```
+
+Post the single `eventra-knowledge-summary-v1` block without copying the claim
+or candidate body. Its exact JSON fields are `schema_version`,
+`child_identifier`, `evidence_comment_uuid`, and `candidate_digest`. Retain the
+new summary comment UUID for parent metadata. Multiple candidates are outside
+this pilot; do not concatenate blocks or choose through prose.
+
+When no candidate exists, write only these string metadata values and omit the
+summary UUID and digest:
+
+```text
+eventra.knowledge.version=1
+eventra.knowledge.status=none
+```
+
+When candidates exist, write these four string fields:
+
+```text
+eventra.knowledge.version=1
+eventra.knowledge.status=pending
+eventra.knowledge.summary_comment=COMMENT_UUID
+eventra.knowledge.candidate_digest=SHA256
+```
+
+Reread the parent metadata after writing it. Parent delivery
+does not wait for curation: proceed with the existing merge, smoke, done, or
+blocked decision independently. Never promote a prose claim into canonical
+knowledge or mix knowledge edits into a business pull request.
+
 ## Ownership and inputs
 
 Own delivery coordination, Issue classification, task decomposition, gate

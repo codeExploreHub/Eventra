@@ -164,7 +164,7 @@ knowledge store. Each entry contains:
 - replacement identifier when deprecated;
 - provenance kind: `delivery_evidence` or `bootstrap_design`;
 - for delivery evidence, source Issue, evidence comment, and exact candidate SHA
-  map;
+  map and candidate digest;
 - for the initial bootstrap only, this design path and its Git commit SHA;
 - last verified commit SHA and date; and
 - content digest.
@@ -231,6 +231,15 @@ A candidate contains:
 Candidate content must not contain credentials, tokens, personal data,
 production payloads, or unrestricted command output. References point to
 authoritative evidence instead of copying sensitive material.
+
+The immutable parent summary does not copy candidate content. For the one
+candidate supported by this pilot it contains exactly one fenced
+`eventra-knowledge-summary-v1` JSON pointer with schema version, child Issue
+identifier, evidence comment UUID, and candidate digest. The Curator follows
+the pointer to the original child comment and accepts it only when the parent
+metadata, summary pointer, comment identity, candidate evidence identity, and
+candidate digest all match. Multiple candidates per parent are deferred until
+the generic workflow is designed.
 
 The Delivery Lead aggregates candidate references when it closes or blocks a
 parent. It writes one immutable knowledge summary comment and only flat pointer
@@ -320,9 +329,12 @@ surface is:
 ```text
 python3 -B -m tools.multica.knowledge context --task-id ISSUE --repository frontend|backend --task-type TYPE --sha KEY=FULL_SHA [--path PATH ...]
 python3 -B -m tools.multica.knowledge candidate --input CANDIDATE_JSON_FILE
+python3 -B -m tools.multica.knowledge summary --child ISSUE --evidence-comment UUID --candidate-digest SHA256
 python3 -B -m tools.multica.knowledge scan --project-id ID --backend-project-id ID
 python3 -B -m tools.multica.knowledge plan --project-id ID --backend-project-id ID
-python3 -B -m tools.multica.knowledge curate --project-id ID --backend-project-id ID --apply
+python3 -B -m tools.multica.knowledge curate --project-id ID --backend-project-id ID --curator-agent-id ID --apply
+python3 -B -m tools.multica.knowledge check-change --repository frontend|backend --changed-path PATH --staged-text-file FILE --repository-root ROOT --frontend-root ROOT --backend-root ROOT
+python3 -B -m tools.multica.knowledge pr-state --repository frontend|backend --candidate-digest SHA256 --pr-url URL --source-branch BRANCH [--recorded-head-sha SHA --recorded-status STATUS --recorded-merge-sha SHA] --frontend-root ROOT --backend-root ROOT
 python3 -B -m tools.multica.knowledge verify
 ```
 
@@ -331,6 +343,14 @@ python3 -B -m tools.multica.knowledge verify
 that an Agent places in its normal evidence comment. `curate --apply` performs
 only the single planned mutation chain and verifies every authoritative
 acknowledgement by rereading it.
+
+`check-change` accepts only the target repository's knowledge paths, rejects
+binary/conflicted/secret-bearing staged text and path escape, and verifies all
+indexes and content digests. `pr-state` performs one strict `gh pr view` read;
+it has no create, review, close, merge, push, or deploy command surface. Its
+canonical state preserves repository, candidate digest, PR URL, source branch,
+head SHA, status, and optional merge SHA so another Agent can continue from
+identity rather than prose.
 
 ### Multiple operational automations
 
@@ -403,16 +423,35 @@ The parent knowledge summary has its own smaller state machine:
 
 ```text
 none
-  or pending -> dispatched
+  or pending -> deduplicated
+             -> rejected
+             -> needs_human
+             -> dispatched
 ```
 
 `dispatched` means the target knowledge Issue has been created and verified;
 it is not a claim that a pull request exists or that knowledge has been
-accepted.
+accepted. The other three terminal states record that no target Issue was
+created; a human may correct the evidence and explicitly reset a
+`needs_human` parent to `pending` for a new evaluation.
 
 Every transition records its source state, target state, candidate digest,
 action key, authoritative object identity, and evidence reference. Identical
 retries are no-ops. A transition from a stale state is rejected.
+
+For the pilot, those fields are stored as one canonical JSON string rather
+than a sequence of independently meaningful metadata keys. The target
+knowledge Issue uses `eventra.knowledge.transition` for the
+`pending -> issue_created` record. The source parent first records
+`eventra.knowledge.dispatch`, then changes only
+`eventra.knowledge.status` from `pending` to `dispatched`. If the second write
+is interrupted, a later run validates the complete dispatch record and the
+authoritative target Issue before finishing the status change. A malformed or
+conflicting partial record stops before creating another Issue.
+For `deduplicated`, `rejected`, and `needs_human`, the parent instead stores
+one canonical `eventra.knowledge.resolution` record before changing the status
+to that terminal value. This prevents the oldest non-actionable parent from
+starving later candidates while preserving a deterministic audit trail.
 
 ## Concurrency and idempotency
 

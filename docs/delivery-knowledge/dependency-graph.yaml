@@ -1,0 +1,15 @@
+schema_version: 1
+repositories:
+  frontend:
+    depends_on:
+      - backend
+  backend:
+    depends_on: []
+integration:
+  start_order:
+    - backend
+    - frontend
+  command_repository: frontend
+  merge_order:
+    - backend
+    - frontend

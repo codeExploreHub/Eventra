@@ -581,6 +581,11 @@ class MulticaRunnerTests(unittest.TestCase):
 
         for argv in (
             ["agent", "update", "agent-1", "--output", "json"],
+            ["issue", "create", "--title", "knowledge", "--output", "json"],
+            [
+                "issue", "metadata", "set", "PRO-1", "--key", "k",
+                "--value", "v", "--type", "string", "--output", "json",
+            ],
             ["issue", "rerun", "PRO-35", "--output", "json"],
         ):
             before = run.call_count
@@ -624,6 +629,8 @@ class MulticaRunnerTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, "[]", ""),
             subprocess.CompletedProcess([], 0, "{}", ""),
             subprocess.CompletedProcess([], 9, "", "private stderr"),
+            subprocess.CompletedProcess([], 0, "{}", ""),
+            subprocess.CompletedProcess([], 0, "{}", ""),
         )
         runner = MulticaRunner()
 
@@ -631,8 +638,13 @@ class MulticaRunnerTests(unittest.TestCase):
         runner.run(["agent", "create", "--output", "json"])
         with self.assertRaisesRegex(RuntimeError, "failed with exit 9"):
             runner.run(["agent", "env", "set", "agent-1", "--output", "json"])
+        runner.run(["issue", "create", "--title", "knowledge", "--output", "json"])
+        runner.run([
+            "issue", "metadata", "set", "PRO-1", "--key", "k",
+            "--value", "v", "--type", "string", "--output", "json",
+        ])
 
-        self.assertEqual(runner.mutation_count, 2)
+        self.assertEqual(runner.mutation_count, 4)
 
     @patch("tools.multica.provision.subprocess.run")
     def test_repair_executor_reads_and_mutations_have_explicit_prefixes(self, run):
@@ -863,15 +875,15 @@ class ProvisionerTests(unittest.TestCase):
         self.assertEqual(
             plan.summary,
             {
-                "total": 38,
+                "total": 42,
                 "noop": False,
                 "blocked": False,
-                "by_action": {"create": 31, "update": 7},
+                "by_action": {"create": 34, "update": 8},
                 "by_kind": {
-                    "agent": 6,
-                    "agent_skill_binding": 6,
-                    "autopilot": 1,
-                    "autopilot_trigger": 1,
+                    "agent": 7,
+                    "agent_skill_binding": 7,
+                    "autopilot": 2,
+                    "autopilot_trigger": 2,
                     "project": 2,
                     "resource": 2,
                     "skill": 14,
@@ -885,17 +897,25 @@ class ProvisionerTests(unittest.TestCase):
             Counter(
                 {
                     "skill.import": 14,
-                    "agent.create": 6,
-                    "agent.skills.add": 6,
+                    "agent.create": 7,
+                    "agent.skills.add": 7,
                     "squad.create": 1,
                     "squad.update": 1,
                     "squad.member.add": 4,
                     "project.create": 2,
                     "project.resource.add": 2,
-                    "autopilot.create": 1,
-                    "autopilot.trigger-add": 1,
+                    "autopilot.create": 2,
+                    "autopilot.trigger-add": 2,
                 }
             ),
+        )
+        self.assertEqual(
+            {
+                action.key
+                for action in plan.actions
+                if action.kind == "autopilot"
+            },
+            {"workflow_watcher", "knowledge_curator"},
         )
         lead = next(
             action
@@ -935,7 +955,7 @@ class ProvisionerTests(unittest.TestCase):
             for call in self.runner.calls
             if call["command"] in FakeRunner.MUTATIONS
         )
-        self.assertEqual(applied.mutation_count, 38)
+        self.assertEqual(applied.mutation_count, 42)
         self.assertEqual(actual_operations, planned_operations)
 
     def test_default_mode_requires_explicit_reuse_for_single_recipient_authority(self):
@@ -1373,7 +1393,7 @@ class ProvisionerTests(unittest.TestCase):
     def test_apply_uses_frozen_cli_and_builds_complete_state(self):
         result = self.provisioner.reconcile(self.config, apply=True, backend_env=self.backend_env)
         self.assertEqual(set(result.agent_ids), {agent.role for agent in self.config.agents})
-        self.assertEqual(len(result.agent_ids), 6)
+        self.assertEqual(len(result.agent_ids), 7)
         rendered = "\n".join(" ".join(call["args"]) for call in self.runner.calls)
         self.assertNotIn("daemon get", rendered)
         self.assertNotIn("agent skills set", rendered)
@@ -1478,11 +1498,19 @@ class ProvisionerTests(unittest.TestCase):
             result.agent_ids["workflow_watcher"],
             self.runner.squads[result.squad_id]["members"],
         )
+        self.assertNotIn(
+            result.agent_ids["knowledge_curator"],
+            self.runner.squads[result.squad_id]["members"],
+        )
         self.assertNotIn(result.agent_ids["workflow_watcher"], self.runner.envs)
+        self.assertNotIn(result.agent_ids["knowledge_curator"], self.runner.envs)
         self.assertFalse(
             any(
                 call["command"] in {("agent", "env", "get"), ("agent", "env", "set")}
-                and call["positionals"] == [result.agent_ids["workflow_watcher"]]
+                and call["positionals"] in (
+                    [result.agent_ids["workflow_watcher"]],
+                    [result.agent_ids["knowledge_curator"]],
+                )
                 for call in self.runner.calls
             )
         )
@@ -1493,27 +1521,37 @@ class ProvisionerTests(unittest.TestCase):
         ]
         self.assertEqual(leader_mutations, [])
 
-    def test_fresh_apply_creates_one_run_only_watcher_and_schedule(self):
+    def test_fresh_apply_creates_two_ordered_run_only_operational_automations(self):
         result = self.provisioner.reconcile(
             self.config, apply=True, backend_env=self.backend_env
         )
-        watcher = self.runner.autopilots[result.autopilot_id]
-        expected_description = (
-            self.config.watcher.description_file.read_text()
-            .replace("__FRONTEND_PROJECT_ID__", result.project_id)
-            .replace("__BACKEND_PROJECT_ID__", result.backend_project_id)
-        )
-        self.assertEqual(watcher["execution_mode"], "run_only")
-        self.assertEqual(watcher["project_id"], result.project_id)
-        self.assertEqual(watcher["assignee_id"], result.agent_ids["workflow_watcher"])
-        self.assertEqual(watcher["description"], expected_description)
-        self.assertNotIn("__FRONTEND_PROJECT_ID__", watcher["description"])
-        self.assertEqual(len(watcher["triggers"]), 1)
-        self.assertEqual(watcher["triggers"][0]["timezone"], "Asia/Shanghai")
         self.assertEqual(
-            watcher["triggers"][0]["cron_expression"],
-            "*/30 * * * *",
+            list(result.autopilot_ids),
+            ["workflow-watcher", "knowledge-curator"],
         )
+        for spec in self.config.operational_automations:
+            autopilot = self.runner.autopilots[result.autopilot_ids[spec.key]]
+            expected_description = (
+                spec.description_file.read_text()
+                .replace("__FRONTEND_PROJECT_ID__", result.project_id)
+                .replace("__BACKEND_PROJECT_ID__", result.backend_project_id)
+                .replace(
+                    "__KNOWLEDGE_CURATOR_AGENT_ID__",
+                    result.agent_ids["knowledge_curator"],
+                )
+            )
+            self.assertEqual(autopilot["execution_mode"], "run_only")
+            self.assertEqual(autopilot["project_id"], result.project_id)
+            self.assertEqual(
+                autopilot["assignee_id"], result.agent_ids[spec.agent_role]
+            )
+            self.assertEqual(autopilot["description"], expected_description)
+            self.assertNotIn("__", autopilot["description"])
+            self.assertEqual(len(autopilot["triggers"]), 1)
+            self.assertEqual(autopilot["triggers"][0]["timezone"], spec.timezone)
+            self.assertEqual(
+                autopilot["triggers"][0]["cron_expression"], spec.cron
+            )
 
     def test_provisioned_watcher_recovers_only_v2_and_migration_blocks_v1(self):
         result = self.provisioner.reconcile(
@@ -1584,6 +1622,42 @@ class ProvisionerTests(unittest.TestCase):
         self.assertTrue(watcher["triggers"][0]["enabled"])
         self.assertEqual(watcher["triggers"][0]["timezone"], "Asia/Shanghai")
 
+    def test_curator_drift_is_repaired_without_changing_watcher_id_or_trigger(self):
+        first = self.provisioner.reconcile(
+            self.config, apply=True, backend_env=self.backend_env
+        )
+        watcher = self.runner.autopilots[
+            first.autopilot_ids["workflow-watcher"]
+        ]
+        curator = self.runner.autopilots[
+            first.autopilot_ids["knowledge-curator"]
+        ]
+        watcher_identity = (watcher["id"], watcher["triggers"][0]["id"])
+        curator_identity = (curator["id"], curator["triggers"][0]["id"])
+        curator["project_id"] = first.backend_project_id
+        curator["assignee_id"] = first.agent_ids["workflow_watcher"]
+        curator["triggers"][0]["cron_expression"] = "0 0 * * *"
+        before = self.runner.mutation_count
+
+        second = self.provisioner.reconcile(
+            self.config, apply=True, backend_env=None
+        )
+
+        self.assertEqual(self.runner.mutation_count - before, 2)
+        self.assertEqual(
+            (watcher["id"], watcher["triggers"][0]["id"]),
+            watcher_identity,
+        )
+        self.assertEqual(
+            (curator["id"], curator["triggers"][0]["id"]),
+            curator_identity,
+        )
+        self.assertEqual(curator["project_id"], second.project_id)
+        self.assertEqual(
+            curator["assignee_id"], second.agent_ids["knowledge_curator"]
+        )
+        self.assertEqual(curator["triggers"][0]["cron_expression"], "17 2 * * *")
+
     def test_watcher_reconciliation_preserves_unrelated_autopilot(self):
         unrelated_id = self.runner.seed_autopilot(
             "Unrelated Watcher",
@@ -1614,6 +1688,16 @@ class ProvisionerTests(unittest.TestCase):
                 self.config, apply=True, backend_env=self.backend_env
             )
         self.assertEqual(self.runner.mutation_count, 0)
+
+    def test_duplicate_live_target_title_fails_before_any_mutation(self):
+        runner = FakeRunner()
+        runner.seed_autopilot(self.config.watcher.title)
+        runner.seed_autopilot(self.config.watcher.title)
+        with self.assertRaisesRegex(RuntimeError, "malformed autopilot list"):
+            Provisioner(runner).reconcile(
+                self.config, apply=True, backend_env=self.backend_env
+            )
+        self.assertEqual(runner.mutation_count, 0)
 
     def test_invalid_server_managed_leader_fails_before_member_mutation(self):
         first = self.provisioner.reconcile(
@@ -1858,6 +1942,7 @@ class ProvisionerTests(unittest.TestCase):
                 ("project", "create"),
                 ("project", "resource", "add"),
                 ("autopilot", "update"),
+                ("autopilot", "update"),
             ],
         )
         self.assertEqual(
@@ -1949,7 +2034,7 @@ class ProvisionerTests(unittest.TestCase):
             set(output),
             {
                 "agent_ids", "skill_ids", "squad_id", "project_id",
-                "backend_project_id", "resource_ids", "autopilot_id",
+                "backend_project_id", "resource_ids", "autopilot_ids",
                 "mutation_count",
             },
         )
@@ -1962,6 +2047,29 @@ class ProvisionerTests(unittest.TestCase):
         result = self.provisioner.reconcile(self.config, apply=False, backend_env=None)
         self.assertEqual(self.runner.mutation_count, 0)
         self.assertTrue(all(value is None for value in result.agent_ids.values()))
+        self.assertEqual(
+            result.autopilot_ids,
+            {"workflow-watcher": None, "knowledge-curator": None},
+        )
+
+    def test_duplicate_desired_automation_key_or_title_fails_before_reads(self):
+        watcher, curator = self.config.operational_automations
+        for automations in (
+            (watcher, replace(curator, key=watcher.key)),
+            (watcher, replace(curator, title=watcher.title)),
+            (curator, watcher),
+        ):
+            runner = FakeRunner()
+            config = replace(
+                self.config,
+                operational_automations=automations,
+            )
+            with self.subTest(automations=automations):
+                with self.assertRaisesRegex(ValueError, "automation"):
+                    Provisioner(runner).reconcile(
+                        config, apply=False, backend_env=None
+                    )
+                self.assertEqual(runner.calls, [])
 
     def test_list_is_index_and_agent_detail_is_reconciled_via_get(self):
         agent = self.config.agents[0]
@@ -2625,7 +2733,13 @@ class ProvisionerTests(unittest.TestCase):
                 watcher = replace(self.config.watcher, agent_role=role)
                 with self.assertRaisesRegex(ValueError, "operational Agent"):
                     Provisioner(runner).reconcile(
-                        replace(self.config, watcher=watcher),
+                        replace(
+                            self.config,
+                            operational_automations=(
+                                watcher,
+                                *self.config.operational_automations[1:],
+                            ),
+                        ),
                         apply=True,
                         backend_env=self.backend_env,
                     )

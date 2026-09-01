@@ -326,6 +326,132 @@ class OperatorDocsTests(unittest.TestCase):
         ):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, readme)
+    def test_repository_knowledge_loop_pilot_runbook_is_guarded_and_operable(self):
+        readme = Path("tools/multica/README.md").read_text()
+        normalized = " ".join(readme.split())
+        for fragment in (
+            "## Repository knowledge loop pilot runbook",
+            "Eventra Knowledge Curator",
+            "Eventra · Knowledge Curator",
+            "17 2 * * *",
+            "Asia/Shanghai",
+            "at most one candidate",
+            "does not block delivery",
+            "python3 -B -m tools.multica.knowledge verify",
+            "python3 -B -m tools.multica.knowledge scan",
+            "python3 -B -m tools.multica.knowledge plan",
+            "python3 -B -m tools.multica.knowledge curate",
+            "python3 -m tools.multica.contract_audit",
+            "python3 -m tools.multica.provision",
+            "explicit live-mutation approval",
+            "pause only the Curator",
+            "Eventra · Stalled Work Watcher remains active",
+            "`multica-multi-repo-delivery` remains unchanged",
+            "candidate acceptance rate",
+            "business delivery delay",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, normalized)
+
+    def test_knowledge_loop_runbook_covers_eight_pilot_scenarios(self):
+        pilot = Path("docs/multica/pilot-issues.md").read_text()
+        section = pilot.split("## Repository knowledge loop scenarios", 1)[1]
+        for title in (
+            "### K1 — no-candidate frontend delivery",
+            "### K2 — backend incident learning",
+            "### K3 — cross-repository contract",
+            "### K4 — duplicate candidate",
+            "### K5 — concurrent Curator triggers",
+            "### K6 — business-code path rejection",
+            "### K7 — stale knowledge correction",
+            "### K8 — paused Curator continuity",
+        ):
+            with self.subTest(title=title):
+                self.assertIn(title, section)
+        normalized = " ".join(section.split())
+        for fragment in (
+            "at most one candidate",
+            "human review",
+            "never merge",
+            "existing Watcher",
+            "production deployment",
+        ):
+            self.assertIn(fragment, normalized)
+
+    def test_curator_and_reviewer_enforce_knowledge_only_human_review(self):
+        instructions = Path("tools/multica/instructions")
+        curator = " ".join(
+            (instructions / "knowledge_curator.md").read_text().split()
+        )
+        reviewer = " ".join(
+            (instructions / "independent_reviewer.md").read_text().split()
+        )
+        for fragment in (
+            "eventra-knowledge/CANDIDATE_DIGEST",
+            "tools.multica.knowledge check-change",
+            "tools.multica.knowledge pr-state",
+            "eventra.knowledge.pr",
+            "stop at `pr_open`",
+            "human review",
+            "do not automatically",
+            "exact local merge SHA",
+        ):
+            self.assertIn(fragment, curator)
+        for fragment in (
+            "repository knowledge pull request",
+            "candidate digest",
+            "evidence comment",
+            "changed-path allowlist",
+            "credentials",
+            "current-code claim",
+            "do not approve, merge, close, push, deploy, or recreate",
+        ):
+            self.assertIn(fragment, reviewer)
+
+    def test_roles_require_repository_knowledge_receipts_and_candidates(self):
+        instructions = Path("tools/multica/instructions")
+        for name in (
+            "frontend_engineer.md",
+            "backend_engineer.md",
+            "integration_qa.md",
+            "independent_reviewer.md",
+        ):
+            rendered = (instructions / name).read_text()
+            normalized = " ".join(rendered.split())
+            with self.subTest(role=name):
+                self.assertIn("Context Receipt", normalized)
+                self.assertIn("tools.multica.knowledge context", normalized)
+                self.assertIn("current code", normalized)
+                self.assertIn("eventra-knowledge-candidate-v1", normalized)
+                self.assertIn("separate knowledge pull request", normalized)
+                self.assertIn("raw logs", normalized)
+
+        lead = (instructions / "delivery_lead.md").read_text()
+        for fragment in (
+            "eventra.knowledge.version=1",
+            "eventra.knowledge.status=none",
+            "eventra.knowledge.status=pending",
+            "tools.multica.knowledge summary",
+            "eventra-knowledge-summary-v1",
+            "child_identifier",
+            "evidence_comment_uuid",
+            "candidate_digest",
+            "does not wait for curation",
+        ):
+            self.assertIn(fragment, lead)
+
+        for path in (
+            Path("AGENTS.md"),
+            Path("/Users/didi/Eventra-workspace/Eventra-Backend/.worktrees/eventra-knowledge-loop/AGENTS.md"),
+        ):
+            rendered = path.read_text()
+            normalized = " ".join(rendered.split())
+            with self.subTest(path=path):
+                self.assertIn("docs/agent-knowledge/index.yaml", normalized)
+                self.assertIn("Context Receipt", normalized)
+                self.assertIn("current code", normalized)
+                self.assertIn("Knowledge Candidate", normalized)
+                self.assertIn("separate knowledge pull request", normalized)
 
     def test_every_execution_role_uses_terminal_phase_helper(self):
         instructions = Path("tools/multica/instructions")

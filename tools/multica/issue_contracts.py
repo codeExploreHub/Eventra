@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import uuid
 from datetime import datetime
 from typing import Any
 import uuid
@@ -26,6 +28,7 @@ ACTIVE_RUN_STATUSES = frozenset(
     {"queued", "dispatched", "running", "waiting_local_directory"}
 )
 TERMINAL_PHASE_STATUSES = frozenset({"done"})
+_ISSUE_IDENTIFIER = re.compile(r"[A-Z][A-Z0-9]*-[1-9][0-9]*\Z")
 
 
 def _error(contract: str) -> None:
@@ -44,6 +47,76 @@ def _timestamp(value: Any) -> bool:
     except ValueError:
         return False
     return parsed.tzinfo is not None
+
+
+def _uuid(value: Any) -> bool:
+    if not _string(value):
+        return False
+    try:
+        return str(uuid.UUID(value)) == value
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def parse_issue_comments(value: Any, expected_issue_id: str) -> list[dict[str, Any]]:
+    """Normalize one observed compact comment thread in authoritative order."""
+
+    contract = "issue comments"
+    if (
+        not isinstance(value, list)
+        or not value
+        or not isinstance(expected_issue_id, str)
+        or _ISSUE_IDENTIFIER.fullmatch(expected_issue_id) is None
+    ):
+        _error(contract)
+    result: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    previous_time: datetime | None = None
+    for position, record in enumerate(value):
+        if not isinstance(record, dict):
+            _error(contract)
+        has_parent = "parent_id" in record
+        expected_keys = {
+            "author_id", "author_type", "content", "created_at", "id",
+            "revision", "type",
+        } | ({"parent_id"} if has_parent else set())
+        record_id = record.get("id")
+        parent_id = record.get("parent_id")
+        created_at = record.get("created_at")
+        revision = record.get("revision")
+        if (
+            set(record) != expected_keys
+            or not _uuid(record_id)
+            or record_id in seen_ids
+            or not _uuid(record.get("author_id"))
+            or record.get("author_type") not in {"agent", "member"}
+            or not _string(record.get("content"))
+            or not _timestamp(created_at)
+            or not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or revision < 1
+            or record.get("type") != "comment"
+            or (position == 0) == has_parent
+            or (has_parent and (not _uuid(parent_id) or parent_id not in seen_ids))
+        ):
+            _error(contract)
+        parsed_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        if previous_time is not None and parsed_time < previous_time:
+            _error(contract)
+        previous_time = parsed_time
+        seen_ids.add(record_id)
+        result.append(
+            {
+                "id": record_id,
+                "parent_id": parent_id if has_parent else None,
+                "author_id": record["author_id"],
+                "author_type": record["author_type"],
+                "content": record["content"],
+                "created_at": created_at,
+                "revision": revision,
+            }
+        )
+    return result
 
 
 def _normalize_issue(value: Any, contract: str) -> dict[str, Any]:
