@@ -31,6 +31,7 @@ from tools.multica.workflow import (
     decide_parent_action,
     decide_recovery,
     execute_parent_repair,
+    execute_parent_smoke,
     finish_parent,
     finish_phase,
     load_parent_snapshot,
@@ -60,6 +61,27 @@ FRONTEND_SHA = "a" * 40
 FRONTEND_PR = "https://github.com/codeExploreHub/Eventra/pull/6"
 
 
+def assignment_agents():
+    return [
+        {"id": DELIVERY_LEAD_ID, "name": "Eventra Delivery Lead"},
+        {"id": AGENT_ID, "name": "Eventra Frontend Engineer"},
+        {"id": BACKEND_AGENT_ID, "name": "Eventra Backend Engineer"},
+        {"id": QA_ID, "name": "Eventra Integration QA"},
+        {"id": REVIEWER_ID, "name": "Eventra Independent Reviewer"},
+        {"id": WATCHER_ID, "name": "Eventra Workflow Watcher"},
+    ]
+
+
+def assignment_projects():
+    return [
+        {"id": PROJECT_ID, "title": "Eventra Local Development"},
+        {
+            "id": BACKEND_PROJECT_ID,
+            "title": "Eventra Backend Local Development",
+        },
+    ]
+
+
 def raw_issue(**overrides):
     value = {
         "id": ISSUE_ID,
@@ -82,6 +104,11 @@ class FakeWorkflowRunner:
     """Stateful argv fake at the Multica process boundary."""
 
     def __init__(self):
+        implementation_action = (
+            "2:PRO-35:create_implementation_stage:0:frontend:"
+            + FRONTEND_SHA
+            + ":-:next-stage:1"
+        )
         self.issue = raw_issue()
         self.parent = raw_issue(
             id=PARENT_ID,
@@ -91,7 +118,17 @@ class FakeWorkflowRunner:
             status="in_progress",
             assignee_type="squad",
         )
-        self.metadata = {}
+        self.metadata = {
+            "eventra.workflow.version": "2",
+            "eventra.phase.kind": "implementation",
+            "eventra.phase.attempt": "0",
+            "eventra.phase.failure_repositories": "[]",
+            "eventra.phase.sha.frontend": FRONTEND_SHA,
+            "eventra.phase.pr": FRONTEND_PR,
+            "eventra.phase.creation_action": implementation_action,
+            "eventra.phase.target": "repository:frontend",
+            "eventra.phase.role": "frontend_engineer",
+        }
         self.parent_metadata = {
             "eventra.workflow.version": "2",
             "eventra.workflow.classification": "frontend-only",
@@ -99,7 +136,7 @@ class FakeWorkflowRunner:
             "eventra.workflow.attempt": "0",
             "eventra.workflow.frontend_sha": FRONTEND_SHA,
             "eventra.workflow.merge_state": "not_ready",
-            "eventra.workflow.last_action": "",
+            "eventra.workflow.last_action": implementation_action,
         }
         self.include_child = True
         self.calls = []
@@ -128,6 +165,10 @@ class FakeWorkflowRunner:
             raise AssertionError("workflow commands never accept stdin JSON")
         call = tuple(args)
         self.calls.append(call)
+        if call == ("agent", "list", "--output", "json"):
+            return assignment_agents()
+        if call == ("project", "list", "--output", "json"):
+            return assignment_projects()
         if call == ("issue", "get", "PRO-36", "--output", "json"):
             if self.issue["status"] == "done":
                 self._post_done_detail_reads += 1
@@ -137,7 +178,10 @@ class FakeWorkflowRunner:
                 ):
                     self.issue["status"] = "blocked"
             return copy.deepcopy(self.issue)
-        if call == ("issue", "get", PARENT_ID, "--output", "json"):
+        if call in {
+            ("issue", "get", PARENT_ID, "--output", "json"),
+            ("issue", "get", "PRO-35", "--output", "json"),
+        }:
             return copy.deepcopy(self.parent)
         if call == ("issue", "children", "PRO-35", "--output", "json"):
             issues = [copy.deepcopy(self.issue)] if self.include_child else []
@@ -476,6 +520,10 @@ class FakeSnapshotFinishRunner:
             raise AssertionError("snapshot completion never accepts stdin JSON")
         call = tuple(args)
         self.calls.append(call)
+        if call == ("agent", "list", "--output", "json"):
+            return assignment_agents()
+        if call == ("project", "list", "--output", "json"):
+            return assignment_projects()
         if call[:2] == ("issue", "get"):
             identifier = call[2]
             if identifier in {PARENT_ID, self.snapshot.identifier}:
@@ -548,6 +596,15 @@ def implementation_completion(**overrides):
 
 
 class PhaseCompletionTests(unittest.TestCase):
+    def setUp(self):
+        github_patch = patch.object(
+            workflow_module,
+            "GitHubRunner",
+            return_value=FakeSnapshotGitHubRunner((frontend_pr(),)),
+        )
+        github_patch.start()
+        self.addCleanup(github_patch.stop)
+
     def _review_completion(self, **overrides):
         values = {
             "kind": "review",
@@ -1414,6 +1471,59 @@ class PhaseCompletionTests(unittest.TestCase):
         self.assertEqual(runner.mutation_count, 0)
 
     def test_finish_phase_accepts_each_valid_current_nonrepair_kind(self):
+        implementation = parent_snapshot(
+            children=(
+                phase(
+                    "PRO-36",
+                    1,
+                    "implementation",
+                    result=None,
+                    status="in_review",
+                ),
+            ),
+        )
+        smoke = parent_snapshot(
+            merge_state="merged",
+            children=(
+                phase(
+                    "PRO-36",
+                    1,
+                    "implementation",
+                    pr_url=FRONTEND_PR,
+                    evidence_comment=COMMENT_ID,
+                ),
+                phase(
+                    "PRO-50",
+                    4,
+                    "smoke",
+                    result=None,
+                    status="in_review",
+                ),
+            ),
+        )
+        cases = (
+            (implementation, "PRO-36", implementation_completion()),
+            (
+                smoke,
+                "PRO-50",
+                implementation_completion(kind="smoke", pr_url=None),
+            ),
+        )
+        for snapshot, issue_key, completion in cases:
+            with self.subTest(kind=completion.kind):
+                runner = FakeSnapshotFinishRunner(snapshot, issue_key)
+                github = FakeSnapshotGitHubRunner(snapshot.pull_requests)
+
+                with patch.object(
+                    workflow_module,
+                    "GitHubRunner",
+                    return_value=github,
+                ):
+                    result = finish_phase(runner, issue_key, completion)
+
+                self.assertEqual(result.status, "done")
+
+    def test_finish_phase_rejects_nonrepair_without_assignment_provenance(self):
         completions = (
             implementation_completion(),
             implementation_completion(kind="smoke", pr_url=None),
@@ -1421,22 +1531,127 @@ class PhaseCompletionTests(unittest.TestCase):
         for completion in completions:
             with self.subTest(kind=completion.kind):
                 runner = FakeWorkflowRunner()
+                runner.issue["assignee_id"] = REVIEWER_ID
+                runner.metadata = {}
 
-                result = finish_phase(runner, "PRO-36", completion)
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "assignment provenance",
+                ):
+                    finish_phase(runner, "PRO-36", completion)
 
-                self.assertEqual(result.status, "done")
+                self.assertEqual(runner.mutation_count, 0)
+
+    def test_finish_phase_rechecks_assignment_authority_after_parent_validation(self):
+        class AssignmentDriftRunner(FakeWorkflowRunner):
+            def __init__(self):
+                super().__init__()
+                self.assignment_reads = 0
+
+            def run(self, args, *, stdin_json=None):
+                if tuple(args) == ("agent", "list", "--output", "json"):
+                    self.assignment_reads += 1
+                    if self.assignment_reads >= 4:
+                        changed = assignment_agents()
+                        changed[1] = {
+                            "id": REVIEWER_ID,
+                            "name": "Eventra Frontend Engineer",
+                        }
+                        return changed
+                return super().run(args, stdin_json=stdin_json)
+
+        runner = AssignmentDriftRunner()
+
+        with self.assertRaisesRegex(RuntimeError, "assignment provenance is malformed"):
+            finish_phase(runner, "PRO-36", implementation_completion())
+
+        self.assertEqual(runner.mutation_count, 0)
 
     def test_finish_phase_is_idempotent_when_done_metadata_matches(self):
-        runner = FakeWorkflowRunner()
-        wanted = build_phase_metadata(implementation_completion())
-        runner.issue["status"] = "done"
-        runner.metadata.update(wanted)
+        snapshot = parent_snapshot(
+            children=(
+                phase(
+                    "PRO-36",
+                    1,
+                    "implementation",
+                    evidence_comment=COMMENT_ID,
+                ),
+            ),
+        )
+        runner = FakeSnapshotFinishRunner(snapshot, "PRO-36")
+        github = FakeSnapshotGitHubRunner(snapshot.pull_requests)
 
-        result = finish_phase(runner, "PRO-36", implementation_completion())
+        with patch.object(
+            workflow_module,
+            "GitHubRunner",
+            return_value=github,
+        ):
+            result = finish_phase(runner, "PRO-36", implementation_completion())
 
         self.assertEqual(result.mutation_count, 0)
         self.assertFalse(any(call[:3] == ("issue", "metadata", "set") for call in runner.calls))
         self.assertFalse(any(call[:2] == ("issue", "status") for call in runner.calls))
+
+    def test_terminal_smoke_replay_requires_and_accepts_exact_assignment(self):
+        snapshot = parent_snapshot(
+            merge_state="merged",
+            children=(
+                phase(
+                    "PRO-36",
+                    1,
+                    "implementation",
+                    pr_url=FRONTEND_PR,
+                    evidence_comment=COMMENT_ID,
+                ),
+                phase(
+                    "PRO-50",
+                    4,
+                    "smoke",
+                    evidence_comment=COMMENT_ID,
+                ),
+            ),
+        )
+        runner = FakeSnapshotFinishRunner(snapshot, "PRO-50")
+        github = FakeSnapshotGitHubRunner(snapshot.pull_requests)
+        completion = implementation_completion(kind="smoke", pr_url=None)
+
+        with patch.object(
+            workflow_module,
+            "GitHubRunner",
+            return_value=github,
+        ):
+            replay = finish_phase(runner, "PRO-50", completion)
+
+        self.assertEqual(replay.status, "done")
+        self.assertEqual(replay.mutation_count, 0)
+
+        forged = replace(
+            snapshot,
+            children=(
+                snapshot.children[0],
+                replace(snapshot.children[1], phase_target="suite:integration"),
+            ),
+        )
+        forged_runner = FakeSnapshotFinishRunner(forged, "PRO-50")
+        with patch.object(
+            workflow_module,
+            "GitHubRunner",
+            return_value=FakeSnapshotGitHubRunner(forged.pull_requests),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "assignment provenance"):
+                finish_phase(forged_runner, "PRO-50", completion)
+        self.assertEqual(forged_runner.mutation_count, 0)
+
+    def test_terminal_nonrepair_replay_without_assignment_provenance_blocks(self):
+        runner = FakeWorkflowRunner()
+        runner.issue["status"] = "done"
+        runner.issue["assignee_id"] = REVIEWER_ID
+        runner.metadata = build_phase_metadata(implementation_completion())
+
+        with self.assertRaisesRegex(RuntimeError, "assignment provenance"):
+            finish_phase(runner, "PRO-36", implementation_completion())
+
+        self.assertEqual(runner.mutation_count, 0)
 
     def test_completed_version_one_phase_remains_inspectable(self):
         runner = FakeWorkflowRunner()
@@ -1444,7 +1659,7 @@ class PhaseCompletionTests(unittest.TestCase):
         legacy["eventra.workflow.version"] = "1"
         legacy.pop("eventra.phase.failure_repositories")
         runner.issue["status"] = "done"
-        runner.metadata.update(legacy)
+        runner.metadata = legacy
 
         result = finish_phase(runner, "PRO-36", implementation_completion())
 
@@ -1662,6 +1877,16 @@ def parent_snapshot(**overrides):
         "children": (phase("PRO-36", 1, "implementation"),),
         "pull_requests": (frontend_pr(),),
         "next_stage": 2,
+        "assignment_agent_ids": (
+            ("backend_engineer", BACKEND_AGENT_ID),
+            ("frontend_engineer", AGENT_ID),
+            ("independent_reviewer", REVIEWER_ID),
+            ("integration_qa", QA_ID),
+        ),
+        "assignment_project_ids": (
+            ("backend", BACKEND_PROJECT_ID),
+            ("frontend", PROJECT_ID),
+        ),
     }
     values.update(overrides)
     if "next_stage" not in overrides:
@@ -1673,6 +1898,65 @@ def parent_snapshot(**overrides):
     current = tuple(
         child for child in values["children"] if child.stage == current_stage
     )
+    if current and {child.kind for child in current} == {"implementation"}:
+        action_snapshot = ParentSnapshot(**values)
+        action = _action_key(
+            replace(action_snapshot, next_stage=current_stage, last_action=None),
+            "create_implementation_stage",
+            values["attempt"],
+        )
+        if "last_action" not in overrides:
+            values["last_action"] = action
+        enriched = []
+        for child in values["children"]:
+            if child.stage != current_stage:
+                enriched.append(child)
+                continue
+            repository = "frontend" if child.frontend_sha is not None else "backend"
+            enriched.append(
+                replace(
+                    child,
+                    creation_action=child.creation_action or action,
+                    phase_target=child.phase_target or f"repository:{repository}",
+                    phase_role=child.phase_role or f"{repository}_engineer",
+                    project_id=child.project_id or (
+                        PROJECT_ID if repository == "frontend" else BACKEND_PROJECT_ID
+                    ),
+                    assignee_id=child.assignee_id or (
+                        AGENT_ID if repository == "frontend" else BACKEND_AGENT_ID
+                    ),
+                    pr_url=child.pr_url or (
+                        FRONTEND_PR if repository == "frontend" else
+                        "https://github.com/codeExploreHub/Eventra-Backend/pull/7"
+                    ),
+                )
+            )
+        values["children"] = tuple(enriched)
+    elif current and {child.kind for child in current} == {"smoke"}:
+        action_snapshot = ParentSnapshot(**values)
+        action = _action_key(
+            replace(action_snapshot, next_stage=current_stage, last_action=None),
+            "create_smoke_stage",
+            values["attempt"],
+        )
+        if "last_action" not in overrides:
+            values["last_action"] = action
+        values["children"] = tuple(
+            replace(
+                child,
+                creation_action=child.creation_action or action,
+                phase_target=child.phase_target or "suite:smoke",
+                phase_role=child.phase_role or "integration_qa",
+                project_id=child.project_id or PROJECT_ID,
+                assignee_id=child.assignee_id or QA_ID,
+            )
+            if child.stage == current_stage else child
+            for child in values["children"]
+        )
+        values["pull_requests"] = tuple(
+            replace(item, state="merged")
+            for item in values["pull_requests"]
+        )
     if current and {child.kind for child in current} <= {
         "review", "qa", "integration_qa"
     }:
@@ -1725,6 +2009,17 @@ def parent_snapshot(**overrides):
                 )
             )
         values["children"] = tuple(enriched)
+    if (
+        values["merge_state"] == "merged"
+        and (not current or {child.kind for child in current} != {"smoke"})
+        and "last_action" not in overrides
+    ):
+        merge_snapshot = ParentSnapshot(**values)
+        values["last_action"] = _action_key(
+            replace(merge_snapshot, last_action=None),
+            "merge",
+            values["attempt"],
+        )
     return ParentSnapshot(**values)
 
 
@@ -2371,7 +2666,10 @@ class ParentDecisionTests(unittest.TestCase):
                 decision = decide_parent_action(snapshot)
 
                 self.assertEqual(decision.kind, "block_parent")
-                self.assertIn("out-of-band", decision.reason)
+                self.assertIn(
+                    "out-of-band" if label == "gate" else "authority",
+                    decision.reason,
+                )
 
     def test_current_repair_pass_requires_complete_authoritative_provenance(self):
         valid = self._authoritative_current_repair_snapshot()
@@ -2780,6 +3078,126 @@ class ParentDecisionTests(unittest.TestCase):
             ),
         )
 
+    def test_nonrepair_completion_without_assignment_provenance_never_advances(self):
+        implementation = parent_snapshot()
+        implementation = replace(
+            implementation,
+            children=(
+                replace(
+                    implementation.children[0],
+                    creation_action="",
+                    phase_target="",
+                    phase_role="",
+                    assignee_id=REVIEWER_ID,
+                ),
+            ),
+        )
+        smoke = parent_snapshot(
+            merge_state="merged",
+            children=(phase("PRO-50", 4, "smoke"),),
+        )
+        smoke = replace(
+            smoke,
+            children=(
+                replace(
+                    smoke.children[0],
+                    creation_action="",
+                    phase_target="",
+                    phase_role="",
+                    assignee_id=REVIEWER_ID,
+                ),
+            ),
+        )
+        cases = (
+            (
+                "implementation",
+                implementation,
+                "create_gate_stage",
+            ),
+            (
+                "smoke",
+                smoke,
+                "complete_parent",
+            ),
+        )
+        for label, snapshot, unsafe_action in cases:
+            with self.subTest(kind=label):
+                decision = decide_parent_action(snapshot)
+
+                self.assertEqual(decision.kind, "block_parent")
+                self.assertNotEqual(decision.kind, unsafe_action)
+
+    def test_nonrepair_assignment_drift_blocks_planner_before_successor(self):
+        implementation = parent_snapshot()
+        smoke = parent_snapshot(
+            merge_state="merged",
+            children=(phase("PRO-50", 4, "smoke"),),
+        )
+        implementation_child = implementation.children[0]
+        smoke_child = smoke.children[0]
+        cases = {
+            "implementation action": replace(
+                implementation,
+                children=(replace(implementation_child, creation_action="forged"),),
+            ),
+            "implementation target": replace(
+                implementation,
+                children=(replace(implementation_child, phase_target="repository:backend"),),
+            ),
+            "implementation role": replace(
+                implementation,
+                children=(replace(implementation_child, phase_role="backend_engineer"),),
+            ),
+            "implementation agent": replace(
+                implementation,
+                children=(replace(implementation_child, assignee_id=REVIEWER_ID),),
+            ),
+            "implementation project": replace(
+                implementation,
+                children=(replace(implementation_child, project_id=BACKEND_PROJECT_ID),),
+            ),
+            "implementation pull request": replace(
+                implementation,
+                children=(replace(implementation_child, pr_url="https://github.com/codeExploreHub/Eventra-Backend/pull/7"),),
+            ),
+            "smoke action": replace(
+                smoke,
+                children=(replace(smoke_child, creation_action="forged"),),
+            ),
+            "smoke target": replace(
+                smoke,
+                children=(replace(smoke_child, phase_target="suite:integration"),),
+            ),
+            "smoke role": replace(
+                smoke,
+                children=(replace(smoke_child, phase_role="independent_reviewer"),),
+            ),
+            "smoke agent": replace(
+                smoke,
+                children=(replace(smoke_child, assignee_id=REVIEWER_ID),),
+            ),
+            "smoke project": replace(
+                smoke,
+                children=(replace(smoke_child, project_id=BACKEND_PROJECT_ID),),
+            ),
+            "smoke parent action": replace(smoke, last_action="forged"),
+            "smoke merge state": replace(smoke, merge_state="ready"),
+            "smoke merged head": replace(
+                smoke,
+                pull_requests=(replace(smoke.pull_requests[0], head_sha="c" * 40),),
+            ),
+            "smoke merged state": replace(
+                smoke,
+                pull_requests=(replace(smoke.pull_requests[0], state="open"),),
+            ),
+        }
+        for label, snapshot in cases.items():
+            with self.subTest(label=label):
+                self.assertEqual(
+                    decide_parent_action(snapshot).kind,
+                    "block_parent",
+                )
+
     def test_future_gate_stage_cannot_override_authoritative_current_stage(self):
         snapshot = parent_snapshot(
             next_stage=3,
@@ -2844,11 +3262,21 @@ class ParentDecisionTests(unittest.TestCase):
             frontend_sha=None,
             backend_sha=backend_sha,
         )
-        complete = ParentSnapshot(
-            **{
-                **snapshot.__dict__,
-                "children": snapshot.children + (backend_implementation,),
-            }
+        complete = parent_snapshot(
+            classification="cross-stack",
+            candidate_backend_sha=backend_sha,
+            children=(snapshot.children[0], backend_implementation),
+            pull_requests=(
+                frontend_pr(),
+                PullRequestSnapshot(
+                    "backend",
+                    "https://github.com/codeExploreHub/Eventra-Backend/pull/7",
+                    backend_sha,
+                    "open",
+                    True,
+                    True,
+                ),
+            ),
         )
         self.assertEqual(
             decide_parent_action(complete).kind,
@@ -3433,9 +3861,20 @@ class ParentDecisionTests(unittest.TestCase):
             decide_parent_action(parent_snapshot(merge_state="partial")).kind,
             "block_parent",
         )
+        merged = parent_snapshot(
+            merge_state="merged",
+            children=(
+                phase("PRO-37", 2, "review"),
+                phase("PRO-38", 2, "qa"),
+            ),
+        )
         self.assertEqual(
-            decide_parent_action(parent_snapshot(merge_state="merged")).kind,
+            decide_parent_action(merged).kind,
             "create_smoke_stage",
+        )
+        self.assertEqual(
+            decide_parent_action(replace(merged, last_action="forged")).kind,
+            "block_parent",
         )
         smoke = (phase("PRO-50", 4, "smoke"),)
         self.assertEqual(
@@ -3468,7 +3907,7 @@ class ParentDecisionTests(unittest.TestCase):
         self.assertEqual(decision.kind, "block_parent")
         self.assertIn("attempt", decision.reason)
 
-    def test_incomplete_stage_and_recorded_action_are_noops(self):
+    def test_incomplete_stage_waits_and_unexplained_recorded_action_blocks(self):
         incomplete = (
             PhaseSnapshot(
                 issue_key="PRO-36",
@@ -3487,7 +3926,7 @@ class ParentDecisionTests(unittest.TestCase):
         )
         first = decide_parent_action(parent_snapshot())
         second = decide_parent_action(parent_snapshot(last_action=first.action_key))
-        self.assertEqual(second.kind, "noop")
+        self.assertEqual(second.kind, "block_parent")
 
 
 class FakeParentCompletionRunner:
@@ -3695,6 +4134,16 @@ def stalled_workflow(**overrides):
         pull_requests=(frontend_pr(),),
         next_stage=current_stage + 1,
         parent_id=PARENT_ID,
+        assignment_agent_ids=(
+            ("backend_engineer", BACKEND_AGENT_ID),
+            ("frontend_engineer", AGENT_ID),
+            ("independent_reviewer", REVIEWER_ID),
+            ("integration_qa", QA_ID),
+        ),
+        assignment_project_ids=(
+            ("backend", BACKEND_PROJECT_ID),
+            ("frontend", PROJECT_ID),
+        ),
     )
     values["children"] = children
     values["parent"] = parent
@@ -3723,6 +4172,21 @@ def stalled_workflow(**overrides):
 
 
 class RecoveryDecisionTests(unittest.TestCase):
+    def test_recovery_never_consumes_an_in_progress_smoke_reservation(self):
+        snapshot = stalled_workflow()
+        snapshot = replace(
+            snapshot,
+            parent=replace(
+                snapshot.parent,
+                smoke_reservation={"action_key": "reserved"},
+            ),
+        )
+
+        decision = decide_recovery(snapshot)
+
+        self.assertEqual(decision.kind, "noop")
+        self.assertIn("reservation", decision.reason)
+
     def test_recovery_never_selects_a_historical_child_over_current_stage(self):
         old_terminal = stalled_workflow().children[0]
         current_active = replace(
@@ -4127,14 +4591,9 @@ class FakeWatchRunner:
         call = tuple(args)
         self.calls.append(call)
         if call == ("agent", "list", "--output", "json"):
-            return [
-                {"id": DELIVERY_LEAD_ID, "name": "Eventra Delivery Lead"},
-                {"id": AGENT_ID, "name": "Eventra Frontend Engineer"},
-                {"id": BACKEND_AGENT_ID, "name": "Eventra Backend Engineer"},
-                {"id": QA_ID, "name": "Eventra Integration QA"},
-                {"id": REVIEWER_ID, "name": "Eventra Independent Reviewer"},
-                {"id": WATCHER_ID, "name": "Eventra Workflow Watcher"},
-            ]
+            return assignment_agents()
+        if call == ("project", "list", "--output", "json"):
+            return assignment_projects()
         if call == ("squad", "list", "--output", "json"):
             return copy.deepcopy(self.squads)
         if call == ("squad", "get", SQUAD_ID, "--output", "json"):
@@ -4517,6 +4976,31 @@ class WatchWorkflowTests(unittest.TestCase):
         )
         return runner
 
+    def _terminal_smoke_runner(self):
+        snapshot = parent_snapshot(
+            merge_state="merged",
+            children=(
+                phase(
+                    "PRO-10",
+                    1,
+                    "implementation",
+                    pr_url=FRONTEND_PR,
+                    evidence_comment=(
+                        "00000000-0000-4000-8000-000000000010"
+                    ),
+                ),
+                phase(
+                    "PRO-36",
+                    4,
+                    "smoke",
+                    evidence_comment=COMMENT_ID,
+                ),
+            ),
+        )
+        runner = FakeWatchRunner()
+        runner.install_parent_snapshot(snapshot, "PRO-36")
+        return runner
+
     def _terminal_gate_runner(self):
         snapshot = self._cross_stack_gate_snapshot()
         children = tuple(
@@ -4664,6 +5148,7 @@ class WatchWorkflowTests(unittest.TestCase):
     def test_watcher_parent_rerun_accepts_exact_terminal_stage_types(self):
         controls = [
             self._terminal_implementation_runner(),
+            self._terminal_smoke_runner(),
             self._terminal_gate_runner(),
             *(self._terminal_repair_runner(round_) for round_ in (1, 2, 3)),
         ]
@@ -4673,6 +5158,36 @@ class WatchWorkflowTests(unittest.TestCase):
 
                 self.assertEqual(result.applied, 1)
                 self.assertEqual(result.decision, "rerun_parent")
+
+    def test_watcher_parent_rerun_rejects_terminal_smoke_assignment_drift(self):
+        corruptions = {
+            "action": lambda runner: runner.metadata["PRO-36"].__setitem__(
+                "eventra.phase.creation_action", "forged"
+            ),
+            "target": lambda runner: runner.metadata["PRO-36"].__setitem__(
+                "eventra.phase.target", "suite:integration"
+            ),
+            "role": lambda runner: runner.metadata["PRO-36"].__setitem__(
+                "eventra.phase.role", "independent_reviewer"
+            ),
+            "project": lambda runner: runner.child.__setitem__(
+                "project_id", BACKEND_PROJECT_ID
+            ),
+            "agent": lambda runner: runner.child.__setitem__(
+                "assignee_id", REVIEWER_ID
+            ),
+            "candidate": lambda runner: runner.metadata["PRO-36"].__setitem__(
+                "eventra.phase.sha.frontend", "c" * 40
+            ),
+        }
+        for label, corrupt in corruptions.items():
+            with self.subTest(label=label):
+                runner = self._terminal_smoke_runner()
+                corrupt(runner)
+
+                result = self._watch(runner, apply=True)
+
+                self.assertEqual(result, WatchResult(1, 0, 0, "noop"))
 
     def test_watcher_parent_rerun_rejects_terminal_gate_target_drift(self):
         runner = self._terminal_gate_runner()
@@ -5287,6 +5802,11 @@ class FakeParentRunner(FakeWatchRunner):
     def __init__(self):
         super().__init__()
         self.comment_records = []
+        implementation_action = (
+            "2:PRO-35:create_implementation_stage:0:frontend:"
+            + FRONTEND_SHA
+            + ":-:next-stage:1"
+        )
         self.metadata["PRO-35"] = {
             "eventra.workflow.version": "2",
             "eventra.workflow.classification": "frontend-only",
@@ -5294,10 +5814,17 @@ class FakeParentRunner(FakeWatchRunner):
             "eventra.workflow.attempt": "0",
             "eventra.workflow.frontend_sha": FRONTEND_SHA,
             "eventra.workflow.merge_state": "not_ready",
-            "eventra.workflow.last_action": "",
+            "eventra.workflow.last_action": implementation_action,
         }
         self.metadata["PRO-36"] = build_phase_metadata(
             implementation_completion()
+        )
+        self.metadata["PRO-36"].update(
+            {
+                "eventra.phase.creation_action": implementation_action,
+                "eventra.phase.target": "repository:frontend",
+                "eventra.phase.role": "frontend_engineer",
+            }
         )
         self.child["status"] = "done"
 
@@ -5595,6 +6122,10 @@ class FakeRepairRunner:
             raise AssertionError("repair executor does not accept stdin JSON")
         call = tuple(args)
         self.calls.append(call)
+        if call == ("agent", "list", "--output", "json"):
+            return assignment_agents()
+        if call == ("project", "list", "--output", "json"):
+            return assignment_projects()
         if call[:2] == ("issue", "get"):
             identifier = call[2]
             if identifier in {"PRO-65", PARENT_ID}:
@@ -5747,6 +6278,265 @@ class FakeRepairRunner:
         if call[:2] == ("issue", "runs"):
             return copy.deepcopy(self.runs.get(call[2], []))
         raise AssertionError(f"unsupported argv: {call!r}")
+
+
+class SmokeExecutionTests(unittest.TestCase):
+    class GitHub(FakeRepairGitHubRunner):
+        def run(self, args):
+            value = super().run(args)
+            value["state"] = "MERGED"
+            value["mergeable"] = "UNKNOWN"
+            value["mergeStateStatus"] = "UNKNOWN"
+            return value
+
+    def _planned(self):
+        runner = FakeRepairRunner(attempt=0)
+        for child in runner.children:
+            metadata = runner.metadata[child["identifier"]]
+            if child["stage"] != 2:
+                continue
+            metadata["eventra.phase.result"] = "pass"
+            metadata["eventra.phase.failure_repositories"] = "[]"
+            metadata.pop("eventra.phase.evidence_comment_url", None)
+        merge_snapshot = load_parent_snapshot(
+            runner,
+            FakeRepairGitHubRunner(),
+            "PRO-65",
+        )
+        merge_decision = decide_parent_action(merge_snapshot)
+        self.assertEqual(merge_decision.kind, "merge", merge_decision.reason)
+        runner.metadata["PRO-65"].update(
+            {
+                "eventra.workflow.merge_state": "merged",
+                "eventra.workflow.last_action": merge_decision.action_key,
+            }
+        )
+        github = self.GitHub()
+        snapshot = load_parent_snapshot(runner, github, "PRO-65")
+        decision = decide_parent_action(snapshot)
+        self.assertEqual(decision.kind, "create_smoke_stage", decision.reason)
+        return runner, github, decision
+
+    def test_smoke_executor_is_an_exact_action_cli(self):
+        self.assertTrue(
+            hasattr(workflow_module, "execute_parent_smoke"),
+            "operational smoke creation lacks an executor",
+        )
+        args = build_workflow_parser().parse_args(
+            [
+                "execute-parent-smoke",
+                "PRO-65",
+                "--expected-action-key",
+                (
+                    "2:PRO-65:create_smoke_stage:0:backend:-:"
+                    + "b" * 40
+                    + ":next-stage:3"
+                ),
+            ]
+        )
+        self.assertEqual(args.command, "execute-parent-smoke")
+        self.assertEqual(args.parent, "PRO-65")
+
+    def test_exact_smoke_action_creates_one_provenance_bound_child_and_replays(self):
+        runner, github, decision = self._planned()
+
+        result = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(result.next_action, "smoke", result.reason)
+        created = [child for child in runner.children if child["stage"] == 3]
+        self.assertEqual(len(created), 1)
+        child = created[0]
+        metadata = runner.metadata[child["identifier"]]
+        self.assertEqual(child["status"], "todo")
+        self.assertEqual(
+            {
+                "creation_action": metadata["eventra.phase.creation_action"],
+                "target": metadata["eventra.phase.target"],
+                "role": metadata["eventra.phase.role"],
+                "sha": metadata["eventra.phase.sha.backend"],
+            },
+            {
+                "creation_action": decision.action_key,
+                "target": "suite:smoke",
+                "role": "integration_qa",
+                "sha": FakeRepairRunner.BACKEND_SHA,
+            },
+        )
+        self.assertEqual(
+            runner.metadata["PRO-65"]["eventra.workflow.next_stage"],
+            "4",
+        )
+        self.assertEqual(
+            runner.metadata["PRO-65"]["eventra.workflow.last_action"],
+            decision.action_key,
+        )
+        self.assertNotIn(
+            "eventra.workflow.smoke_reservation",
+            runner.metadata["PRO-65"],
+        )
+
+        replay = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+        self.assertEqual(replay.next_action, "noop", replay.reason)
+        self.assertEqual(replay.mutation_count, 0)
+        self.assertEqual(len([child for child in runner.children if child["stage"] == 3]), 1)
+
+    def test_smoke_reservation_recovers_every_metadata_prefix_without_duplicate(self):
+        for persisted_key_count in range(9):
+            with self.subTest(persisted_key_count=persisted_key_count):
+                runner, github, decision = self._planned()
+                if persisted_key_count == 0:
+                    runner.hard_interrupt_after_create = True
+                else:
+                    runner.hard_interrupt_after_child_metadata_writes = (
+                        persisted_key_count
+                    )
+
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt,
+                    "injected hard interruption",
+                ):
+                    execute_parent_smoke(
+                        runner,
+                        github,
+                        "PRO-65",
+                        expected_action_key=decision.action_key,
+                    )
+
+                runner.hard_interrupt_after_create = False
+                runner.hard_interrupt_after_child_metadata_writes = None
+                before = runner.committed_mutations
+                retry = execute_parent_smoke(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+                smoke_children = [
+                    child for child in runner.children if child["stage"] == 3
+                ]
+
+                self.assertEqual(retry.next_action, "smoke", retry.reason)
+                self.assertEqual(len(smoke_children), 1)
+                self.assertEqual(smoke_children[0]["status"], "todo")
+                self.assertEqual(
+                    retry.mutation_count,
+                    runner.committed_mutations - before,
+                )
+                self.assertNotIn(
+                    "eventra.workflow.smoke_reservation",
+                    runner.metadata["PRO-65"],
+                )
+
+    def test_smoke_executor_lost_ack_retries_converge_without_duplicate(self):
+        lost_acks = (
+            "set:PRO-65:eventra.workflow.smoke_reservation",
+            "create",
+            "set-child:eventra.phase.creation_action",
+            "set:PRO-65:eventra.workflow.last_action",
+            "status",
+            "delete:PRO-65:eventra.workflow.smoke_reservation",
+        )
+        for lost_ack in lost_acks:
+            with self.subTest(lost_ack=lost_ack):
+                runner, github, decision = self._planned()
+                runner.lost_ack_once.add(lost_ack)
+
+                first = execute_parent_smoke(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+                second = execute_parent_smoke(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+
+                self.assertIn(first.next_action, {"smoke", "block"})
+                self.assertIn(second.next_action, {"smoke", "noop"}, second.reason)
+                self.assertEqual(
+                    len([child for child in runner.children if child["stage"] == 3]),
+                    1,
+                )
+
+    def test_smoke_reservation_conflicts_never_overwrite_or_duplicate(self):
+        for corruption in ("extra metadata", "duplicate child"):
+            with self.subTest(corruption=corruption):
+                runner, github, decision = self._planned()
+                runner.hard_interrupt_after_create = True
+                with self.assertRaises(KeyboardInterrupt):
+                    execute_parent_smoke(
+                        runner,
+                        github,
+                        "PRO-65",
+                        expected_action_key=decision.action_key,
+                    )
+                runner.hard_interrupt_after_create = False
+                if corruption == "extra metadata":
+                    child = next(item for item in runner.children if item["stage"] == 3)
+                    runner.metadata[child["identifier"]]["eventra.phase.unbound"] = "forged"
+                else:
+                    duplicate = copy.deepcopy(
+                        next(item for item in runner.children if item["stage"] == 3)
+                    )
+                    duplicate["id"] = "01a00000-0000-7000-8000-000000000099"
+                    duplicate["identifier"] = "PRO-99"
+                    runner.children.append(duplicate)
+                    runner.metadata["PRO-99"] = {}
+                    runner.runs["PRO-99"] = []
+                before = runner.committed_mutations
+
+                retry = execute_parent_smoke(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+
+                self.assertEqual(retry.next_action, "block")
+                self.assertEqual(retry.mutation_count, 0)
+                self.assertEqual(runner.committed_mutations, before)
+
+    def test_uncommitted_smoke_reservation_recovers_a_missing_create_effect(self):
+        runner, github, decision = self._planned()
+        runner.fail_once_create = True
+
+        interrupted = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+        replanned = decide_parent_action(
+            load_parent_snapshot(runner, github, "PRO-65")
+        )
+        retry = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(interrupted.next_action, "block")
+        self.assertEqual(replanned.kind, "block_parent")
+        self.assertNotEqual(replanned.kind, "create_smoke_stage")
+        self.assertEqual(retry.next_action, "smoke", retry.reason)
+        self.assertEqual(
+            len([child for child in runner.children if child["stage"] == 3]),
+            1,
+        )
 
 
 class RepairExecutionTests(unittest.TestCase):
@@ -7806,6 +8596,43 @@ class ParentSnapshotReadTests(unittest.TestCase):
         self.assertEqual(snapshot.children[0].kind, "implementation")
         self.assertEqual(snapshot.pull_requests[0].head_sha, FRONTEND_SHA)
         self.assertEqual(decide_parent_action(snapshot).kind, "create_gate_stage")
+
+    def test_loaded_forged_implementation_completion_never_advances(self):
+        runner = FakeParentRunner()
+        runner.child["assignee_id"] = REVIEWER_ID
+        for key in (
+            "eventra.phase.creation_action",
+            "eventra.phase.target",
+            "eventra.phase.role",
+        ):
+            runner.metadata["PRO-36"].pop(key)
+
+        decision = decide_parent_action(
+            load_parent_snapshot(runner, FakeGitHubRunner(), "PRO-35")
+        )
+
+        self.assertEqual(decision.kind, "block_parent")
+        self.assertNotEqual(decision.kind, "create_gate_stage")
+
+    def test_loaded_assignment_parent_view_must_remain_stable_after_authority_reads(self):
+        class DriftingRunner(FakeParentRunner):
+            def __init__(self):
+                super().__init__()
+                self.assignment_reads = 0
+
+            def run(self, args, *, stdin_json=None):
+                if tuple(args) == ("agent", "list", "--output", "json"):
+                    self.assignment_reads += 1
+                    if self.assignment_reads == 2:
+                        self.metadata["PRO-36"][
+                            "eventra.phase.target"
+                        ] = "repository:backend"
+                return super().run(args, stdin_json=stdin_json)
+
+        runner = DriftingRunner()
+
+        with self.assertRaisesRegex(RuntimeError, "assignment.*changed"):
+            load_parent_snapshot(runner, FakeGitHubRunner(), "PRO-35")
 
     def test_plan_parent_parser_is_read_only_and_prints_only_decision_fields(self):
         args = build_workflow_parser().parse_args(["plan-parent", "PRO-35"])

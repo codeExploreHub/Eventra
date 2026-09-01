@@ -315,6 +315,29 @@ class OperatorDocsTests(unittest.TestCase):
             lead,
         )
 
+    def test_smoke_creation_uses_the_exact_recoverable_executor_only(self):
+        lead = " ".join(
+            Path("tools/multica/instructions/delivery_lead.md").read_text().split()
+        )
+        readme = " ".join(Path("tools/multica/README.md").read_text().split())
+
+        for rendered in (lead, readme):
+            self.assertIn(
+                "tools.multica.workflow execute-parent-smoke",
+                rendered,
+            )
+            self.assertIn("--expected-action-key", rendered)
+            self.assertIn("eventra.workflow.smoke_reservation", rendered)
+            self.assertIn("eventra.phase.creation_action", rendered)
+            self.assertIn("eventra.phase.target", rendered)
+            self.assertIn("eventra.phase.role", rendered)
+            self.assertIn("exact merged candidate SHA map", rendered)
+            self.assertIn("single serialized Delivery Lead", rendered)
+            self.assertIn("not generic CAS or transaction safety", rendered)
+            self.assertIn("starts Integration QA", rendered)
+
+        self.assertIn("Do not create smoke children manually", lead)
+
     def test_unattended_parent_completion_and_exact_sha_checkout_are_explicit(self):
         instructions = Path("tools/multica/instructions")
         lead = (instructions / "delivery_lead.md").read_text()

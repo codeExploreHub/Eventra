@@ -18,6 +18,7 @@ from urllib.parse import unquote, urlsplit
 from .blueprint import build_multi_repo_blueprint
 from .contracts import (
     parse_agent_list,
+    parse_project_list,
     parse_squad_detail,
     parse_squad_list,
     parse_squad_members,
@@ -66,6 +67,7 @@ GATE_PROVENANCE_KEYS = frozenset(
     }
 )
 REPAIR_RESERVATION_KEY = "eventra.workflow.repair_reservation"
+SMOKE_RESERVATION_KEY = "eventra.workflow.smoke_reservation"
 REPAIR_AUTHORIZATION_KEY = "eventra.workflow.repair_authorization_comment"
 REPAIR_AUTHORIZATION_CONSUMED_KEY = (
     "eventra.workflow.repair_authorization_consumed"
@@ -73,6 +75,7 @@ REPAIR_AUTHORIZATION_CONSUMED_KEY = (
 MAX_REPAIR_RESERVATION_BYTES = 16_384
 MAX_REPAIR_DESCRIPTION_BYTES = 16_384
 MAX_REPAIR_TITLE_BYTES = 255
+MAX_SMOKE_RESERVATION_BYTES = 8_192
 REPAIR_ASSIGNEES = {
     "frontend": "Eventra Frontend Engineer",
     "backend": "Eventra Backend Engineer",
@@ -87,6 +90,10 @@ ASSIGNMENT_AGENT_NAMES = {
     role: name
     for role, name in SQUAD_AGENT_NAMES.items()
     if role != DELIVERY_LEAD_ROLE
+}
+ASSIGNMENT_PROJECT_TITLES = {
+    "frontend": "Eventra Local Development",
+    "backend": "Eventra Backend Local Development",
 }
 REPAIR_PROVENANCE_KEYS = frozenset(
     {
@@ -207,8 +214,11 @@ class ParentSnapshot:
     consumed_authorization_uuid: str = ""
     authorizing_comment: AuthorizingComment | None = None
     repair_reservation: dict[str, object] | None = None
+    smoke_reservation: dict[str, object] | None = None
     parent_id: str = ""
     quarantined_repair_children: tuple[QuarantinedRepairChild, ...] = ()
+    assignment_agent_ids: tuple[tuple[str, str], ...] = ()
+    assignment_project_ids: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -235,6 +245,16 @@ class RepairExecutionResult:
     action_key: str
     mutation_count: int
     child_identifiers: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SmokeExecutionResult:
+    parent_identifier: str
+    next_action: Literal["smoke", "noop", "block"]
+    reason: str
+    action_key: str
+    mutation_count: int
+    child_identifier: str = ""
 
 
 @dataclass(frozen=True)
@@ -1368,6 +1388,12 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
             "block_parent",
             "repair reservation requires exact executor reconciliation",
         )
+    if snapshot.smoke_reservation is not None:
+        return _parent_decision(
+            snapshot,
+            "block_parent",
+            "smoke reservation requires exact executor reconciliation",
+        )
     if snapshot.merge_state == "partial":
         return _parent_decision(
             snapshot,
@@ -1399,6 +1425,15 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
     current_repair_stage = bool(
         latest and {item.kind for item in latest} == {"repair"}
     )
+    current_kinds = {item.kind for item in latest}
+    if current_kinds == {"implementation"}:
+        assignment_problem = _implementation_assignment_problem(snapshot, latest)
+        if assignment_problem is not None:
+            return ParentDecision("block_parent", None, assignment_problem)
+    elif current_kinds == {"smoke"}:
+        assignment_problem = _smoke_assignment_problem(snapshot, latest)
+        if assignment_problem is not None:
+            return ParentDecision("block_parent", None, assignment_problem)
     if current_repair_stage:
         repair_problem = _current_repair_provenance_problem(snapshot, latest)
         if repair_problem is not None:
@@ -1434,6 +1469,17 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
                     "merged local smoke passed",
                 )
             return _repair_or_block(snapshot)
+        expected_merge_action = _action_key(
+            replace(snapshot, last_action=None),
+            "merge",
+            snapshot.attempt,
+        )
+        if snapshot.last_action != expected_merge_action:
+            return _parent_decision(
+                snapshot,
+                "block_parent",
+                "merged state lacks its canonical merge action",
+            )
         return _parent_decision(
             snapshot,
             "create_smoke_stage",
@@ -1587,6 +1633,11 @@ def _recovery_authority_identity(
             if parent.repair_reservation is None
             else _canonical_json(parent.repair_reservation)
         ),
+        (
+            None
+            if parent.smoke_reservation is None
+            else _canonical_json(parent.smoke_reservation)
+        ),
         snapshot.project_ids,
         snapshot.agent_ids,
         tuple(
@@ -1642,11 +1693,51 @@ def _parent_assignment_problem(snapshot: WorkflowSnapshot) -> str | None:
     return None
 
 
+def _exact_assignment_authority(
+    runner: MulticaRunner,
+) -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]]:
+    agents = parse_agent_list(
+        runner.run(["agent", "list", "--output", "json"])
+    )
+    projects = parse_project_list(
+        runner.run(["project", "list", "--output", "json"])
+    )
+    agent_ids: list[tuple[str, str]] = []
+    for role, name in sorted(ASSIGNMENT_AGENT_NAMES.items()):
+        matches = [item["id"] for item in agents if item["name"] == name]
+        if len(matches) != 1 or not _is_uuid(matches[0]):
+            raise RuntimeError("assignment agent authority is incomplete")
+        agent_ids.append((role, matches[0]))
+    project_ids: list[tuple[str, str]] = []
+    for repository, title in sorted(ASSIGNMENT_PROJECT_TITLES.items()):
+        matches = [item["id"] for item in projects if item["title"] == title]
+        if len(matches) != 1 or not _is_uuid(matches[0]):
+            raise RuntimeError("assignment project authority is incomplete")
+        project_ids.append((repository, matches[0]))
+    return tuple(agent_ids), tuple(project_ids)
+
+
+def _parent_assignment_authority_problem(snapshot: ParentSnapshot) -> str | None:
+    agents = dict(snapshot.assignment_agent_ids)
+    projects = dict(snapshot.assignment_project_ids)
+    if (
+        set(agents) != set(ASSIGNMENT_AGENT_NAMES)
+        or set(projects) != set(ASSIGNMENT_PROJECT_TITLES)
+        or len(agents) != len(snapshot.assignment_agent_ids)
+        or len(projects) != len(snapshot.assignment_project_ids)
+        or any(not _is_uuid(item) for item in (*agents.values(), *projects.values()))
+    ):
+        return "current assignment authority is incomplete"
+    return None
+
+
 def _implementation_assignment_problem(
-    snapshot: WorkflowSnapshot,
     parent: ParentSnapshot,
     phases: tuple[PhaseSnapshot, ...],
 ) -> str | None:
+    authority_problem = _parent_assignment_authority_problem(parent)
+    if authority_problem is not None:
+        return authority_problem
     expected_repositories = _expected_repositories(parent)
     expected_action = _action_key(
         replace(
@@ -1657,11 +1748,8 @@ def _implementation_assignment_problem(
         "create_implementation_stage",
         parent.attempt,
     )
-    expected_projects = (
-        dict(zip(("frontend", "backend"), snapshot.project_ids, strict=True))
-        if len(snapshot.project_ids) == 2
-        else {}
-    )
+    expected_projects = dict(parent.assignment_project_ids)
+    expected_agents = dict(parent.assignment_agent_ids)
     observed: dict[str, PhaseSnapshot] = {}
     assignees: set[str] = set()
     for phase in phases:
@@ -1689,12 +1777,8 @@ def _implementation_assignment_problem(
             or phase.phase_target != f"repository:{repository}"
             or phase.phase_role != f"{repository}_engineer"
             or phase.assignee_type != "agent"
-            or not _is_uuid(phase.assignee_id)
-            or not _is_uuid(phase.project_id)
-            or (
-                expected_projects
-                and phase.project_id != expected_projects[repository]
-            )
+            or phase.assignee_id != expected_agents[f"{repository}_engineer"]
+            or phase.project_id != expected_projects[repository]
             or phase.frontend_sha != (
                 expected_sha if repository == "frontend" else None
             )
@@ -1717,6 +1801,71 @@ def _implementation_assignment_problem(
         return "current implementation assignment membership is incomplete"
     if _assignment_pull_request_problem(parent) is not None:
         return "current implementation pull-request authority is conflicting"
+    return None
+
+
+def _smoke_assignment_problem(
+    parent: ParentSnapshot,
+    phases: tuple[PhaseSnapshot, ...],
+) -> str | None:
+    authority_problem = _parent_assignment_authority_problem(parent)
+    if authority_problem is not None:
+        return authority_problem
+    expected_candidates = _candidate_sha_map(parent)
+    expected_action = _action_key(
+        replace(
+            parent,
+            next_stage=parent.next_stage - 1,
+            last_action=None,
+        ),
+        "create_smoke_stage",
+        parent.attempt,
+    )
+    if len(phases) != 1:
+        return "current smoke assignment membership is incomplete or conflicting"
+    phase = phases[0]
+    candidates = {
+        repository: sha
+        for repository, sha in (
+            ("frontend", phase.frontend_sha),
+            ("backend", phase.backend_sha),
+        )
+        if sha is not None
+    }
+    if (
+        phase.workflow_version != 2
+        or phase.kind != "smoke"
+        or phase.stage != parent.next_stage - 1
+        or phase.attempt != parent.attempt
+        or phase.creation_action != expected_action
+        or parent.last_action != expected_action
+        or phase.phase_target != "suite:smoke"
+        or phase.phase_role != "integration_qa"
+        or phase.assignee_type != "agent"
+        or phase.assignee_id != dict(parent.assignment_agent_ids)["integration_qa"]
+        or phase.project_id != dict(parent.assignment_project_ids)["frontend"]
+        or candidates != expected_candidates
+        or phase.pr_url
+        or phase.failure_bundle_digest
+        or phase.failure_evidence_uuids
+        or phase.authorizing_comment_uuid
+        or phase.repair_repository
+        or phase.repair_pull_request
+        or phase.repair_source_candidates
+        or parent.merge_state != "merged"
+    ):
+        return "current smoke assignment provenance is conflicting"
+    pull_requests = {item.repository: item for item in parent.pull_requests}
+    if (
+        len(pull_requests) != len(parent.pull_requests)
+        or set(pull_requests) != set(expected_candidates)
+        or any(
+            item.head_sha != expected_candidates[repository]
+            or item.state != "merged"
+            for repository, item in pull_requests.items()
+        )
+    ):
+        return "current smoke merged pull-request authority is conflicting"
     return None
 
 
@@ -1775,6 +1924,11 @@ def _current_assignment_provenance_problem(
     parent = snapshot.parent
     if parent is None or parent.workflow_version != 2:
         return "current assignment lacks authoritative parent provenance"
+    if (
+        parent.repair_reservation is not None
+        or parent.smoke_reservation is not None
+    ):
+        return "current assignment reservation is still in progress"
     current_children = tuple(
         child
         for child in snapshot.children
@@ -1798,7 +1952,9 @@ def _current_assignment_provenance_problem(
         return "current assignment child identity is conflicting"
     kinds = {phase.kind for phase in phases}
     if kinds == {"implementation"}:
-        problem = _implementation_assignment_problem(snapshot, parent, phases)
+        problem = _implementation_assignment_problem(parent, phases)
+    elif kinds == {"smoke"}:
+        problem = _smoke_assignment_problem(parent, phases)
     elif kinds <= {"review", "qa", "integration_qa"}:
         problem = _gate_assignment_problem(snapshot, parent, phases)
     elif kinds == {"repair"}:
@@ -1834,6 +1990,8 @@ def _assignment_agent_problem(
     for phase in phases:
         if phase.kind == "implementation":
             role = phase.phase_role
+        elif phase.kind == "smoke":
+            role = "integration_qa"
         elif phase.kind == "repair":
             role = f"{phase.repair_repository}_engineer"
         elif phase.kind == "review":
@@ -2074,6 +2232,12 @@ def _parent_metadata(value: dict[str, str]) -> dict[str, object]:
         if reservation_text is None
         else _decode_repair_reservation(reservation_text)
     )
+    smoke_reservation_text = value.get(SMOKE_RESERVATION_KEY)
+    smoke_reservation = (
+        None
+        if smoke_reservation_text is None
+        else _decode_smoke_reservation(smoke_reservation_text)
+    )
     if (
         version not in {"1", "2"}
         or classification not in {"frontend-only", "backend-only", "cross-stack"}
@@ -2097,6 +2261,7 @@ def _parent_metadata(value: dict[str, str]) -> dict[str, object]:
             consumed_authorization_uuid != ""
             and not _is_uuid(consumed_authorization_uuid)
         )
+        or (repair_reservation is not None and smoke_reservation is not None)
     ):
         raise RuntimeError("malformed parent workflow metadata")
     return {
@@ -2111,6 +2276,7 @@ def _parent_metadata(value: dict[str, str]) -> dict[str, object]:
         "authorization_comment_uuid": authorization_comment_uuid,
         "consumed_authorization_uuid": consumed_authorization_uuid,
         "repair_reservation": repair_reservation,
+        "smoke_reservation": smoke_reservation,
     }
 
 
@@ -2736,6 +2902,19 @@ def load_parent_snapshot(
         if stable_authorizing_comment != authorizing_comment:
             raise RuntimeError("repair authorization changed during recovery read")
 
+    current_stage = int(metadata["next_stage"]) - 1
+    current_kinds = {
+        item.kind for item in phases if item.stage == current_stage
+    }
+    needs_assignment_authority = current_kinds in (
+        {"implementation"},
+        {"smoke"},
+    )
+    assignment_authority_before = (
+        _exact_assignment_authority(runner)
+        if needs_assignment_authority
+        else ((), ())
+    )
     pull_requests = []
     for repository, (_, url) in sorted(pr_candidates.items()):
         raw = github.run(
@@ -2746,6 +2925,53 @@ def load_parent_snapshot(
             ]
         )
         pull_requests.append(_parse_pull_request(raw, url, repository))
+    assignment_authority_after = (
+        _exact_assignment_authority(runner)
+        if needs_assignment_authority
+        else assignment_authority_before
+    )
+    if assignment_authority_after != assignment_authority_before:
+        raise RuntimeError("assignment authority changed during parent read")
+    if needs_assignment_authority:
+        stable_parent = parse_issue_detail(
+            runner.run(["issue", "get", parent_key, "--output", "json"]),
+            parent_key,
+        )
+        stable_metadata = _parent_metadata(
+            parse_issue_metadata(
+                runner.run(
+                    [
+                        "issue", "metadata", "list", parent_key,
+                        "--output", "json",
+                    ]
+                )
+            )
+        )
+        stable_children = parse_issue_children(
+            runner.run(["issue", "children", parent_key, "--output", "json"]),
+            str(parent["id"]),
+        )
+        stable_child_metadata = {
+            str(child["identifier"]): parse_issue_metadata(
+                runner.run(
+                    [
+                        "issue", "metadata", "list",
+                        str(child["identifier"]), "--output", "json",
+                    ]
+                )
+            )
+            for child in stable_children
+            if child["stage"] is not None
+        }
+        assignment_authority_final = _exact_assignment_authority(runner)
+        if (
+            stable_parent != parent
+            or stable_metadata != metadata
+            or stable_children != children
+            or stable_child_metadata != child_metadata_by_key
+            or assignment_authority_final != assignment_authority_before
+        ):
+            raise RuntimeError("assignment parent authority changed during read")
     snapshot = ParentSnapshot(
         identifier=parent_key,
         classification=str(metadata["classification"]),
@@ -2765,8 +2991,11 @@ def load_parent_snapshot(
         ),
         authorizing_comment=authorizing_comment,
         repair_reservation=metadata["repair_reservation"],
+        smoke_reservation=metadata["smoke_reservation"],
         parent_id=str(parent["id"]),
         quarantined_repair_children=tuple(quarantined),
+        assignment_agent_ids=assignment_authority_before[0],
+        assignment_project_ids=assignment_authority_before[1],
     )
     if quarantined:
         if snapshot.repair_reservation is None:
@@ -4026,6 +4255,583 @@ def execute_parent_repair(
         )
 
 
+def _smoke_child_metadata(reservation: dict[str, object]) -> dict[str, str]:
+    candidates = reservation["candidate_shas"]
+    if not isinstance(candidates, dict):
+        raise RuntimeError("malformed smoke reservation")
+    metadata = {
+        "eventra.workflow.version": "2",
+        "eventra.phase.kind": "smoke",
+        "eventra.phase.attempt": str(reservation["attempt"]),
+        "eventra.phase.failure_repositories": "[]",
+        "eventra.phase.creation_action": str(reservation["action_key"]),
+        "eventra.phase.target": "suite:smoke",
+        "eventra.phase.role": "integration_qa",
+    }
+    for repository, sha in sorted(candidates.items()):
+        metadata[f"eventra.phase.sha.{repository}"] = str(sha)
+    return metadata
+
+
+def _decode_smoke_reservation(value: str) -> dict[str, object]:
+    if type(value) is not str or len(value.encode("utf-8")) > MAX_SMOKE_RESERVATION_BYTES:
+        raise RuntimeError("malformed smoke reservation")
+    try:
+        decoded = json.loads(value)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        raise RuntimeError("malformed smoke reservation") from None
+    if (
+        not isinstance(decoded, dict)
+        or value != _canonical_json(decoded)
+        or set(decoded) != {
+            "action_key",
+            "assignee_id",
+            "attempt",
+            "candidate_shas",
+            "next_stage",
+            "parent_identifier",
+            "previous_last_action",
+            "project_id",
+            "pull_requests",
+        }
+    ):
+        raise RuntimeError("malformed smoke reservation")
+    candidates = decoded["candidate_shas"]
+    pull_requests = decoded["pull_requests"]
+    if (
+        type(decoded["action_key"]) is not str
+        or type(decoded["parent_identifier"]) is not str
+        or ISSUE_KEY_PATTERN.fullmatch(decoded["parent_identifier"]) is None
+        or type(decoded["previous_last_action"]) is not str
+        or type(decoded["attempt"]) is not int
+        or decoded["attempt"] not in {0, 1, 2, 3}
+        or type(decoded["next_stage"]) is not int
+        or decoded["next_stage"] < 1
+        or not _is_uuid(decoded["project_id"])
+        or not _is_uuid(decoded["assignee_id"])
+        or not isinstance(candidates, dict)
+        or not candidates
+        or set(candidates) - set(REPAIR_ASSIGNEES)
+        or any(
+            type(sha) is not str or SHA_PATTERN.fullmatch(sha) is None
+            for sha in candidates.values()
+        )
+        or not isinstance(pull_requests, list)
+        or len(pull_requests) != len(candidates)
+    ):
+        raise RuntimeError("malformed smoke reservation")
+    expected_prs = []
+    for item in pull_requests:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"head_sha", "repository", "url"}
+            or item["repository"] not in candidates
+            or item["head_sha"] != candidates[item["repository"]]
+            or _repository_for_pr(item["url"]) != item["repository"]
+        ):
+            raise RuntimeError("malformed smoke reservation")
+        expected_prs.append(item["repository"])
+    if len(expected_prs) != len(set(expected_prs)) or set(expected_prs) != set(candidates):
+        raise RuntimeError("malformed smoke reservation")
+    action_snapshot = ParentSnapshot(
+        identifier=decoded["parent_identifier"],
+        classification={
+            frozenset({"frontend"}): "frontend-only",
+            frozenset({"backend"}): "backend-only",
+            frozenset({"frontend", "backend"}): "cross-stack",
+        }.get(frozenset(candidates), "invalid"),
+        attempt=decoded["attempt"],
+        last_action=None,
+        merge_state="merged",
+        candidate_frontend_sha=candidates.get("frontend"),
+        candidate_backend_sha=candidates.get("backend"),
+        children=(),
+        pull_requests=(),
+        next_stage=decoded["next_stage"],
+    )
+    if _action_key(
+        action_snapshot,
+        "create_smoke_stage",
+        decoded["attempt"],
+    ) != decoded["action_key"] or _action_key(
+        action_snapshot,
+        "merge",
+        decoded["attempt"],
+    ) != decoded["previous_last_action"]:
+        raise RuntimeError("malformed smoke reservation")
+    return decoded
+
+
+def _build_smoke_reservation(
+    snapshot: ParentSnapshot,
+    decision: ParentDecision,
+) -> dict[str, object]:
+    if decision.kind != "create_smoke_stage" or decision.action_key is None:
+        raise RuntimeError("smoke execution requires an exact smoke decision")
+    authority_problem = _parent_assignment_authority_problem(snapshot)
+    if authority_problem is not None:
+        raise RuntimeError(authority_problem)
+    candidates = _candidate_sha_map(snapshot)
+    pull_requests = sorted(
+        (
+            {
+                "repository": item.repository,
+                "url": item.url,
+                "head_sha": item.head_sha,
+            }
+            for item in snapshot.pull_requests
+        ),
+        key=lambda item: item["repository"],
+    )
+    if (
+        snapshot.merge_state != "merged"
+        or snapshot.last_action
+        != _action_key(
+            replace(snapshot, last_action=None),
+            "merge",
+            snapshot.attempt,
+        )
+        or len(pull_requests) != len(candidates)
+        or any(
+            item.state != "merged" or item.head_sha != candidates[item.repository]
+            for item in snapshot.pull_requests
+        )
+    ):
+        raise RuntimeError("smoke source merge authority is conflicting")
+    reservation = {
+        "action_key": decision.action_key,
+        "assignee_id": dict(snapshot.assignment_agent_ids)["integration_qa"],
+        "attempt": snapshot.attempt,
+        "candidate_shas": candidates,
+        "next_stage": snapshot.next_stage,
+        "parent_identifier": snapshot.identifier,
+        "previous_last_action": snapshot.last_action or "",
+        "project_id": dict(snapshot.assignment_project_ids)["frontend"],
+        "pull_requests": pull_requests,
+    }
+    return _decode_smoke_reservation(_canonical_json(reservation))
+
+
+def _smoke_child_title(reservation: dict[str, object]) -> str:
+    return f"{reservation['parent_identifier']} merged smoke verification"
+
+
+def _smoke_child_description(reservation: dict[str, object]) -> str:
+    return _canonical_json(
+        {
+            "action": reservation["action_key"],
+            "candidate_shas": reservation["candidate_shas"],
+            "parent": reservation["parent_identifier"],
+        }
+    )
+
+
+def _read_smoke_reservation_authority(
+    runner: MulticaRunner,
+    github: GitHubRunner,
+    parent_key: str,
+    reservation: dict[str, object],
+) -> tuple[object, ...]:
+    parent = parse_issue_detail(
+        runner.run(["issue", "get", parent_key, "--output", "json"]),
+        parent_key,
+    )
+    raw_parent_metadata = parse_issue_metadata(
+        runner.run(
+            ["issue", "metadata", "list", parent_key, "--output", "json"]
+        )
+    )
+    parent_metadata = _parent_metadata(raw_parent_metadata)
+    children = parse_issue_children(
+        runner.run(["issue", "children", parent_key, "--output", "json"]),
+        str(parent["id"]),
+    )
+    smoke_stage = int(reservation["next_stage"])
+    source_children = tuple(
+        child for child in children if child["stage"] is not None
+        and int(child["stage"]) < smoke_stage
+    )
+    smoke_children = tuple(
+        child for child in children if child["stage"] == smoke_stage
+    )
+    if (
+        parent["id"] is None
+        or parent["parent_issue_id"] is not None
+        or parent["stage"] is not None
+        or parent["status"] not in {"in_progress", "in_review"}
+        or parent_metadata["workflow_version"] != 2
+        or parent_metadata["merge_state"] != "merged"
+        or parent_metadata["attempt"] != reservation["attempt"]
+        or _candidate_sha_map(
+            ParentSnapshot(
+                identifier=parent_key,
+                classification=str(parent_metadata["classification"]),
+                attempt=int(parent_metadata["attempt"]),
+                last_action=parent_metadata["last_action"],
+                merge_state="merged",
+                candidate_frontend_sha=parent_metadata["frontend_sha"],
+                candidate_backend_sha=parent_metadata["backend_sha"],
+                children=(),
+                pull_requests=(),
+            )
+        ) != reservation["candidate_shas"]
+        or parent_metadata["next_stage"]
+        not in {smoke_stage, smoke_stage + 1}
+        or (parent_metadata["last_action"] or "")
+        not in {
+            str(reservation["previous_last_action"]),
+            str(reservation["action_key"]),
+        }
+        or raw_parent_metadata.get(SMOKE_RESERVATION_KEY)
+        != _canonical_json(reservation)
+        or any(
+            child["stage"] is None or int(child["stage"]) > smoke_stage
+            for child in children
+        )
+        or len(smoke_children) > 1
+    ):
+        raise RuntimeError("smoke reservation parent or child authority conflicts")
+    raw_child: object | None = None
+    metadata: dict[str, str] = {}
+    runs: list[dict[str, object]] = []
+    if smoke_children:
+        child = smoke_children[0]
+        child_key = str(child["identifier"])
+        raw_child = runner.run(["issue", "get", child_key, "--output", "json"])
+        detail = parse_issue_detail(raw_child, child_key)
+        metadata = parse_issue_metadata(
+            runner.run(
+                ["issue", "metadata", "list", child_key, "--output", "json"]
+            )
+        )
+        runs = parse_issue_runs(
+            runner.run(["issue", "runs", child_key, "--output", "json"]),
+            str(detail["id"]),
+        )
+        expected_items = sorted(_smoke_child_metadata(reservation).items())
+        prefix = dict(expected_items[: len(metadata)])
+        if (
+            detail != child
+            or detail["parent_issue_id"] != parent["id"]
+            or detail["stage"] != smoke_stage
+            or detail["project_id"] != reservation["project_id"]
+            or detail["assignee_id"] != reservation["assignee_id"]
+            or detail["assignee_type"] != "agent"
+            or detail["status"] not in {"backlog", "todo", "in_progress", "in_review"}
+            or not isinstance(raw_child, dict)
+            or raw_child.get("title") != _smoke_child_title(reservation)
+            or raw_child.get("description") != _smoke_child_description(reservation)
+            or len(metadata) > len(expected_items)
+            or metadata != prefix
+            or (detail["status"] == "backlog" and runs)
+            or (
+                detail["status"] != "backlog"
+                and len(
+                    [item for item in runs if item["status"] in ACTIVE_RUN_STATUSES]
+                )
+                != 1
+            )
+        ):
+            raise RuntimeError("smoke reservation child provenance conflicts")
+    source_metadata = {
+        str(child["identifier"]): parse_issue_metadata(
+            runner.run(
+                [
+                    "issue", "metadata", "list", str(child["identifier"]),
+                    "--output", "json",
+                ]
+            )
+        )
+        for child in source_children
+    }
+    source_phases = tuple(
+        _phase_snapshot(child, source_metadata[str(child["identifier"])])
+        for child in source_children
+    )
+    source_gate = tuple(
+        phase for phase in source_phases if phase.stage == smoke_stage - 1
+    )
+    pull_requests = tuple(
+        _parse_pull_request(
+            github.run(
+                [
+                    "pr", "view", str(item["url"]),
+                    "--json",
+                    (
+                        "url,headRefOid,state,mergeable,"
+                        "mergeStateStatus,statusCheckRollup"
+                    ),
+                ]
+            ),
+            str(item["url"]),
+            str(item["repository"]),
+        )
+        for item in reservation["pull_requests"]
+    )
+    source_snapshot = ParentSnapshot(
+        identifier=parent_key,
+        classification=str(parent_metadata["classification"]),
+        attempt=int(reservation["attempt"]),
+        last_action=str(reservation["previous_last_action"]) or None,
+        merge_state="merged",
+        candidate_frontend_sha=dict(reservation["candidate_shas"]).get("frontend"),
+        candidate_backend_sha=dict(reservation["candidate_shas"]).get("backend"),
+        children=source_phases,
+        pull_requests=pull_requests,
+        next_stage=smoke_stage,
+    )
+    if (
+        not _historical_gate_identity_matches(source_snapshot, source_gate)
+        or any(item.status != "done" or item.result != "pass" for item in source_gate)
+        or any(
+            item.state != "merged"
+            or item.head_sha != dict(reservation["candidate_shas"])[item.repository]
+            for item in pull_requests
+        )
+    ):
+        raise RuntimeError("smoke reservation source merge authority conflicts")
+    evidence = _read_gate_evidence_set(runner, source_children, source_phases)
+    assignment_authority = _exact_assignment_authority(runner)
+    if (
+        dict(assignment_authority[0]).get("integration_qa")
+        != reservation["assignee_id"]
+        or dict(assignment_authority[1]).get("frontend")
+        != reservation["project_id"]
+    ):
+        raise RuntimeError("smoke reservation assignment authority conflicts")
+    return (
+        parent,
+        raw_parent_metadata,
+        children,
+        raw_child,
+        metadata,
+        runs,
+        source_metadata,
+        pull_requests,
+        evidence,
+        assignment_authority,
+    )
+
+
+def _resume_smoke_reservation(
+    runner: MulticaRunner,
+    github: GitHubRunner,
+    parent_key: str,
+    reservation: dict[str, object],
+    effects: list[int],
+) -> SmokeExecutionResult:
+    first = _read_smoke_reservation_authority(
+        runner, github, parent_key, reservation
+    )
+    second = _read_smoke_reservation_authority(
+        runner, github, parent_key, reservation
+    )
+    if first != second:
+        raise RuntimeError("smoke reservation authority changed during read")
+    if not any(
+        item["stage"] == reservation["next_stage"] for item in first[2]
+    ):
+        before_ids = {str(item["identifier"]) for item in first[2]}
+        try:
+            runner.run(
+                [
+                    "issue", "create",
+                    "--parent", parent_key,
+                    "--stage", str(reservation["next_stage"]),
+                    "--project", str(reservation["project_id"]),
+                    "--assignee-id", str(reservation["assignee_id"]),
+                    "--status", "backlog",
+                    "--title", _smoke_child_title(reservation),
+                    "--description", _smoke_child_description(reservation),
+                    "--output", "json",
+                ]
+            )
+        except RuntimeError:
+            pass
+        first = _read_smoke_reservation_authority(
+            runner, github, parent_key, reservation
+        )
+        second = _read_smoke_reservation_authority(
+            runner, github, parent_key, reservation
+        )
+        if first != second:
+            raise RuntimeError("smoke child creation authority changed during read")
+        created = [
+            item for item in first[2]
+            if item["stage"] == reservation["next_stage"]
+            and str(item["identifier"]) not in before_ids
+        ]
+        if len(created) != 1:
+            raise RuntimeError("smoke child creation effect is ambiguous")
+        effects[0] += 1
+    child = next(
+        item for item in first[2]
+        if item["stage"] == reservation["next_stage"]
+    )
+    child_key = str(child["identifier"])
+    expected_items = sorted(_smoke_child_metadata(reservation).items())
+    prefix_length = len(first[4])
+    for index in range(prefix_length, len(expected_items)):
+        before = _read_smoke_reservation_authority(
+            runner, github, parent_key, reservation
+        )
+        if len(before[4]) != index:
+            raise RuntimeError("smoke metadata prefix changed before write")
+        key, value = expected_items[index]
+        effects[0] += _metadata_set_observed(runner, child_key, key, value)
+        after = _read_smoke_reservation_authority(
+            runner, github, parent_key, reservation
+        )
+        if len(after[4]) != index + 1:
+            raise RuntimeError("smoke metadata prefix reconciliation failed")
+    initialized = _read_smoke_reservation_authority(
+        runner, github, parent_key, reservation
+    )
+    detail = parse_issue_detail(initialized[3], child_key)
+    if detail["status"] == "backlog":
+        before_runs = initialized[5]
+        before_ids = {item["id"] for item in before_runs}
+        try:
+            runner.run(["issue", "status", child_key, "todo", "--output", "json"])
+        except RuntimeError:
+            pass
+        after_detail = parse_issue_detail(
+            runner.run(["issue", "get", child_key, "--output", "json"]),
+            child_key,
+        )
+        after_runs = parse_issue_runs(
+            runner.run(["issue", "runs", child_key, "--output", "json"]),
+            str(after_detail["id"]),
+        )
+        if after_detail["status"] != "backlog" or any(
+            item["id"] not in before_ids for item in after_runs
+        ):
+            effects[0] += 1
+        if (
+            after_detail["status"] not in {"todo", "in_progress", "in_review"}
+            or len(
+                [item for item in after_runs if item["status"] in ACTIVE_RUN_STATUSES]
+            ) != 1
+        ):
+            raise RuntimeError("smoke child promotion effect was not observed")
+    desired_parent = {
+        "eventra.workflow.next_stage": str(int(reservation["next_stage"]) + 1),
+        "eventra.workflow.last_action": str(reservation["action_key"]),
+    }
+    for key, value in desired_parent.items():
+        effects[0] += _metadata_set_observed(runner, parent_key, key, value)
+    _read_smoke_reservation_authority(runner, github, parent_key, reservation)
+    effects[0] += _metadata_delete_observed(
+        runner, parent_key, SMOKE_RESERVATION_KEY
+    )
+    final = load_parent_snapshot(runner, github, parent_key)
+    current = tuple(
+        item for item in final.children if item.stage == final.next_stage - 1
+    )
+    if (
+        final.last_action != reservation["action_key"]
+        or _smoke_assignment_problem(final, current) is not None
+    ):
+        raise RuntimeError("smoke executor convergence verification failed")
+    return SmokeExecutionResult(
+        parent_key,
+        "smoke",
+        "exact merged smoke child was committed and promoted",
+        str(reservation["action_key"]),
+        effects[0],
+        child_key,
+    )
+
+
+def execute_parent_smoke(
+    runner: MulticaRunner,
+    github: GitHubRunner,
+    parent_key: str,
+    *,
+    expected_action_key: str,
+) -> SmokeExecutionResult:
+    effects = [0]
+    try:
+        if (
+            type(expected_action_key) is not str
+            or not expected_action_key
+            or ISSUE_KEY_PATTERN.fullmatch(parent_key) is None
+        ):
+            raise RuntimeError("smoke execution requires an exact action identity")
+        raw_parent_metadata = parse_issue_metadata(
+            runner.run(
+                ["issue", "metadata", "list", parent_key, "--output", "json"]
+            )
+        )
+        reservation_text = raw_parent_metadata.get(SMOKE_RESERVATION_KEY)
+        if reservation_text is not None:
+            reservation = _decode_smoke_reservation(reservation_text)
+            if reservation["action_key"] != expected_action_key:
+                raise RuntimeError("smoke reservation conflicts with expected action")
+            return _resume_smoke_reservation(
+                runner,
+                github,
+                parent_key,
+                reservation,
+                effects,
+            )
+        snapshot = load_parent_snapshot(runner, github, parent_key)
+        if snapshot.last_action == expected_action_key:
+            current = tuple(
+                item
+                for item in snapshot.children
+                if item.stage == snapshot.next_stage - 1
+            )
+            if _smoke_assignment_problem(snapshot, current) is not None:
+                raise RuntimeError("recorded smoke assignment is conflicting")
+            return SmokeExecutionResult(
+                parent_key,
+                "noop",
+                "exact smoke action is already committed",
+                expected_action_key,
+                0,
+                current[0].issue_key,
+            )
+        decision = decide_parent_action(snapshot)
+        if (
+            decision.kind != "create_smoke_stage"
+            or decision.action_key != expected_action_key
+        ):
+            raise RuntimeError("fresh parent plan does not authorize smoke action")
+        assignment_authority_before = _exact_assignment_authority(runner)
+        assignment_authority_after = _exact_assignment_authority(runner)
+        if assignment_authority_after != assignment_authority_before:
+            raise RuntimeError("smoke assignment authority changed during read")
+        snapshot = replace(
+            snapshot,
+            assignment_agent_ids=assignment_authority_before[0],
+            assignment_project_ids=assignment_authority_before[1],
+        )
+        reservation = _build_smoke_reservation(snapshot, decision)
+        encoded = _canonical_json(reservation)
+        effects[0] += _metadata_set_observed(
+            runner,
+            parent_key,
+            SMOKE_RESERVATION_KEY,
+            encoded,
+        )
+        return _resume_smoke_reservation(
+            runner,
+            github,
+            parent_key,
+            reservation,
+            effects,
+        )
+    except (RuntimeError, ValueError, KeyError, TypeError) as error:
+        return SmokeExecutionResult(
+            parent_key,
+            "block",
+            str(error) or "smoke execution failed closed",
+            expected_action_key if isinstance(expected_action_key, str) else "",
+            effects[0],
+        )
+
+
 def _has_phase_completion(metadata: dict[str, str]) -> bool:
     version = metadata.get("eventra.workflow.version")
     if version not in {"1", "2"}:
@@ -4115,6 +4921,7 @@ def load_workflow_snapshot(
         raise RuntimeError("unsupported workflow metadata")
     decoded_parent: dict[str, object] | None = None
     assignment_agent_ids: tuple[tuple[str, str], ...] = ()
+    assignment_project_ids: tuple[tuple[str, str], ...] = ()
     delivery_squad_id = ""
     delivery_lead_id = ""
     delivery_squad_leader_id = ""
@@ -4143,6 +4950,24 @@ def load_workflow_snapshot(
                         for role in ASSIGNMENT_AGENT_NAMES
                     )
                 )
+            project_records = parse_project_list(
+                runner.run(["project", "list", "--output", "json"])
+            )
+            resolved_projects: list[tuple[str, str]] = []
+            for repository, title in sorted(ASSIGNMENT_PROJECT_TITLES.items()):
+                matches = [
+                    item["id"] for item in project_records
+                    if item["title"] == title
+                ]
+                if len(matches) != 1 or not _is_uuid(matches[0]):
+                    resolved_projects = []
+                    break
+                resolved_projects.append((repository, matches[0]))
+            if tuple(project_ids) == tuple(
+                dict(resolved_projects).get(repository, "")
+                for repository in ("frontend", "backend")
+            ):
+                assignment_project_ids = tuple(resolved_projects)
             squad_records = parse_squad_list(
                 runner.run(["squad", "list", "--output", "json"])
             )
@@ -4323,6 +5148,7 @@ def load_workflow_snapshot(
         )
         or decoded_parent is None
         or (bool(project_ids) and not assignment_agent_ids)
+        or (bool(project_ids) and not assignment_project_ids)
         or (bool(project_ids) and not delivery_squad_id)
         or (bool(project_ids) and not delivery_lead_id)
         or (bool(project_ids) and not delivery_squad_leader_id)
@@ -4413,7 +5239,10 @@ def load_workflow_snapshot(
                     decoded_parent["consumed_authorization_uuid"]
                 ),
                 repair_reservation=decoded_parent["repair_reservation"],
+                smoke_reservation=decoded_parent["smoke_reservation"],
                 parent_id=str(parent["id"]),
+                assignment_agent_ids=assignment_agent_ids,
+                assignment_project_ids=assignment_project_ids,
             )
         except (KeyError, RuntimeError, TypeError, ValueError):
             parent_snapshot = None
@@ -4806,6 +5635,7 @@ def _finish_phase_authority_problem(
         or next_stage < 2
         or attempt not in {0, 1, 2, 3}
         or parent_workflow["repair_reservation"] is not None
+        or parent_workflow["smoke_reservation"] is not None
     ):
         return "parent is not a mutable current workflow authority"
     current_stage = next_stage - 1
@@ -4822,6 +5652,66 @@ def _finish_phase_authority_problem(
         or value.attempt != attempt
     ):
         return "phase completion is not for the exact current child"
+    if value.kind in {"implementation", "smoke"}:
+        if not GATE_PROVENANCE_KEYS <= set(metadata):
+            return "nonrepair assignment provenance is incomplete"
+        try:
+            assignment_snapshot = load_parent_snapshot(
+                runner,
+                GitHubRunner(),
+                str(parent["identifier"]),
+            )
+        except (RuntimeError, TypeError, ValueError):
+            return "authoritative nonrepair assignment provenance is malformed"
+        current_phases = tuple(
+            item
+            for item in assignment_snapshot.children
+            if item.stage == current_stage
+        )
+        assignment_problem = (
+            _implementation_assignment_problem(
+                assignment_snapshot,
+                current_phases,
+            )
+            if value.kind == "implementation"
+            else _smoke_assignment_problem(
+                assignment_snapshot,
+                current_phases,
+            )
+        )
+        loaded_target = tuple(
+            item
+            for item in current_phases
+            if item.issue_key == detail["identifier"]
+        )
+        requested_candidates = {
+            repository: sha
+            for repository, sha in (
+                ("frontend", value.frontend_sha),
+                ("backend", value.backend_sha),
+            )
+            if sha is not None
+        }
+        if (
+            assignment_snapshot.identifier != str(parent["identifier"])
+            or assignment_snapshot.parent_id != str(parent["id"])
+            or assignment_snapshot.attempt != attempt
+            or assignment_snapshot.next_stage != next_stage
+            or assignment_problem is not None
+            or len(loaded_target) != 1
+            or loaded_target[0].kind != value.kind
+            or {
+                repository: sha
+                for repository, sha in (
+                    ("frontend", loaded_target[0].frontend_sha),
+                    ("backend", loaded_target[0].backend_sha),
+                )
+                if sha is not None
+            }
+            != requested_candidates
+            or (loaded_target[0].pr_url or None) != value.pr_url
+        ):
+            return "phase completion conflicts with current assignment provenance"
     if value.kind == "repair":
         authoritative_repair_snapshot = None
         try:
@@ -5082,6 +5972,11 @@ def finish_phase(
     }
     if detail["status"] == "done":
         if controlled_before == wanted:
+            assignment_authority = (
+                _exact_assignment_authority(runner)
+                if value.kind in {"implementation", "smoke"}
+                else None
+            )
             evidence_before = _finish_gate_evidence_authority(
                 runner,
                 detail,
@@ -5104,6 +5999,11 @@ def finish_phase(
                 != authority_envelope
             ):
                 raise RuntimeError("phase authority changed during replay")
+            if (
+                assignment_authority is not None
+                and _exact_assignment_authority(runner) != assignment_authority
+            ):
+                raise RuntimeError("assignment authority changed during replay")
             evidence_after = _finish_gate_evidence_authority(
                 runner,
                 detail,
@@ -5127,6 +6027,11 @@ def finish_phase(
         raise RuntimeError("phase issue is not mutable")
     if controlled_before.get("eventra.workflow.version") == "1":
         raise RuntimeError("version 1 workflow requires explicit migration")
+    assignment_authority = (
+        _exact_assignment_authority(runner)
+        if value.kind in {"implementation", "smoke"}
+        else None
+    )
     evidence_before = _finish_gate_evidence_authority(runner, detail, value)
     authority_envelope = _finish_parent_authority_envelope(runner, detail)
     authority_problem = _finish_phase_authority_problem(
@@ -5139,6 +6044,11 @@ def finish_phase(
         raise RuntimeError(authority_problem)
     if _finish_parent_authority_envelope(runner, detail) != authority_envelope:
         raise RuntimeError("phase authority changed before metadata mutation")
+    if (
+        assignment_authority is not None
+        and _exact_assignment_authority(runner) != assignment_authority
+    ):
+        raise RuntimeError("assignment authority changed before metadata mutation")
     evidence_after = _finish_gate_evidence_authority(runner, detail, value)
     if evidence_after != evidence_before:
         raise RuntimeError("Gate evidence comment changed before metadata mutation")
@@ -5203,6 +6113,11 @@ def finish_phase(
     )
     if _finish_parent_authority_envelope(runner, detail) != authority_envelope:
         raise RuntimeError("phase authority changed before terminal transition")
+    if (
+        assignment_authority is not None
+        and _exact_assignment_authority(runner) != assignment_authority
+    ):
+        raise RuntimeError("assignment authority changed before terminal transition")
     evidence_after_status_gate = _finish_gate_evidence_authority(
         runner,
         detail,
@@ -5259,6 +6174,11 @@ def finish_phase(
         value,
     )
     _finish_parent_authority_envelope(runner, final_observations[0][0])
+    final_assignment_authority = (
+        _exact_assignment_authority(runner)
+        if assignment_authority is not None
+        else None
+    )
     final_evidence_after = _finish_gate_evidence_authority(
         runner,
         final_observations[0][0],
@@ -5267,8 +6187,9 @@ def finish_phase(
     if (
         final_evidence_before != evidence_before
         or final_evidence_after != evidence_before
+        or final_assignment_authority != assignment_authority
     ):
-        raise RuntimeError("Gate evidence comment changed after terminal transition")
+        raise RuntimeError("phase authority changed after terminal transition")
     final = final_observations[0][0]
     return PhaseResult(
         str(final["id"]),
@@ -5374,6 +6295,9 @@ def build_workflow_parser() -> argparse.ArgumentParser:
     execute_repair = subparsers.add_parser("execute-parent-repair")
     execute_repair.add_argument("parent")
     execute_repair.add_argument("--expected-action-key", required=True)
+    execute_smoke = subparsers.add_parser("execute-parent-smoke")
+    execute_smoke.add_argument("parent")
+    execute_smoke.add_argument("--expected-action-key", required=True)
     finish_parent_parser = subparsers.add_parser("finish-parent")
     finish_parent_parser.add_argument("parent")
     watch = subparsers.add_parser("watch")
@@ -5442,6 +6366,21 @@ def print_repair_execution_result(value: RepairExecutionResult) -> None:
     )
 
 
+def print_smoke_execution_result(value: SmokeExecutionResult) -> None:
+    print(
+        _canonical_json(
+            {
+                "action_key": value.action_key,
+                "child": value.child_identifier,
+                "decision": value.next_action,
+                "mutations": value.mutation_count,
+                "parent": value.parent_identifier,
+                "reason": value.reason,
+            }
+        )
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_workflow_parser().parse_args(argv)
     runner = MulticaRunner()
@@ -5467,6 +6406,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.command == "execute-parent-repair":
         print_repair_execution_result(
             execute_parent_repair(
+                runner,
+                GitHubRunner(),
+                args.parent,
+                expected_action_key=args.expected_action_key,
+            )
+        )
+    elif args.command == "execute-parent-smoke":
+        print_smoke_execution_result(
+            execute_parent_smoke(
                 runner,
                 GitHubRunner(),
                 args.parent,

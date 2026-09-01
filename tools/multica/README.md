@@ -233,6 +233,13 @@ product-neutral HTTPS, but its normalized path must end exactly in
 fragment, or traversal. Any malformed JSON or bundle, version mismatch, stale
 or deleted evidence comment, stale child, or PR drift is a human-visible block.
 
+An implementation assignment is usable only after Delivery Lead creates it in
+backlog and persists the canonical Stage action, single repository target,
+Engineer role, exact Engineer/Project identity, one candidate SHA, and canonical
+managed PR before starting it. Planner, `finish-phase`, replay, and Watcher all
+reuse that immutable assignment authority; an empty/manual/foreign child cannot
+advance merely by carrying a PASS envelope.
+
 Current version-2 Gate membership is typed and exact: every affected repository
 has one single-repository Review and one single-repository QA child, while a
 cross-stack Gate additionally has one `integration_qa` child for the complete
@@ -284,6 +291,25 @@ PR heads to equal the completed replacements.
 This Eventra-local adapter is safe only under the provisioned single serialized
 Delivery Lead (`max_concurrent_tasks=1`); it is not generic CAS or transaction
 safety.
+
+After an exact Gate PASS and verified automatic merge, Delivery Lead must not
+create a smoke child manually. It executes only the exact Core action:
+
+```text
+python3 -B -m tools.multica.workflow execute-parent-smoke PRO-M --expected-action-key ACTION_KEY
+```
+
+The smoke executor revalidates the completed Gate, managed merged PRs, exact
+merged candidate SHA map, and provisioned Integration QA assignment. It writes
+`eventra.workflow.smoke_reservation`, creates one backlog child, persists and
+rereads `eventra.phase.creation_action`, `eventra.phase.target=suite:smoke`,
+`eventra.phase.role=integration_qa`, and the complete SHA map, then promotes and
+starts Integration QA. It commits the exact parent action and clears the
+reservation only after verifying the complete effect. Retry resumes a missing
+create, canonical metadata prefix, promotion, or lost acknowledgement without
+duplicating the child. Conflicting identity, metadata, Gate evidence, assignment,
+or merged PR state blocks without overwrite. This recovery uses the same single
+serialized Delivery Lead and is not generic CAS or transaction safety.
 
 For round 3 the caller supplies only an authoritative parent-scoped comment UUID.
 The helper authoritatively rereads the parent thread and accepts only

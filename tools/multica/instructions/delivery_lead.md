@@ -53,10 +53,16 @@ Write parent metadata as explicit strings: workflow version `2`,
 classification, `eventra.workflow.next_stage=1`, attempt `0`, base candidate
 SHAs, merge state `not_ready`, and `eventra.workflow.last_action`. Move the
 parent to `in_progress`. Create every implementation child together in Stage 1
-with `--parent` and `--stage`; backend children use the backend Project. One
-valid argv is `["multica", "issue", "create", "--parent", "PRO-35",
-"--stage", "1", "--title", "PRO-35 frontend implementation", "--output",
-"json"]`. Verify the full Stage 1 group, record its stable action key, then set
+with `--parent`, `--stage`, the exact Engineer/Project assignment, and
+`--status backlog`; backend children use the backend Project. Before starting
+any child, persist and reread the canonical implementation action as
+`eventra.phase.creation_action`, its single `repository:NAME` target as
+`eventra.phase.target`, its `NAME_engineer` role as `eventra.phase.role`, the
+one exact candidate SHA, and its canonical managed PR. A valid creation prefix
+is `["multica", "issue", "create", "--parent", "PRO-35", "--stage", "1",
+"--status", "backlog", "--title", "PRO-35 frontend implementation"]`.
+Verify the full Stage 1 assignment group, promote only those exact initialized
+children, record the canonical action key, then set
 `eventra.workflow.next_stage=2`.
 
 Multica wakes you only after every child in a Stage reaches `done`. Here `done`
@@ -145,8 +151,27 @@ next barrier group, then advance `next_stage` and record `last_action`.
 - `merge`: verify current heads, exact-SHA review and QA PASS, required local
   and repository checks, and mergeability, then automatically merge the
   personal-fork PRs. PR bodies use `Closes PRO-N` and `Related to PRO-M`.
-- `create_smoke_stage`: create Integration QA smoke for the exact merged SHA
-  set. Complete the parent only after smoke PASS.
+- `create_smoke_stage`: Do not create smoke children manually. Invoke the
+  verified executor with the exact action identity returned by the immediately
+  preceding plan:
+
+  ```text
+  python3 -B -m tools.multica.workflow execute-parent-smoke PRO-M --expected-action-key ACTION_KEY
+  ```
+
+  The executor freshly revalidates the completed Gate, merged managed PRs and
+  exact merged candidate SHA map, writes
+  `eventra.workflow.smoke_reservation`, creates one Integration QA child in
+  backlog, and persists/rereads `eventra.phase.creation_action`, the typed
+  `eventra.phase.target=suite:smoke`, `eventra.phase.role=integration_qa`, and
+  the full candidate SHA metadata before it starts Integration QA. It promotes
+  the child, commits the parent action, and clears the reservation only after
+  the complete effect is verified. Exact retry resumes a missing create,
+  canonical metadata prefix, promotion, or lost acknowledgement without a
+  duplicate; conflicting children, metadata, assignments, Gate evidence, or
+  merged PR heads block without overwrite. This depends on the provisioned
+  single serialized Delivery Lead; it is not generic CAS or transaction safety.
+  Complete the parent only after exact assigned smoke PASS.
 - `complete_parent`: in approved unattended local-development mode, run
   `python3 -B -m tools.multica.workflow finish-parent PRO-M` from the
   authoritative control repository. This revalidates the merged smoke barrier
