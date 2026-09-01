@@ -53,6 +53,8 @@ BACKEND_AGENT_ID = "00000000-0000-4000-8000-000000000016"
 QA_ID = "00000000-0000-4000-8000-000000000015"
 SQUAD_ID = "00000000-0000-4000-8000-000000000017"
 FOREIGN_SQUAD_ID = "00000000-0000-4000-8000-000000000018"
+DELIVERY_LEAD_ID = "00000000-0000-4000-8000-000000000019"
+WATCHER_ID = "00000000-0000-4000-8000-000000000020"
 COMMENT_ID = "01a00000-0000-7000-8000-000000000010"
 FRONTEND_SHA = "a" * 40
 FRONTEND_PR = "https://github.com/codeExploreHub/Eventra/pull/6"
@@ -3706,6 +3708,15 @@ def stalled_workflow(**overrides):
     values["parent_assignee_id"] = SQUAD_ID
     values["parent_assignee_type"] = "squad"
     values["delivery_squad_id"] = SQUAD_ID
+    values["delivery_lead_id"] = DELIVERY_LEAD_ID
+    values["delivery_squad_leader_id"] = DELIVERY_LEAD_ID
+    values["delivery_squad_members"] = (
+        (AGENT_ID, "agent", "frontend_engineer"),
+        (REVIEWER_ID, "agent", "independent_reviewer"),
+        (QA_ID, "agent", "integration_qa"),
+        (BACKEND_AGENT_ID, "agent", "backend_engineer"),
+        (DELIVERY_LEAD_ID, "agent", "leader"),
+    )
     snapshot = WorkflowSnapshot(**values)
     object.__setattr__(snapshot, "current_stage", current_stage)
     return snapshot
@@ -4076,9 +4087,39 @@ class FakeWatchRunner:
         self.post_rerun_child_detail = None
         self.post_rerun_parent_detail = None
         self.post_rerun_squads = None
+        self.post_rerun_squad_detail = None
+        self.post_rerun_squad_members = None
         self.post_parent_rerun_child_metadata = None
+        self.fail_squad_detail_read = False
+        self.fail_squad_member_read = False
         self.squads = [
             {"id": SQUAD_ID, "name": "Eventra Local Delivery"},
+        ]
+        self.squad_detail = {
+            "id": SQUAD_ID,
+            "name": "Eventra Local Delivery",
+            "description": "Coordinates Eventra delivery.",
+            "instructions": "Exact Eventra squad contract.",
+            "leader_id": DELIVERY_LEAD_ID,
+        }
+        self.squad_members = [
+            {
+                "id": f"membership-{index}",
+                "squad_id": SQUAD_ID,
+                "member_id": member_id,
+                "member_type": "agent",
+                "role": role,
+            }
+            for index, (member_id, role) in enumerate(
+                (
+                    (DELIVERY_LEAD_ID, "leader"),
+                    (AGENT_ID, "frontend_engineer"),
+                    (BACKEND_AGENT_ID, "backend_engineer"),
+                    (QA_ID, "integration_qa"),
+                    (REVIEWER_ID, "independent_reviewer"),
+                ),
+                start=1,
+            )
         ]
         self.github = FakeSnapshotGitHubRunner((frontend_pr(),))
 
@@ -4087,13 +4128,29 @@ class FakeWatchRunner:
         self.calls.append(call)
         if call == ("agent", "list", "--output", "json"):
             return [
+                {"id": DELIVERY_LEAD_ID, "name": "Eventra Delivery Lead"},
                 {"id": AGENT_ID, "name": "Eventra Frontend Engineer"},
                 {"id": BACKEND_AGENT_ID, "name": "Eventra Backend Engineer"},
                 {"id": QA_ID, "name": "Eventra Integration QA"},
                 {"id": REVIEWER_ID, "name": "Eventra Independent Reviewer"},
+                {"id": WATCHER_ID, "name": "Eventra Workflow Watcher"},
             ]
         if call == ("squad", "list", "--output", "json"):
             return copy.deepcopy(self.squads)
+        if call == ("squad", "get", SQUAD_ID, "--output", "json"):
+            if self.fail_squad_detail_read:
+                raise RuntimeError("injected squad get failure")
+            return copy.deepcopy(self.squad_detail)
+        if call[:2] == ("squad", "get"):
+            raise RuntimeError("unknown squad detail")
+        if call == (
+            "squad", "member", "list", SQUAD_ID, "--output", "json"
+        ):
+            if self.fail_squad_member_read:
+                raise RuntimeError("injected squad member list failure")
+            return copy.deepcopy(self.squad_members)
+        if call[:3] == ("squad", "member", "list"):
+            raise RuntimeError("unknown squad membership")
         if call[:2] == ("issue", "list"):
             flags = dict(zip(call[2::2], call[3::2]))
             self._assert_list_flags(flags)
@@ -4200,6 +4257,10 @@ class FakeWatchRunner:
                 self.parent.update(copy.deepcopy(self.post_rerun_parent_detail))
             if self.post_rerun_squads is not None:
                 self.squads = copy.deepcopy(self.post_rerun_squads)
+            if self.post_rerun_squad_detail is not None:
+                self.squad_detail = copy.deepcopy(self.post_rerun_squad_detail)
+            if self.post_rerun_squad_members is not None:
+                self.squad_members = copy.deepcopy(self.post_rerun_squad_members)
             if self.post_parent_rerun_child_metadata is not None:
                 child_key, child_metadata = self.post_parent_rerun_child_metadata
                 self.metadata[child_key] = copy.deepcopy(child_metadata)
@@ -4714,6 +4775,102 @@ class WatchWorkflowTests(unittest.TestCase):
                     RuntimeError, "recovery verification failed"
                 ):
                     self._watch(runner, apply=True)
+
+    @staticmethod
+    def _corrupt_squad_internal_authority(runner, label):
+        if label == "foreign leader":
+            runner.squad_detail["leader_id"] = WATCHER_ID
+        elif label == "wrong squad detail":
+            runner.squad_detail["name"] = "Foreign Delivery"
+        elif label == "missing member":
+            runner.squad_members.pop()
+        elif label == "duplicate member":
+            duplicate = copy.deepcopy(runner.squad_members[0])
+            duplicate["id"] = "membership-duplicate"
+            runner.squad_members.append(duplicate)
+        elif label == "wrong role":
+            runner.squad_members[1]["role"] = "backend_engineer"
+        elif label == "wrong type":
+            runner.squad_members[1]["member_type"] = "member"
+        elif label == "watcher included":
+            runner.squad_members.append(
+                {
+                    "id": "membership-watcher",
+                    "squad_id": SQUAD_ID,
+                    "member_id": WATCHER_ID,
+                    "member_type": "agent",
+                    "role": "workflow_watcher",
+                }
+            )
+        elif label == "foreign member":
+            runner.squad_members.append(
+                {
+                    "id": "membership-foreign",
+                    "squad_id": SQUAD_ID,
+                    "member_id": FOREIGN_SQUAD_ID,
+                    "member_type": "agent",
+                    "role": "frontend_engineer",
+                }
+            )
+        elif label == "squad get failure":
+            runner.fail_squad_detail_read = True
+        elif label == "member list failure":
+            runner.fail_squad_member_read = True
+        else:
+            raise AssertionError(f"unknown squad corruption: {label}")
+
+    def test_watcher_child_and_parent_reruns_require_exact_squad_membership(self):
+        labels = (
+            "foreign leader",
+            "wrong squad detail",
+            "missing member",
+            "duplicate member",
+            "wrong role",
+            "wrong type",
+            "watcher included",
+            "foreign member",
+            "squad get failure",
+            "member list failure",
+        )
+        for recovery_kind in ("child", "parent"):
+            for label in labels:
+                with self.subTest(recovery_kind=recovery_kind, label=label):
+                    runner = (
+                        FakeWatchRunner()
+                        if recovery_kind == "child"
+                        else self._terminal_implementation_runner()
+                    )
+                    self._corrupt_squad_internal_authority(runner, label)
+
+                    result = self._watch(runner, apply=True)
+
+                    self.assertEqual(result, WatchResult(1, 0, 0, "noop"))
+                    self.assertFalse(
+                        any(call[:2] == ("issue", "rerun") for call in runner.calls)
+                    )
+
+    def test_watcher_rechecks_squad_leader_and_members_after_rerun(self):
+        for recovery_kind in ("child", "parent"):
+            for drift in ("leader", "member"):
+                with self.subTest(recovery_kind=recovery_kind, drift=drift):
+                    runner = (
+                        FakeWatchRunner()
+                        if recovery_kind == "child"
+                        else self._terminal_implementation_runner()
+                    )
+                    if drift == "leader":
+                        changed = copy.deepcopy(runner.squad_detail)
+                        changed["leader_id"] = WATCHER_ID
+                        runner.post_rerun_squad_detail = changed
+                    else:
+                        changed = copy.deepcopy(runner.squad_members)
+                        changed[1]["role"] = "backend_engineer"
+                        runner.post_rerun_squad_members = changed
+
+                    with self.assertRaisesRegex(
+                        RuntimeError, "recovery verification failed"
+                    ):
+                        self._watch(runner, apply=True)
 
     def test_watcher_rejects_current_child_without_assignment_provenance(self):
         runner = FakeWatchRunner()

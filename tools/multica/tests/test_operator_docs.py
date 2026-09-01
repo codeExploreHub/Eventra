@@ -114,6 +114,10 @@ class OperatorDocsTests(unittest.TestCase):
             "Before rerunning Delivery Lead after a finished Stage",
             watcher,
         )
+        self.assertIn(
+            "exact Delivery Lead leader and five-agent Squad membership",
+            watcher,
+        )
 
         forbidden = (
             "Route failures to the owning implementer",

@@ -9,6 +9,14 @@ phase, role, Project, Agent, candidate SHAs, pull request, and authoritative
 creation action must exactly match the current parent assignment. Repair also
 requires its exact immutable source candidate map, FailureBundle digest,
 assigned evidence partition, round, and round-3 authorization when applicable.
+Before either child or parent recovery, require the exact provisioned Delivery
+Squad, its exact Delivery Lead leader and five-agent Squad membership: Delivery
+Lead as `leader`, the frontend/backend engineers, Integration QA, and Independent
+Reviewer as their exact blueprint roles, all with `member_type=agent`. The
+Workflow Watcher is operationally separate and must not be a Squad member.
+Reread the same leader and canonical member set before and after any rerun;
+missing, duplicate, foreign, malformed, or changed membership is not a recovery
+target.
 Before rerunning Delivery Lead after a finished Stage, apply the same exact
 typed membership and provenance checks to every terminal current child and
 require each authoritative completion to be complete and stable. Never wake

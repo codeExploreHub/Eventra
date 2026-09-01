@@ -15,7 +15,13 @@ from dataclasses import dataclass, replace
 from typing import Literal, Sequence
 from urllib.parse import unquote, urlsplit
 
-from .contracts import parse_agent_list, parse_squad_list
+from .blueprint import build_multi_repo_blueprint
+from .contracts import (
+    parse_agent_list,
+    parse_squad_detail,
+    parse_squad_list,
+    parse_squad_members,
+)
 from .issue_contracts import (
     ACTIVE_RUN_STATUSES,
     parse_authorizing_comment,
@@ -71,13 +77,17 @@ REPAIR_ASSIGNEES = {
     "frontend": "Eventra Frontend Engineer",
     "backend": "Eventra Backend Engineer",
 }
-ASSIGNMENT_AGENT_NAMES = {
-    "frontend_engineer": "Eventra Frontend Engineer",
-    "backend_engineer": "Eventra Backend Engineer",
-    "integration_qa": "Eventra Integration QA",
-    "independent_reviewer": "Eventra Independent Reviewer",
+EVENTRA_BLUEPRINT = build_multi_repo_blueprint("Eventra")
+DELIVERY_SQUAD_NAME = EVENTRA_BLUEPRINT.squad_name
+DELIVERY_LEAD_ROLE = EVENTRA_BLUEPRINT.leader_role
+SQUAD_AGENT_NAMES = {
+    agent.role: agent.name for agent in EVENTRA_BLUEPRINT.agents
 }
-DELIVERY_SQUAD_NAME = "Eventra Local Delivery"
+ASSIGNMENT_AGENT_NAMES = {
+    role: name
+    for role, name in SQUAD_AGENT_NAMES.items()
+    if role != DELIVERY_LEAD_ROLE
+}
 REPAIR_PROVENANCE_KEYS = frozenset(
     {
         "eventra.repair.creation_action",
@@ -259,6 +269,9 @@ class WorkflowSnapshot:
     parent_assignee_id: str = ""
     parent_assignee_type: str = ""
     delivery_squad_id: str = ""
+    delivery_lead_id: str = ""
+    delivery_squad_leader_id: str = ""
+    delivery_squad_members: tuple[tuple[str, str, str], ...] = ()
 
     def first_terminal_run_needing_transition(
         self,
@@ -1555,6 +1568,9 @@ def _recovery_authority_identity(
         snapshot.parent_assignee_id,
         snapshot.parent_assignee_type,
         snapshot.delivery_squad_id,
+        snapshot.delivery_lead_id,
+        snapshot.delivery_squad_leader_id,
+        snapshot.delivery_squad_members,
         parent.classification,
         parent.attempt,
         parent.last_action,
@@ -1600,8 +1616,25 @@ def _recovery_authority_identity(
 
 
 def _parent_assignment_problem(snapshot: WorkflowSnapshot) -> str | None:
+    assignment_agents = dict(snapshot.agent_ids)
+    expected_members = tuple(
+        sorted(
+            (
+                member_id,
+                "agent",
+                "leader" if role == DELIVERY_LEAD_ROLE else role,
+            )
+            for role, member_id in {
+                DELIVERY_LEAD_ROLE: snapshot.delivery_lead_id,
+                **assignment_agents,
+            }.items()
+        )
+    )
     if (
         not _is_uuid(snapshot.delivery_squad_id)
+        or not _is_uuid(snapshot.delivery_lead_id)
+        or snapshot.delivery_squad_leader_id != snapshot.delivery_lead_id
+        or snapshot.delivery_squad_members != expected_members
         or snapshot.parent_assignee_type != "squad"
         or snapshot.parent_assignee_id != snapshot.delivery_squad_id
     ):
@@ -4083,6 +4116,9 @@ def load_workflow_snapshot(
     decoded_parent: dict[str, object] | None = None
     assignment_agent_ids: tuple[tuple[str, str], ...] = ()
     delivery_squad_id = ""
+    delivery_lead_id = ""
+    delivery_squad_leader_id = ""
+    delivery_squad_members: tuple[tuple[str, str, str], ...] = ()
     if workflow_version == "2":
         try:
             decoded_parent = _parent_metadata(parent_metadata)
@@ -4093,14 +4129,20 @@ def load_workflow_snapshot(
                 runner.run(["agent", "list", "--output", "json"])
             )
             resolved: dict[str, str] = {}
-            for role, name in ASSIGNMENT_AGENT_NAMES.items():
+            for role, name in SQUAD_AGENT_NAMES.items():
                 matches = [item["id"] for item in records if item["name"] == name]
                 if len(matches) != 1 or not _is_uuid(matches[0]):
                     resolved = {}
                     break
                 resolved[role] = matches[0]
-            if len(resolved) == len(ASSIGNMENT_AGENT_NAMES):
-                assignment_agent_ids = tuple(sorted(resolved.items()))
+            if len(resolved) == len(SQUAD_AGENT_NAMES):
+                delivery_lead_id = resolved[DELIVERY_LEAD_ROLE]
+                assignment_agent_ids = tuple(
+                    sorted(
+                        (role, resolved[role])
+                        for role in ASSIGNMENT_AGENT_NAMES
+                    )
+                )
             squad_records = parse_squad_list(
                 runner.run(["squad", "list", "--output", "json"])
             )
@@ -4110,7 +4152,53 @@ def load_workflow_snapshot(
                 if item["name"] == DELIVERY_SQUAD_NAME
             ]
             if len(squad_matches) == 1 and _is_uuid(squad_matches[0]):
-                delivery_squad_id = squad_matches[0]
+                squad_id = squad_matches[0]
+                try:
+                    detail = parse_squad_detail(
+                        runner.run(
+                            ["squad", "get", squad_id, "--output", "json"]
+                        ),
+                        squad_id,
+                    )
+                    members = parse_squad_members(
+                        runner.run(
+                            [
+                                "squad", "member", "list", squad_id,
+                                "--output", "json",
+                            ]
+                        ),
+                        squad_id,
+                    )
+                    observed_members = tuple(
+                        sorted(
+                            (
+                                item["member_id"],
+                                item["member_type"],
+                                item["role"],
+                            )
+                            for item in members
+                        )
+                    )
+                    expected_members = tuple(
+                        sorted(
+                            (
+                                member_id,
+                                "agent",
+                                "leader" if role == DELIVERY_LEAD_ROLE else role,
+                            )
+                            for role, member_id in resolved.items()
+                        )
+                    )
+                    if (
+                        detail["name"] == DELIVERY_SQUAD_NAME
+                        and detail["leader_id"] == delivery_lead_id
+                        and observed_members == expected_members
+                    ):
+                        delivery_squad_id = squad_id
+                        delivery_squad_leader_id = detail["leader_id"]
+                        delivery_squad_members = observed_members
+                except (RuntimeError, TypeError, ValueError):
+                    pass
     children = parse_issue_children(
         runner.run(["issue", "children", parent_key, "--output", "json"]),
         str(parent["id"]),
@@ -4236,6 +4324,9 @@ def load_workflow_snapshot(
         or decoded_parent is None
         or (bool(project_ids) and not assignment_agent_ids)
         or (bool(project_ids) and not delivery_squad_id)
+        or (bool(project_ids) and not delivery_lead_id)
+        or (bool(project_ids) and not delivery_squad_leader_id)
+        or (bool(project_ids) and not delivery_squad_members)
         or any(
             child.phase is None
             for child in snapshots
@@ -4353,6 +4444,9 @@ def load_workflow_snapshot(
         ),
         parent_assignee_type=str(parent["assignee_type"]),
         delivery_squad_id=delivery_squad_id,
+        delivery_lead_id=delivery_lead_id,
+        delivery_squad_leader_id=delivery_squad_leader_id,
+        delivery_squad_members=delivery_squad_members,
     )
 
 
