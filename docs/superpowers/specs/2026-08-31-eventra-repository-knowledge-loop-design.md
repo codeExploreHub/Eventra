@@ -332,7 +332,7 @@ python3 -B -m tools.multica.knowledge candidate --input CANDIDATE_JSON_FILE
 python3 -B -m tools.multica.knowledge summary --child ISSUE --evidence-comment UUID --candidate-digest SHA256
 python3 -B -m tools.multica.knowledge scan --project-id ID --backend-project-id ID
 python3 -B -m tools.multica.knowledge plan --project-id ID --backend-project-id ID
-python3 -B -m tools.multica.knowledge curate --project-id ID --backend-project-id ID --apply
+python3 -B -m tools.multica.knowledge curate --project-id ID --backend-project-id ID --curator-agent-id ID --apply
 python3 -B -m tools.multica.knowledge verify
 ```
 
@@ -413,16 +413,35 @@ The parent knowledge summary has its own smaller state machine:
 
 ```text
 none
-  or pending -> dispatched
+  or pending -> deduplicated
+             -> rejected
+             -> needs_human
+             -> dispatched
 ```
 
 `dispatched` means the target knowledge Issue has been created and verified;
 it is not a claim that a pull request exists or that knowledge has been
-accepted.
+accepted. The other three terminal states record that no target Issue was
+created; a human may correct the evidence and explicitly reset a
+`needs_human` parent to `pending` for a new evaluation.
 
 Every transition records its source state, target state, candidate digest,
 action key, authoritative object identity, and evidence reference. Identical
 retries are no-ops. A transition from a stale state is rejected.
+
+For the pilot, those fields are stored as one canonical JSON string rather
+than a sequence of independently meaningful metadata keys. The target
+knowledge Issue uses `eventra.knowledge.transition` for the
+`pending -> issue_created` record. The source parent first records
+`eventra.knowledge.dispatch`, then changes only
+`eventra.knowledge.status` from `pending` to `dispatched`. If the second write
+is interrupted, a later run validates the complete dispatch record and the
+authoritative target Issue before finishing the status change. A malformed or
+conflicting partial record stops before creating another Issue.
+For `deduplicated`, `rejected`, and `needs_human`, the parent instead stores
+one canonical `eventra.knowledge.resolution` record before changing the status
+to that terminal value. This prevents the oldest non-actionable parent from
+starving later candidates while preserving a deterministic audit trail.
 
 ## Concurrency and idempotency
 

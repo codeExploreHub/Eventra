@@ -56,6 +56,8 @@ MUTATION_COMMAND_PREFIXES = frozenset(
         ("autopilot", "update"),
         ("autopilot", "trigger-add"),
         ("autopilot", "trigger-update"),
+        ("issue", "create"),
+        ("issue", "metadata", "set"),
     }
 )
 READ_ONLY_COMMAND_PREFIXES = frozenset(

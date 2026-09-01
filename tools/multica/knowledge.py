@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import re
+import tempfile
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import date
@@ -83,6 +84,19 @@ class KnowledgeParentSnapshot:
     summary_comment_uuid: str
     candidate_comment_uuid: str
     candidate: KnowledgeCandidate
+    dispatch_record: str | None = None
+    resolution_record: str | None = None
+
+
+@dataclass(frozen=True)
+class CurationRunResult:
+    decision: str
+    parent_identifier: str | None
+    knowledge_issue_identifier: str | None
+    action_key: str | None
+    created: int
+    mutation_count: int
+    reason: str
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -656,7 +670,9 @@ def load_candidate_snapshot(
         "eventra.knowledge.summary_comment",
         "eventra.knowledge.candidate_digest",
     }
-    if set(knowledge_metadata) != required:
+    dispatch_keys = required | {"eventra.knowledge.dispatch"}
+    resolution_keys = required | {"eventra.knowledge.resolution"}
+    if set(knowledge_metadata) not in (required, dispatch_keys, resolution_keys):
         raise RuntimeError("invalid knowledge evidence")
     summary_uuid = knowledge_metadata["eventra.knowledge.summary_comment"]
     metadata_digest = knowledge_metadata["eventra.knowledge.candidate_digest"]
@@ -736,6 +752,8 @@ def load_candidate_snapshot(
         summary_comment_uuid=canonical_summary_uuid,
         candidate_comment_uuid=pointer.evidence_comment_uuid,
         candidate=candidate,
+        dispatch_record=knowledge_metadata.get("eventra.knowledge.dispatch"),
+        resolution_record=knowledge_metadata.get("eventra.knowledge.resolution"),
     )
 
 
@@ -830,6 +848,637 @@ def stable_curation_decision(
     return second_decision
 
 
+def _curation_result(
+    runner: MulticaRunner,
+    starting_mutations: int,
+    decision: str,
+    *,
+    parent_identifier: str | None = None,
+    knowledge_issue_identifier: str | None = None,
+    action_key: str | None = None,
+    created: int = 0,
+    reason: str,
+) -> CurationRunResult:
+    return CurationRunResult(
+        decision=decision,
+        parent_identifier=parent_identifier,
+        knowledge_issue_identifier=knowledge_issue_identifier,
+        action_key=action_key,
+        created=created,
+        mutation_count=runner.mutation_count - starting_mutations,
+        reason=reason,
+    )
+
+
+def _knowledge_issue_title(action_key: str) -> str:
+    return f"Eventra knowledge curation {action_key}"
+
+
+def _knowledge_issue_description(
+    snapshot: KnowledgeParentSnapshot, decision: CurationDecision
+) -> str:
+    shas = "\n".join(
+        f"- {repository}={sha}"
+        for repository, sha in snapshot.candidate.candidate_shas
+    )
+    return (
+        "# Eventra repository knowledge curation\n\n"
+        f"eventra-knowledge-action-key: {decision.action_key}\n"
+        f"source-parent: {snapshot.identifier}\n"
+        f"source-summary-comment: {snapshot.summary_comment_uuid}\n"
+        f"source-evidence-comment: {snapshot.candidate_comment_uuid}\n"
+        f"candidate-digest: {snapshot.candidate.digest}\n"
+        f"target-repository: {decision.target_repository}\n"
+        f"knowledge-type: {snapshot.candidate.knowledge_type}\n"
+        "candidate-shas:\n"
+        f"{shas}\n\n"
+        "Follow the source evidence, verify it against the exact candidate SHA, "
+        "and use only the repository knowledge allowlist. Do not modify business "
+        "code, merge, deploy, or copy unrestricted source output.\n"
+    )
+
+
+def _action_issue_matches(
+    raw: Any,
+    normalized: Mapping[str, Any],
+    *,
+    project_id: str,
+    curator_agent_id: str,
+    title: str,
+    description: str,
+) -> bool:
+    return (
+        isinstance(raw, dict)
+        and raw.get("id") == normalized["id"]
+        and raw.get("identifier") == normalized["identifier"]
+        and raw.get("title") == title
+        and raw.get("description") == description
+        and normalized["project_id"] == project_id
+        and normalized["assignee_id"] == curator_agent_id
+        and normalized["assignee_type"] == "agent"
+        and normalized["parent_issue_id"] is None
+        and normalized["stage"] is None
+    )
+
+
+def _find_action_issues(
+    runner: MulticaRunner,
+    *,
+    project_id: str,
+    curator_agent_id: str,
+    title: str,
+    description: str,
+) -> tuple[dict[str, Any], ...]:
+    matches: dict[str, dict[str, Any]] = {}
+    offset = 0
+    while True:
+        raw = runner.run(
+            [
+                "issue", "list",
+                "--project", project_id,
+                "--assignee-id", curator_agent_id,
+                "--limit", "50",
+                "--offset", str(offset),
+                "--output", "json",
+            ]
+        )
+        try:
+            page = parse_issue_list(raw, project_id)
+        except RuntimeError:
+            raise RuntimeError("malformed knowledge action search") from None
+        if page["limit"] != 50 or page["offset"] != offset:
+            raise RuntimeError("malformed knowledge action search")
+        raw_issues = raw.get("issues") if isinstance(raw, dict) else None
+        if not isinstance(raw_issues, list) or len(raw_issues) != len(page["issues"]):
+            raise RuntimeError("malformed knowledge action search")
+        for raw_issue, issue in zip(raw_issues, page["issues"], strict=True):
+            if _action_issue_matches(
+                raw_issue,
+                issue,
+                project_id=project_id,
+                curator_agent_id=curator_agent_id,
+                title=title,
+                description=description,
+            ):
+                matches[issue["id"]] = dict(issue)
+        if not page["has_more"]:
+            break
+        if not page["issues"]:
+            raise RuntimeError("malformed knowledge action search")
+        offset += len(page["issues"])
+    return tuple(
+        sorted(matches.values(), key=lambda item: (item["updated_at"], item["identifier"]))
+    )
+
+
+def _load_action_issue(
+    runner: MulticaRunner,
+    identifier: str,
+    *,
+    project_id: str,
+    curator_agent_id: str,
+    title: str,
+    description: str,
+) -> dict[str, Any]:
+    raw = runner.run(["issue", "get", identifier, "--output", "json"])
+    try:
+        issue = parse_issue_detail(raw, identifier)
+    except RuntimeError:
+        raise RuntimeError("invalid knowledge action issue") from None
+    if not _action_issue_matches(
+        raw,
+        issue,
+        project_id=project_id,
+        curator_agent_id=curator_agent_id,
+        title=title,
+        description=description,
+    ):
+        raise RuntimeError("invalid knowledge action issue")
+    return issue
+
+
+def _transition_record(
+    snapshot: KnowledgeParentSnapshot,
+    decision: CurationDecision,
+    knowledge_issue_identifier: str,
+    target_status: Literal["issue_created", "dispatched"],
+) -> str:
+    payload = {
+        "schema_version": 1,
+        "source_status": "pending",
+        "target_status": target_status,
+        "candidate_digest": snapshot.candidate.digest,
+        "action_key": decision.action_key,
+        "object_identifier": knowledge_issue_identifier,
+        "source_parent": snapshot.identifier,
+        "summary_comment_uuid": snapshot.summary_comment_uuid,
+        "evidence_comment_uuid": snapshot.candidate_comment_uuid,
+        "target_repository": decision.target_repository,
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _resolution_record(
+    snapshot: KnowledgeParentSnapshot,
+    decision: CurationDecision,
+) -> str:
+    payload = {
+        "schema_version": 1,
+        "source_status": "pending",
+        "target_status": decision.kind,
+        "candidate_digest": snapshot.candidate.digest,
+        "action_key": decision.action_key,
+        "source_parent": snapshot.identifier,
+        "summary_comment_uuid": snapshot.summary_comment_uuid,
+        "evidence_comment_uuid": snapshot.candidate_comment_uuid,
+        "target_repository": decision.target_repository,
+        "existing_knowledge_id": decision.existing_knowledge_id,
+    }
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _dispatch_identifier(
+    value: str,
+    snapshot: KnowledgeParentSnapshot,
+    decision: CurationDecision,
+) -> str:
+    try:
+        payload = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        raise RuntimeError("invalid knowledge transition") from None
+    required = {
+        "schema_version", "source_status", "target_status",
+        "candidate_digest", "action_key", "object_identifier",
+        "source_parent", "summary_comment_uuid", "evidence_comment_uuid",
+        "target_repository",
+    }
+    identifier = payload.get("object_identifier") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != required
+        or json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True) != value
+        or payload.get("schema_version") != 1
+        or payload.get("source_status") != "pending"
+        or payload.get("target_status") != "dispatched"
+        or payload.get("candidate_digest") != snapshot.candidate.digest
+        or payload.get("action_key") != decision.action_key
+        or not isinstance(identifier, str)
+        or _ISSUE.fullmatch(identifier) is None
+        or payload.get("source_parent") != snapshot.identifier
+        or payload.get("summary_comment_uuid") != snapshot.summary_comment_uuid
+        or payload.get("evidence_comment_uuid") != snapshot.candidate_comment_uuid
+        or payload.get("target_repository") != decision.target_repository
+    ):
+        raise RuntimeError("invalid knowledge transition")
+    return identifier
+
+
+def _load_metadata(runner: MulticaRunner, identifier: str) -> dict[str, str]:
+    try:
+        return parse_issue_metadata(
+            runner.run(["issue", "metadata", "list", identifier, "--output", "json"])
+        )
+    except RuntimeError:
+        raise RuntimeError("invalid knowledge transition") from None
+
+
+def _set_string_metadata(
+    runner: MulticaRunner, identifier: str, key: str, value: str
+) -> None:
+    runner.run(
+        [
+            "issue", "metadata", "set", identifier,
+            "--key", key,
+            "--value", value,
+            "--type", "string",
+            "--output", "json",
+        ]
+    )
+
+
+def _controlled_knowledge_metadata(metadata: Mapping[str, str]) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in metadata.items()
+        if key.startswith("eventra.knowledge.")
+    }
+
+
+def _default_backend_root(frontend_root: Path) -> Path:
+    resolved = frontend_root.resolve()
+    if resolved.parent.name == ".worktrees":
+        resolved = resolved.parent.parent
+    return resolved.parent / "Eventra-Backend"
+
+
+def _record_parent_resolution(
+    runner: MulticaRunner,
+    snapshot: KnowledgeParentSnapshot,
+    decision: CurationDecision,
+) -> None:
+    if decision.kind not in {"deduplicated", "rejected", "needs_human"}:
+        raise RuntimeError("invalid knowledge transition")
+    resolution = _resolution_record(snapshot, decision)
+    base = {
+        "eventra.knowledge.version": "1",
+        "eventra.knowledge.status": "pending",
+        "eventra.knowledge.summary_comment": snapshot.summary_comment_uuid,
+        "eventra.knowledge.candidate_digest": snapshot.candidate.digest,
+    }
+    expected_pending = {
+        **base,
+        "eventra.knowledge.resolution": resolution,
+    }
+    expected_terminal = {
+        **expected_pending,
+        "eventra.knowledge.status": decision.kind,
+    }
+    controlled = _controlled_knowledge_metadata(
+        _load_metadata(runner, snapshot.identifier)
+    )
+    if controlled not in (base, expected_pending, expected_terminal):
+        raise RuntimeError("invalid knowledge transition")
+    if controlled == base:
+        _set_string_metadata(
+            runner,
+            snapshot.identifier,
+            "eventra.knowledge.resolution",
+            resolution,
+        )
+        controlled = _controlled_knowledge_metadata(
+            _load_metadata(runner, snapshot.identifier)
+        )
+    if controlled == expected_pending:
+        _set_string_metadata(
+            runner,
+            snapshot.identifier,
+            "eventra.knowledge.status",
+            decision.kind,
+        )
+    if _controlled_knowledge_metadata(
+        _load_metadata(runner, snapshot.identifier)
+    ) != expected_terminal:
+        raise RuntimeError("invalid knowledge transition")
+
+
+def curate_once(
+    runner: MulticaRunner,
+    project_ids: Mapping[str, str],
+    curator_agent_id: str,
+    apply: bool,
+    *,
+    frontend_root: Path | None = None,
+    backend_root: Path | None = None,
+) -> CurationRunResult:
+    """Plan or dispatch at most one verified Eventra knowledge candidate."""
+    starting_mutations = runner.mutation_count
+    if not isinstance(apply, bool):
+        raise TypeError("apply must be a bool")
+    try:
+        canonical_curator_id = _canonical_uuid(curator_agent_id)
+        configured = dict(_project_map(project_ids))
+        resolved_frontend_root = (
+            Path.cwd() if frontend_root is None else frontend_root
+        )
+        resolved_backend_root = (
+            _default_backend_root(resolved_frontend_root)
+            if backend_root is None
+            else backend_root
+        )
+        entries = verify_indexes(resolved_frontend_root, resolved_backend_root)
+        refs = list_pending_parents(runner, configured)
+    except (RuntimeError, ValueError):
+        return _curation_result(
+            runner, starting_mutations, "needs_human",
+            reason="knowledge scan or index verification failed",
+        )
+    if not refs:
+        return _curation_result(
+            runner, starting_mutations, "noop",
+            reason="no pending knowledge parent",
+        )
+    parent_ref = refs[0]
+    try:
+        snapshots: list[KnowledgeParentSnapshot] = []
+
+        def load_snapshot() -> KnowledgeParentSnapshot:
+            value = load_candidate_snapshot(runner, parent_ref, configured)
+            snapshots.append(value)
+            return value
+
+        decision = stable_curation_decision(
+            load_snapshot,
+            entries,
+        )
+        snapshot = snapshots[-1]
+    except RuntimeError:
+        return _curation_result(
+            runner, starting_mutations, "needs_human",
+            parent_identifier=parent_ref.identifier,
+            reason="knowledge evidence is invalid or changed",
+        )
+    if decision.kind != "create_issue":
+        if (
+            apply
+            and decision.candidate_digest == snapshot.candidate.digest
+            and decision.kind in {"deduplicated", "rejected", "needs_human"}
+        ):
+            try:
+                _record_parent_resolution(runner, snapshot, decision)
+            except RuntimeError:
+                return _curation_result(
+                    runner, starting_mutations, "needs_human",
+                    parent_identifier=snapshot.identifier,
+                    action_key=decision.action_key,
+                    reason="knowledge resolution could not be verified",
+                )
+        return _curation_result(
+            runner, starting_mutations, decision.kind,
+            parent_identifier=snapshot.identifier,
+            action_key=decision.action_key,
+            reason=decision.reason,
+        )
+    if decision.action_key is None or decision.target_project_id is None:
+        return _curation_result(
+            runner, starting_mutations, "needs_human",
+            parent_identifier=snapshot.identifier,
+            reason="knowledge decision is incomplete",
+        )
+    dispatch_identifier = None
+    if snapshot.dispatch_record is not None:
+        try:
+            dispatch_identifier = _dispatch_identifier(
+                snapshot.dispatch_record, snapshot, decision
+            )
+        except RuntimeError:
+            return _curation_result(
+                runner, starting_mutations, "needs_human",
+                parent_identifier=snapshot.identifier,
+                action_key=decision.action_key,
+                reason="pending knowledge dispatch record is invalid",
+            )
+    title = _knowledge_issue_title(decision.action_key)
+    description = _knowledge_issue_description(snapshot, decision)
+    try:
+        matches = _find_action_issues(
+            runner,
+            project_id=decision.target_project_id,
+            curator_agent_id=canonical_curator_id,
+            title=title,
+            description=description,
+        )
+    except RuntimeError:
+        return _curation_result(
+            runner, starting_mutations, "needs_human",
+            parent_identifier=snapshot.identifier,
+            action_key=decision.action_key,
+            reason="knowledge action search failed",
+        )
+    if len(matches) > 1:
+        return _curation_result(
+            runner, starting_mutations, "needs_human",
+            parent_identifier=snapshot.identifier,
+            action_key=decision.action_key,
+            reason="multiple knowledge action Issues matched",
+        )
+    if dispatch_identifier is not None and (
+        len(matches) != 1 or matches[0]["identifier"] != dispatch_identifier
+    ):
+        return _curation_result(
+            runner, starting_mutations, "needs_human",
+            parent_identifier=snapshot.identifier,
+            action_key=decision.action_key,
+            reason="pending knowledge dispatch does not match an authoritative Issue",
+        )
+    if not apply:
+        return _curation_result(
+            runner, starting_mutations, "create_issue",
+            parent_identifier=snapshot.identifier,
+            knowledge_issue_identifier=(matches[0]["identifier"] if matches else None),
+            action_key=decision.action_key,
+            reason=(
+                "matching knowledge Issue already exists"
+                if matches
+                else decision.reason
+            ),
+        )
+
+    issue = matches[0] if matches else None
+    created = 0
+    if issue is None:
+        description_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                prefix=".eventra-knowledge-",
+                suffix=".md",
+                dir=Path.cwd(),
+                delete=False,
+            ) as handle:
+                handle.write(description)
+                description_path = Path(handle.name)
+            raw_created = runner.run(
+                [
+                    "issue", "create",
+                    "--title", title,
+                    "--description-file", str(description_path),
+                    "--assignee-id", canonical_curator_id,
+                    "--project", decision.target_project_id,
+                    "--output", "json",
+                ]
+            )
+            identifier = (
+                raw_created.get("identifier")
+                if isinstance(raw_created, dict)
+                else None
+            )
+            if not isinstance(identifier, str):
+                raise RuntimeError("invalid knowledge action issue")
+            issue = _load_action_issue(
+                runner,
+                identifier,
+                project_id=decision.target_project_id,
+                curator_agent_id=canonical_curator_id,
+                title=title,
+                description=description,
+            )
+            created = 1
+        except (OSError, RuntimeError):
+            try:
+                recovered = _find_action_issues(
+                    runner,
+                    project_id=decision.target_project_id,
+                    curator_agent_id=canonical_curator_id,
+                    title=title,
+                    description=description,
+                )
+            except RuntimeError:
+                recovered = ()
+            if len(recovered) == 1:
+                issue = recovered[0]
+                created = 1
+            else:
+                return _curation_result(
+                    runner, starting_mutations, "needs_human",
+                    parent_identifier=snapshot.identifier,
+                    action_key=decision.action_key,
+                    reason="knowledge Issue creation acknowledgement was ambiguous",
+                )
+        finally:
+            if description_path is not None:
+                try:
+                    description_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    if issue is None:
+        return _curation_result(
+            runner, starting_mutations, "needs_human",
+            parent_identifier=snapshot.identifier,
+            action_key=decision.action_key,
+            reason="knowledge Issue was not established",
+        )
+    identifier = issue["identifier"]
+    try:
+        authoritative_issue = _load_action_issue(
+            runner,
+            identifier,
+            project_id=decision.target_project_id,
+            curator_agent_id=canonical_curator_id,
+            title=title,
+            description=description,
+        )
+        if authoritative_issue["id"] != issue["id"]:
+            raise RuntimeError("invalid knowledge action issue")
+        issue_transition = _transition_record(
+            snapshot, decision, identifier, "issue_created"
+        )
+        target_metadata = _controlled_knowledge_metadata(
+            _load_metadata(runner, identifier)
+        )
+        expected_target = {"eventra.knowledge.transition": issue_transition}
+        if target_metadata not in ({}, expected_target):
+            raise RuntimeError("invalid knowledge transition")
+        if not target_metadata:
+            _set_string_metadata(
+                runner,
+                identifier,
+                "eventra.knowledge.transition",
+                issue_transition,
+            )
+        if _controlled_knowledge_metadata(_load_metadata(runner, identifier)) != expected_target:
+            raise RuntimeError("invalid knowledge transition")
+
+        current_snapshot = load_candidate_snapshot(runner, parent_ref, configured)
+        current_decision = decide_curation(current_snapshot, entries)
+        if current_snapshot != snapshot or current_decision != decision:
+            raise RuntimeError("invalid knowledge transition")
+        dispatch_record = _transition_record(
+            snapshot, decision, identifier, "dispatched"
+        )
+        parent_metadata = _load_metadata(runner, snapshot.identifier)
+        controlled_parent = _controlled_knowledge_metadata(parent_metadata)
+        base_parent = {
+            "eventra.knowledge.version": "1",
+            "eventra.knowledge.status": "pending",
+            "eventra.knowledge.summary_comment": snapshot.summary_comment_uuid,
+            "eventra.knowledge.candidate_digest": snapshot.candidate.digest,
+        }
+        expected_pending = {
+            **base_parent,
+            "eventra.knowledge.dispatch": dispatch_record,
+        }
+        expected_dispatched = {
+            **expected_pending,
+            "eventra.knowledge.status": "dispatched",
+        }
+        if controlled_parent not in (base_parent, expected_pending, expected_dispatched):
+            raise RuntimeError("invalid knowledge transition")
+        if controlled_parent == base_parent:
+            _set_string_metadata(
+                runner,
+                snapshot.identifier,
+                "eventra.knowledge.dispatch",
+                dispatch_record,
+            )
+            controlled_parent = _controlled_knowledge_metadata(
+                _load_metadata(runner, snapshot.identifier)
+            )
+        if controlled_parent == expected_pending:
+            _set_string_metadata(
+                runner,
+                snapshot.identifier,
+                "eventra.knowledge.status",
+                "dispatched",
+            )
+        if _controlled_knowledge_metadata(
+            _load_metadata(runner, snapshot.identifier)
+        ) != expected_dispatched:
+            raise RuntimeError("invalid knowledge transition")
+    except RuntimeError:
+        return _curation_result(
+            runner, starting_mutations, "needs_human",
+            parent_identifier=snapshot.identifier,
+            knowledge_issue_identifier=identifier,
+            action_key=decision.action_key,
+            created=created,
+            reason="knowledge transition could not be verified",
+        )
+    return _curation_result(
+        runner, starting_mutations, "dispatched",
+        parent_identifier=snapshot.identifier,
+        knowledge_issue_identifier=identifier,
+        action_key=decision.action_key,
+        created=created,
+        reason="knowledge Issue was verified and parent was dispatched",
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Eventra verified knowledge retrieval")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -860,6 +1509,13 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--backend-project-id", required=True)
     plan.add_argument("--frontend-root", type=Path, default=Path.cwd())
     plan.add_argument("--backend-root", type=Path, default=Path.cwd().parent / "Eventra-Backend")
+    curate = subparsers.add_parser("curate")
+    curate.add_argument("--project-id", required=True)
+    curate.add_argument("--backend-project-id", required=True)
+    curate.add_argument("--curator-agent-id", required=True)
+    curate.add_argument("--frontend-root", type=Path, default=Path.cwd())
+    curate.add_argument("--backend-root", type=Path)
+    curate.add_argument("--apply", action="store_true")
     return parser
 
 
@@ -889,6 +1545,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             render_summary_pointer(
                 args.child, args.evidence_comment, args.candidate_digest
+            )
+        )
+        return 0
+    if args.command == "curate":
+        result = curate_once(
+            MulticaRunner(),
+            {
+                "frontend": args.project_id,
+                "backend": args.backend_project_id,
+            },
+            args.curator_agent_id,
+            args.apply,
+            frontend_root=args.frontend_root,
+            backend_root=args.backend_root,
+        )
+        print(
+            json.dumps(
+                asdict(result),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
             )
         )
         return 0

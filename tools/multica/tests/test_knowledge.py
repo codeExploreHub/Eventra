@@ -14,6 +14,7 @@ import yaml
 from tools.multica.knowledge import (
     KnowledgeParentRef,
     build_context_receipt,
+    curate_once,
     decide_curation,
     extract_candidate_blocks,
     extract_summary_pointer,
@@ -797,6 +798,378 @@ class KnowledgeReadOnlyCliTests(unittest.TestCase):
                 for call in runner.calls
             )
         )
+
+
+class CurationApplyRunner(CombinedKnowledgeRunner):
+    def __init__(self):
+        super().__init__()
+        self.created_issues = []
+        self.issue_metadata = {}
+        self.create_attempts = 0
+        self.metadata_sets = []
+        self.description_paths = []
+        self.descriptions = []
+        self.raise_after_committed_issue_create = False
+        self.fail_issue_create = False
+        self.change_parent_on_get = None
+        self.parent_gets = 0
+        self.fail_parent_status_once = False
+        self._mutation_count = 0
+
+    @property
+    def mutation_count(self):
+        return self._mutation_count
+
+    @staticmethod
+    def _flag(call, name):
+        return call[call.index(name) + 1]
+
+    def route_candidate_to_backend(self):
+        self.payload["candidate_shas"] = {"backend": "b" * 40}
+        self.payload["target_scope"] = "backend"
+        self.payload["target_repository"] = "backend"
+        self.refresh_candidate_evidence()
+
+    def refresh_candidate_evidence(self):
+        self.payload["digest"] = candidate_digest(self.payload)
+        self.metadata["eventra.knowledge.candidate_digest"] = self.payload["digest"]
+        self.summary = compact_comment(
+            SUMMARY_UUID,
+            render_summary_pointer(
+                "PRO-101", CANDIDATE_COMMENT_UUID, self.payload["digest"]
+            ),
+        )
+        self.evidence = compact_comment(
+            CANDIDATE_COMMENT_UUID,
+            render_candidate_block(json.dumps(self.payload)),
+        )
+
+    def seed_action_issue(self, action_key, *, project_id=FRONTEND_PROJECT_ID):
+        identifier = "BCK-201" if project_id == BACKEND_PROJECT_ID else "PRO-201"
+        shas = "\n".join(
+            f"- {repository}={sha}"
+            for repository, sha in sorted(self.payload["candidate_shas"].items())
+        )
+        description = (
+            "# Eventra repository knowledge curation\n\n"
+            f"eventra-knowledge-action-key: {action_key}\n"
+            "source-parent: PRO-100\n"
+            f"source-summary-comment: {SUMMARY_UUID}\n"
+            f"source-evidence-comment: {CANDIDATE_COMMENT_UUID}\n"
+            f"candidate-digest: {self.payload['digest']}\n"
+            f"target-repository: {self.payload['target_repository']}\n"
+            f"knowledge-type: {self.payload['knowledge_type']}\n"
+            "candidate-shas:\n"
+            f"{shas}\n\n"
+            "Follow the source evidence, verify it against the exact candidate SHA, "
+            "and use only the repository knowledge allowlist. Do not modify business "
+            "code, merge, deploy, or copy unrestricted source output.\n"
+        )
+        issue = knowledge_issue(
+            identifier,
+            "01a00000-0000-7000-8000-000000000401",
+            project_id,
+            assignee_id="00000000-0000-4000-8000-000000000301",
+            status="todo",
+            status_category="unstarted",
+            title=f"Eventra knowledge curation {action_key}",
+            description=description,
+        )
+        self.created_issues.append(issue)
+        self.issue_metadata[identifier] = {}
+        return issue
+
+    def run(self, args, *, stdin_json=None):
+        call = tuple(args)
+        if call == ("issue", "get", "PRO-100", "--output", "json"):
+            self.parent_gets += 1
+            if self.change_parent_on_get == self.parent_gets:
+                self.parent["updated_at"] = "2026-08-31T09:00:01Z"
+            return super().run(args, stdin_json=stdin_json)
+        if call[:2] == ("issue", "list") and "--assignee-id" in call:
+            self.calls.append(call)
+            project_id = self._flag(call, "--project")
+            offset = int(self._flag(call, "--offset"))
+            records = [
+                copy.deepcopy(item)
+                for item in self.created_issues
+                if item["project_id"] == project_id
+            ]
+            return {
+                "has_more": False,
+                "issues": records[offset:offset + 50],
+                "limit": 50,
+                "offset": offset,
+                "total": len(records),
+            }
+        if call[:2] == ("issue", "list"):
+            if self.metadata["eventra.knowledge.status"] != "pending":
+                self.calls.append(call)
+                return {
+                    "has_more": False,
+                    "issues": [],
+                    "limit": 50,
+                    "offset": int(self._flag(call, "--offset")),
+                    "total": 0,
+                }
+            return super().run(args, stdin_json=stdin_json)
+        if call[:2] == ("issue", "create"):
+            self.calls.append(call)
+            self._mutation_count += 1
+            self.create_attempts += 1
+            path = Path(self._flag(call, "--description-file"))
+            self.description_paths.append(path)
+            description = path.read_text(encoding="utf-8")
+            self.descriptions.append(description)
+            if self.fail_issue_create:
+                raise RuntimeError("Multica command failed with exit 1")
+            project_id = self._flag(call, "--project")
+            action_key = self._flag(call, "--title").rsplit(" ", 1)[1]
+            issue = self.seed_action_issue(action_key, project_id=project_id)
+            issue["description"] = description
+            if self.raise_after_committed_issue_create:
+                self.raise_after_committed_issue_create = False
+                raise RuntimeError("Multica command failed with exit 1")
+            return copy.deepcopy(issue)
+        if call[:2] == ("issue", "get") and call[2] in self.issue_metadata:
+            self.calls.append(call)
+            return copy.deepcopy(
+                next(item for item in self.created_issues if item["identifier"] == call[2])
+            )
+        if call[:3] == ("issue", "metadata", "list") and call[3] in self.issue_metadata:
+            self.calls.append(call)
+            return copy.deepcopy(self.issue_metadata[call[3]])
+        if call[:3] == ("issue", "metadata", "set"):
+            self.calls.append(call)
+            self._mutation_count += 1
+            identifier = call[3]
+            key = self._flag(call, "--key")
+            value = self._flag(call, "--value")
+            self.metadata_sets.append((identifier, key, value))
+            if (
+                self.fail_parent_status_once
+                and identifier == "PRO-100"
+                and key == "eventra.knowledge.status"
+                and value == "dispatched"
+            ):
+                self.fail_parent_status_once = False
+                raise RuntimeError("Multica command failed with exit 1")
+            target = self.metadata if identifier == "PRO-100" else self.issue_metadata[identifier]
+            target[key] = value
+            return {"ignored": "mutation acknowledgement"}
+        return super().run(args, stdin_json=stdin_json)
+
+
+class KnowledgeCurationApplyTests(unittest.TestCase):
+    roots = {
+        "frontend_root": Path.cwd(),
+        "backend_root": Path(
+            "/Users/didi/Eventra-workspace/Eventra-Backend/.worktrees/eventra-knowledge-loop"
+        ),
+    }
+    projects = {
+        "frontend": FRONTEND_PROJECT_ID,
+        "backend": BACKEND_PROJECT_ID,
+    }
+    curator_id = "00000000-0000-4000-8000-000000000301"
+
+    def test_dry_run_plans_without_mutation(self):
+        runner = CurationApplyRunner()
+        result = curate_once(
+            runner, self.projects, self.curator_id, False, **self.roots
+        )
+        self.assertEqual(result.decision, "create_issue")
+        self.assertEqual(result.created, 0)
+        self.assertEqual(runner.mutation_count, 0)
+
+    def test_apply_routes_with_assignee_and_local_description_then_records_states(self):
+        for backend in (False, True):
+            runner = CurationApplyRunner()
+            if backend:
+                runner.route_candidate_to_backend()
+            with self.subTest(backend=backend):
+                result = curate_once(
+                    runner, self.projects, self.curator_id, True, **self.roots
+                )
+                expected_project = BACKEND_PROJECT_ID if backend else FRONTEND_PROJECT_ID
+                create = next(call for call in runner.calls if call[:2] == ("issue", "create"))
+                self.assertEqual(runner._flag(create, "--project"), expected_project)
+                self.assertEqual(runner._flag(create, "--assignee-id"), self.curator_id)
+                self.assertIn("--description-file", create)
+                self.assertNotIn("--description", create)
+                self.assertNotIn("--allow-duplicate", create)
+                self.assertEqual(runner.description_paths[0].parent, Path.cwd())
+                self.assertFalse(runner.description_paths[0].exists())
+                self.assertNotIn(runner.payload["claim"], runner.descriptions[0])
+                self.assertEqual(result.created, 1)
+                self.assertEqual(result.decision, "dispatched")
+                self.assertEqual(runner.metadata["eventra.knowledge.status"], "dispatched")
+                target_metadata = runner.issue_metadata[result.knowledge_issue_identifier]
+                self.assertEqual(set(target_metadata), {"eventra.knowledge.transition"})
+                target_transition = json.loads(
+                    target_metadata["eventra.knowledge.transition"]
+                )
+                parent_transition = json.loads(
+                    runner.metadata["eventra.knowledge.dispatch"]
+                )
+                self.assertEqual(target_transition["target_status"], "issue_created")
+                self.assertEqual(parent_transition["target_status"], "dispatched")
+                self.assertEqual(
+                    target_transition["object_identifier"],
+                    result.knowledge_issue_identifier,
+                )
+                self.assertEqual(
+                    parent_transition["action_key"], target_transition["action_key"]
+                )
+
+    def test_replay_and_concurrent_wake_do_not_duplicate_issue(self):
+        runner = CurationApplyRunner()
+        planned = curate_once(
+            runner, self.projects, self.curator_id, False, **self.roots
+        )
+        runner.seed_action_issue(planned.action_key)
+        first = curate_once(
+            runner, self.projects, self.curator_id, True, **self.roots
+        )
+        mutations = runner.mutation_count
+        second = curate_once(
+            runner, self.projects, self.curator_id, True, **self.roots
+        )
+        self.assertEqual(first.created, 0)
+        self.assertEqual(second.created, 0)
+        self.assertEqual(len(runner.created_issues), 1)
+        self.assertEqual(runner.mutation_count, mutations)
+
+    def test_ambiguous_committed_create_is_recovered_without_duplicate(self):
+        runner = CurationApplyRunner()
+        runner.raise_after_committed_issue_create = True
+        first = curate_once(
+            runner, self.projects, self.curator_id, True, **self.roots
+        )
+        second = curate_once(
+            runner, self.projects, self.curator_id, True, **self.roots
+        )
+        self.assertEqual(first.decision, "dispatched")
+        self.assertEqual(second.created, 0)
+        self.assertEqual(len(runner.created_issues), 1)
+        self.assertEqual(runner.create_attempts, 1)
+
+    def test_partial_dispatch_record_resumes_but_malformed_record_stops_before_create(self):
+        runner = CurationApplyRunner()
+        runner.fail_parent_status_once = True
+        first = curate_once(
+            runner, self.projects, self.curator_id, True, **self.roots
+        )
+        self.assertEqual(first.decision, "needs_human")
+        self.assertEqual(runner.metadata["eventra.knowledge.status"], "pending")
+        self.assertIn("eventra.knowledge.dispatch", runner.metadata)
+        second = curate_once(
+            runner, self.projects, self.curator_id, True, **self.roots
+        )
+        self.assertEqual(second.decision, "dispatched")
+        self.assertEqual(len(runner.created_issues), 1)
+
+        malformed = CurationApplyRunner()
+        malformed.metadata["eventra.knowledge.dispatch"] = "not-json"
+        stopped = curate_once(
+            malformed, self.projects, self.curator_id, True, **self.roots
+        )
+        self.assertEqual(stopped.decision, "needs_human")
+        self.assertEqual(malformed.mutation_count, 0)
+        self.assertFalse(malformed.created_issues)
+
+    def test_stale_parent_or_uncommitted_create_failure_stops_safely(self):
+        stale = CurationApplyRunner()
+        stale.change_parent_on_get = 2
+        stale_result = curate_once(
+            stale, self.projects, self.curator_id, True, **self.roots
+        )
+        self.assertEqual(stale_result.decision, "needs_human")
+        self.assertEqual(stale.mutation_count, 0)
+
+        failed = CurationApplyRunner()
+        failed.fail_issue_create = True
+        failed_result = curate_once(
+            failed, self.projects, self.curator_id, True, **self.roots
+        )
+        self.assertEqual(failed_result.decision, "needs_human")
+        self.assertEqual(failed.create_attempts, 1)
+        self.assertFalse(failed.metadata_sets)
+
+    def test_non_create_decisions_are_terminal_without_creating_issue(self):
+        cases = []
+
+        duplicate = CurationApplyRunner()
+        entries = load_index(
+            Path("docs/agent-knowledge/index.yaml"), Path.cwd(), "frontend"
+        )
+        duplicate_entries = (
+            replace(
+                entries[0], source_candidate_digest=duplicate.payload["digest"]
+            ),
+            *entries[1:],
+        )
+        cases.append(("deduplicated", duplicate, duplicate_entries))
+
+        rejected = CurationApplyRunner()
+        rejected.payload["target_repository"] = "backend"
+        rejected.refresh_candidate_evidence()
+        cases.append(("rejected", rejected, entries))
+
+        needs_human = CurationApplyRunner()
+        needs_human.payload["related_knowledge_ids"] = ["missing-knowledge"]
+        needs_human.refresh_candidate_evidence()
+        cases.append(("needs_human", needs_human, entries))
+
+        for expected, runner, planned_entries in cases:
+            with (
+                self.subTest(expected=expected),
+                mock.patch(
+                    "tools.multica.knowledge.verify_indexes",
+                    return_value=planned_entries,
+                ),
+            ):
+                first = curate_once(
+                    runner, self.projects, self.curator_id, True, **self.roots
+                )
+                mutations = runner.mutation_count
+                second = curate_once(
+                    runner, self.projects, self.curator_id, True, **self.roots
+                )
+                self.assertEqual(first.decision, expected)
+                self.assertEqual(second.decision, "noop")
+                self.assertEqual(runner.metadata["eventra.knowledge.status"], expected)
+                self.assertIn("eventra.knowledge.resolution", runner.metadata)
+                self.assertFalse(runner.created_issues)
+                self.assertEqual(runner.mutation_count, mutations)
+
+    def test_curate_cli_is_bounded_and_redacts_candidate_evidence(self):
+        runner = CurationApplyRunner()
+        output = io.StringIO()
+        with (
+            mock.patch("tools.multica.knowledge.MulticaRunner", return_value=runner),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(
+                main([
+                    "curate",
+                    "--project-id", FRONTEND_PROJECT_ID,
+                    "--backend-project-id", BACKEND_PROJECT_ID,
+                    "--curator-agent-id", self.curator_id,
+                    "--frontend-root", str(self.roots["frontend_root"]),
+                    "--backend-root", str(self.roots["backend_root"]),
+                    "--apply",
+                ]),
+                0,
+            )
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["decision"], "dispatched")
+        self.assertEqual(result["created"], 1)
+        rendered = output.getvalue()
+        self.assertNotIn(runner.payload["claim"], rendered)
+        self.assertNotIn(runner.payload["digest"], rendered)
+        self.assertNotIn(CANDIDATE_COMMENT_UUID, rendered)
+        self.assertEqual(len(runner.created_issues), 1)
 
 
 if __name__ == "__main__":

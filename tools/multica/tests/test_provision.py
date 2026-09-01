@@ -569,6 +569,11 @@ class MulticaRunnerTests(unittest.TestCase):
 
         for argv in (
             ["agent", "update", "agent-1", "--output", "json"],
+            ["issue", "create", "--title", "knowledge", "--output", "json"],
+            [
+                "issue", "metadata", "set", "PRO-1", "--key", "k",
+                "--value", "v", "--type", "string", "--output", "json",
+            ],
             ["issue", "rerun", "PRO-35", "--output", "json"],
         ):
             before = run.call_count
@@ -612,6 +617,8 @@ class MulticaRunnerTests(unittest.TestCase):
             subprocess.CompletedProcess([], 0, "[]", ""),
             subprocess.CompletedProcess([], 0, "{}", ""),
             subprocess.CompletedProcess([], 9, "", "private stderr"),
+            subprocess.CompletedProcess([], 0, "{}", ""),
+            subprocess.CompletedProcess([], 0, "{}", ""),
         )
         runner = MulticaRunner()
 
@@ -619,8 +626,13 @@ class MulticaRunnerTests(unittest.TestCase):
         runner.run(["agent", "create", "--output", "json"])
         with self.assertRaisesRegex(RuntimeError, "failed with exit 9"):
             runner.run(["agent", "env", "set", "agent-1", "--output", "json"])
+        runner.run(["issue", "create", "--title", "knowledge", "--output", "json"])
+        runner.run([
+            "issue", "metadata", "set", "PRO-1", "--key", "k",
+            "--value", "v", "--type", "string", "--output", "json",
+        ])
 
-        self.assertEqual(runner.mutation_count, 2)
+        self.assertEqual(runner.mutation_count, 4)
 
 
 class ProvisionerTests(unittest.TestCase):
