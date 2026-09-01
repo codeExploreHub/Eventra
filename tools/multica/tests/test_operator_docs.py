@@ -11,6 +11,71 @@ from tools.multica.workflow import (
 
 
 class OperatorDocsTests(unittest.TestCase):
+    def test_reviewer_documents_only_repository_scoped_review_completions(self):
+        rendered = Path(
+            "tools/multica/instructions/independent_reviewer.md"
+        ).read_text()
+        commands = [
+            line
+            for line in rendered.splitlines()
+            if line.startswith(
+                "python3 -B -m tools.multica.workflow finish-phase "
+            )
+        ]
+        parsed = []
+        for line in commands:
+            argv = shlex.split(line)[4:]
+            replacements = {
+                "PRO-N": "PRO-99",
+                "N": "1",
+                "FULL_SHA": "a" * 40,
+                "COMMENT_UUID": "00000000-0000-4000-8000-000000000099",
+                "HTTPS_URL": (
+                    "https://multica.example.test/comments/"
+                    "00000000-0000-4000-8000-000000000099"
+                ),
+            }
+            argv = [replacements.get(value, value) for value in argv]
+            args = build_workflow_parser().parse_args(argv)
+            completion = PhaseCompletion(
+                kind=args.kind,
+                result=args.result,
+                attempt=args.attempt,
+                evidence_comment=args.evidence_comment,
+                frontend_sha=args.frontend_sha,
+                backend_sha=args.backend_sha,
+                pr_url=args.pr,
+                responsible_repositories=tuple(args.responsible_repository),
+                evidence_comment_url=args.evidence_comment_url,
+            )
+            build_phase_metadata(completion)
+            parsed.append(completion)
+
+        identities = {
+            (
+                item.result,
+                item.frontend_sha is not None,
+                item.backend_sha is not None,
+                item.responsible_repositories,
+                item.evidence_comment_url is not None,
+            )
+            for item in parsed
+        }
+        self.assertEqual(
+            identities,
+            {
+                ("pass", True, False, (), False),
+                ("fail", True, False, ("frontend",), True),
+                ("pass", False, True, (), False),
+                ("fail", False, True, ("backend",), True),
+            },
+        )
+        normalized = " ".join(rendered.split())
+        self.assertNotIn("both SHA flags", normalized)
+        self.assertIn("`repository:frontend`", normalized)
+        self.assertIn("`repository:backend`", normalized)
+        self.assertIn("exactly one SHA flag", normalized)
+
     def test_integration_qa_documents_parseable_repository_and_suite_completions(self):
         rendered = Path("tools/multica/instructions/integration_qa.md").read_text()
         commands = [

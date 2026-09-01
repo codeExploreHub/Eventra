@@ -2,11 +2,13 @@
 
 ## Ownership and inputs
 
-Own independent review of the exact submitted commit SHA or SHA pair. Require
-the child Issue, acceptance criteria, repository boundary, changed paths,
-interface contract when relevant, and exact SHA for each affected repository.
-Ask the Delivery Lead for clarification before review if scope, expected
-behavior, or the review target is ambiguous.
+Own independent review of the exact submitted commit SHA for one
+repository-scoped Review child. Require the child Issue, acceptance criteria,
+repository boundary, changed paths, interface contract when relevant, and the
+one exact SHA handed off for that repository. Verify the frontend/control
+Project child targets `repository:frontend`, while the backend Project child
+targets `repository:backend`. Ask the Delivery Lead for clarification before
+review if scope, expected behavior, or the review target is ambiguous.
 
 ## Exact-SHA worktree preparation
 
@@ -47,6 +49,7 @@ traversal.
 
 ```text
 python3 -B -m tools.multica.workflow finish-phase PRO-N --kind review --result pass --attempt N --frontend-sha FULL_SHA --evidence-comment COMMENT_UUID
+python3 -B -m tools.multica.workflow finish-phase PRO-N --kind review --result pass --attempt N --backend-sha FULL_SHA --evidence-comment COMMENT_UUID
 ```
 
 PASS declares neither `--evidence-comment-url` nor
@@ -56,12 +59,14 @@ PASS declares neither `--evidence-comment-url` nor
 
 ```text
 python3 -B -m tools.multica.workflow finish-phase PRO-N --kind review --result fail --attempt N --frontend-sha FULL_SHA --evidence-comment COMMENT_UUID --evidence-comment-url HTTPS_URL --responsible-repository frontend
+python3 -B -m tools.multica.workflow finish-phase PRO-N --kind review --result fail --attempt N --backend-sha FULL_SHA --evidence-comment COMMENT_UUID --evidence-comment-url HTTPS_URL --responsible-repository backend
 ```
 
-Use `--backend-sha`, or both SHA flags, for the exact scope. Omit
-only the unaffected SHA flag. Every FAIL or BLOCKED uses a canonical HTTPS URL
-and at least one `--responsible-repository` legal owner (repeat the flag for
-every affected owner). Here
+Every Review completion uses exactly one SHA flag matching its child target:
+`--frontend-sha` for `repository:frontend`, or `--backend-sha` for
+`repository:backend`. Never combine frontend and backend SHA flags in a Review
+completion. Every FAIL or BLOCKED uses a canonical HTTPS URL and names that
+same repository with one `--responsible-repository`. Here
 `done means phase execution finished`; `pass|fail|blocked` is the verdict. A defect is `done`
 plus `fail`, not an Issue left `in_review`. Verify terminal state and metadata.
 
