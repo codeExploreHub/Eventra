@@ -15,7 +15,7 @@ from dataclasses import dataclass, replace
 from typing import Literal, Sequence
 from urllib.parse import urlsplit
 
-from .contracts import parse_agent_list
+from .contracts import parse_agent_list, parse_squad_list
 from .issue_contracts import (
     ACTIVE_RUN_STATUSES,
     parse_authorizing_comment,
@@ -76,6 +76,7 @@ ASSIGNMENT_AGENT_NAMES = {
     "integration_qa": "Eventra Integration QA",
     "independent_reviewer": "Eventra Independent Reviewer",
 }
+DELIVERY_SQUAD_NAME = "Eventra Local Delivery"
 REPAIR_PROVENANCE_KEYS = frozenset(
     {
         "eventra.repair.creation_action",
@@ -246,6 +247,9 @@ class WorkflowSnapshot:
     project_ids: tuple[str, ...] = ()
     parent_project_id: str = ""
     agent_ids: tuple[tuple[str, str], ...] = ()
+    parent_assignee_id: str = ""
+    parent_assignee_type: str = ""
+    delivery_squad_id: str = ""
 
     def first_terminal_run_needing_transition(
         self,
@@ -1516,6 +1520,9 @@ def _recovery_authority_identity(
         snapshot.parent_issue_id,
         snapshot.parent_identifier,
         snapshot.parent_project_id,
+        snapshot.parent_assignee_id,
+        snapshot.parent_assignee_type,
+        snapshot.delivery_squad_id,
         parent.classification,
         parent.attempt,
         parent.last_action,
@@ -1558,6 +1565,16 @@ def _recovery_authority_identity(
             )
         ),
     )
+
+
+def _parent_assignment_problem(snapshot: WorkflowSnapshot) -> str | None:
+    if (
+        not _is_uuid(snapshot.delivery_squad_id)
+        or snapshot.parent_assignee_type != "squad"
+        or snapshot.parent_assignee_id != snapshot.delivery_squad_id
+    ):
+        return "parent Delivery squad authority is conflicting"
+    return None
 
 
 def _implementation_assignment_problem(
@@ -1854,6 +1871,9 @@ def decide_recovery(snapshot: WorkflowSnapshot) -> RecoveryDecision:
             None,
             "authoritative current Stage membership is malformed",
         )
+    parent_assignment_problem = _parent_assignment_problem(snapshot)
+    if parent_assignment_problem is not None:
+        return RecoveryDecision("noop", None, parent_assignment_problem)
     stalled_child = snapshot.first_terminal_run_needing_transition()
     if stalled_child is not None:
         assignment_problem = _current_assignment_provenance_problem(snapshot)
@@ -3607,6 +3627,7 @@ def load_workflow_snapshot(
         raise RuntimeError("unsupported workflow metadata")
     decoded_parent: dict[str, object] | None = None
     assignment_agent_ids: tuple[tuple[str, str], ...] = ()
+    delivery_squad_id = ""
     if workflow_version == "2":
         try:
             decoded_parent = _parent_metadata(parent_metadata)
@@ -3625,6 +3646,16 @@ def load_workflow_snapshot(
                 resolved[role] = matches[0]
             if len(resolved) == len(ASSIGNMENT_AGENT_NAMES):
                 assignment_agent_ids = tuple(sorted(resolved.items()))
+            squad_records = parse_squad_list(
+                runner.run(["squad", "list", "--output", "json"])
+            )
+            squad_matches = [
+                item["id"]
+                for item in squad_records
+                if item["name"] == DELIVERY_SQUAD_NAME
+            ]
+            if len(squad_matches) == 1 and _is_uuid(squad_matches[0]):
+                delivery_squad_id = squad_matches[0]
     children = parse_issue_children(
         runner.run(["issue", "children", parent_key, "--output", "json"]),
         str(parent["id"]),
@@ -3697,6 +3728,7 @@ def load_workflow_snapshot(
         )
         or decoded_parent is None
         or (bool(project_ids) and not assignment_agent_ids)
+        or (bool(project_ids) and not delivery_squad_id)
         or any(
             child.phase is None
             for child in snapshots
@@ -3807,6 +3839,13 @@ def load_workflow_snapshot(
         project_ids=tuple(project_ids),
         parent_project_id=str(parent["project_id"]),
         agent_ids=assignment_agent_ids,
+        parent_assignee_id=(
+            str(parent["assignee_id"])
+            if parent["assignee_id"] is not None
+            else ""
+        ),
+        parent_assignee_type=str(parent["assignee_type"]),
+        delivery_squad_id=delivery_squad_id,
     )
 
 

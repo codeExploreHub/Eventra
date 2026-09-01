@@ -51,6 +51,8 @@ BACKEND_PROJECT_ID = "00000000-0000-4000-8000-000000000013"
 REVIEWER_ID = "00000000-0000-4000-8000-000000000014"
 BACKEND_AGENT_ID = "00000000-0000-4000-8000-000000000016"
 QA_ID = "00000000-0000-4000-8000-000000000015"
+SQUAD_ID = "00000000-0000-4000-8000-000000000017"
+FOREIGN_SQUAD_ID = "00000000-0000-4000-8000-000000000018"
 COMMENT_ID = "01a00000-0000-7000-8000-000000000010"
 FRONTEND_SHA = "a" * 40
 FRONTEND_PR = "https://github.com/codeExploreHub/Eventra/pull/6"
@@ -236,6 +238,7 @@ class FakeSnapshotFinishRunner:
             parent_issue_id=None,
             stage=None,
             status=snapshot.parent_status,
+            assignee_id=SQUAD_ID,
             assignee_type="squad",
         )
         self.issues = {}
@@ -3516,6 +3519,9 @@ def stalled_workflow(**overrides):
         ("independent_reviewer", REVIEWER_ID),
         ("integration_qa", QA_ID),
     )
+    values["parent_assignee_id"] = SQUAD_ID
+    values["parent_assignee_type"] = "squad"
+    values["delivery_squad_id"] = SQUAD_ID
     snapshot = WorkflowSnapshot(**values)
     object.__setattr__(snapshot, "current_stage", current_stage)
     return snapshot
@@ -3836,6 +3842,7 @@ class FakeWatchRunner:
             parent_issue_id=None,
             stage=None,
             status="in_progress",
+            assignee_id=SQUAD_ID,
             assignee_type="squad",
             updated_at="2026-08-25T08:33:49Z",
         )
@@ -3881,7 +3888,11 @@ class FakeWatchRunner:
         self.post_rerun_child_metadata = None
         self.post_rerun_child_detail = None
         self.post_rerun_parent_detail = None
+        self.post_rerun_squads = None
         self.post_parent_rerun_child_metadata = None
+        self.squads = [
+            {"id": SQUAD_ID, "name": "Eventra Local Delivery"},
+        ]
         self.github = FakeSnapshotGitHubRunner((frontend_pr(),))
 
     def run(self, args, *, stdin_json=None):
@@ -3894,6 +3905,8 @@ class FakeWatchRunner:
                 {"id": QA_ID, "name": "Eventra Integration QA"},
                 {"id": REVIEWER_ID, "name": "Eventra Independent Reviewer"},
             ]
+        if call == ("squad", "list", "--output", "json"):
+            return copy.deepcopy(self.squads)
         if call[:2] == ("issue", "list"):
             flags = dict(zip(call[2::2], call[3::2]))
             self._assert_list_flags(flags)
@@ -3988,6 +4001,8 @@ class FakeWatchRunner:
                 self.child.update(copy.deepcopy(self.post_rerun_child_detail))
             if self.post_rerun_parent_detail is not None:
                 self.parent.update(copy.deepcopy(self.post_rerun_parent_detail))
+            if self.post_rerun_squads is not None:
+                self.squads = copy.deepcopy(self.post_rerun_squads)
             if self.post_parent_rerun_child_metadata is not None:
                 child_key, child_metadata = self.post_parent_rerun_child_metadata
                 self.metadata[child_key] = copy.deepcopy(child_metadata)
@@ -4400,6 +4415,61 @@ class WatchWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "recovery verification failed"):
             self._watch(runner, apply=True)
 
+    def test_watcher_parent_rerun_requires_exact_delivery_squad_assignment(self):
+        corruptions = {
+            "agent assignment": lambda runner: runner.parent.update(
+                {"assignee_id": AGENT_ID, "assignee_type": "agent"}
+            ),
+            "foreign squad": lambda runner: runner.parent.update(
+                {"assignee_id": FOREIGN_SQUAD_ID, "assignee_type": "squad"}
+            ),
+            "missing squad": lambda runner: setattr(runner, "squads", []),
+            "duplicate squad": lambda runner: setattr(
+                runner,
+                "squads",
+                [
+                    {"id": SQUAD_ID, "name": "Eventra Local Delivery"},
+                    {
+                        "id": FOREIGN_SQUAD_ID,
+                        "name": "Eventra Local Delivery",
+                    },
+                ],
+            ),
+        }
+        for label, corrupt in corruptions.items():
+            with self.subTest(label=label):
+                runner = self._terminal_implementation_runner()
+                corrupt(runner)
+
+                result = self._watch(runner, apply=True)
+
+                self.assertEqual(result, WatchResult(1, 0, 0, "noop"))
+                self.assertFalse(
+                    any(
+                        call[:3] == ("issue", "rerun", "PRO-35")
+                        for call in runner.calls
+                    )
+                )
+
+    def test_watcher_parent_rerun_rechecks_delivery_squad_after_effect(self):
+        corruptions = (
+            ({"assignee_id": AGENT_ID, "assignee_type": "agent"}, None),
+            (
+                None,
+                [{"id": FOREIGN_SQUAD_ID, "name": "Eventra Local Delivery"}],
+            ),
+        )
+        for parent_detail, squads in corruptions:
+            with self.subTest(parent_detail=parent_detail, squads=squads):
+                runner = self._terminal_implementation_runner()
+                runner.post_rerun_parent_detail = parent_detail
+                runner.post_rerun_squads = squads
+
+                with self.assertRaisesRegex(
+                    RuntimeError, "recovery verification failed"
+                ):
+                    self._watch(runner, apply=True)
+
     def test_watcher_rejects_current_child_without_assignment_provenance(self):
         runner = FakeWatchRunner()
         runner.metadata["PRO-36"] = {}
@@ -4410,6 +4480,58 @@ class WatchWorkflowTests(unittest.TestCase):
         self.assertFalse(
             any(call[:2] == ("issue", "rerun") for call in runner.calls)
         )
+
+    def test_watcher_child_rerun_requires_exact_delivery_squad_assignment(self):
+        corruptions = {
+            "agent assignment": lambda runner: runner.parent.update(
+                {"assignee_id": AGENT_ID, "assignee_type": "agent"}
+            ),
+            "foreign squad": lambda runner: runner.parent.update(
+                {"assignee_id": FOREIGN_SQUAD_ID, "assignee_type": "squad"}
+            ),
+            "missing squad": lambda runner: setattr(runner, "squads", []),
+            "duplicate squad": lambda runner: setattr(
+                runner,
+                "squads",
+                [
+                    {"id": SQUAD_ID, "name": "Eventra Local Delivery"},
+                    {
+                        "id": FOREIGN_SQUAD_ID,
+                        "name": "Eventra Local Delivery",
+                    },
+                ],
+            ),
+        }
+        for label, corrupt in corruptions.items():
+            with self.subTest(label=label):
+                runner = FakeWatchRunner()
+                corrupt(runner)
+
+                result = self._watch(runner, apply=True)
+
+                self.assertEqual(result, WatchResult(1, 0, 0, "noop"))
+                self.assertFalse(
+                    any(call[:2] == ("issue", "rerun") for call in runner.calls)
+                )
+
+    def test_watcher_child_rerun_rechecks_delivery_squad_after_effect(self):
+        corruptions = (
+            ({"assignee_id": AGENT_ID, "assignee_type": "agent"}, None),
+            (
+                None,
+                [{"id": FOREIGN_SQUAD_ID, "name": "Eventra Local Delivery"}],
+            ),
+        )
+        for parent_detail, squads in corruptions:
+            with self.subTest(parent_detail=parent_detail, squads=squads):
+                runner = FakeWatchRunner()
+                runner.post_rerun_parent_detail = parent_detail
+                runner.post_rerun_squads = squads
+
+                with self.assertRaisesRegex(
+                    RuntimeError, "recovery verification failed"
+                ):
+                    self._watch(runner, apply=True)
 
     def test_watcher_rejects_typed_assignment_provenance_drift(self):
         corruptions = {
