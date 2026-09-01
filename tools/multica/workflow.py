@@ -220,6 +220,7 @@ class ChildRunSnapshot:
     latest_run_activity_at: str | None
     has_active_run: bool
     has_phase_completion: bool
+    phase: PhaseSnapshot | None = None
 
 
 @dataclass(frozen=True)
@@ -234,6 +235,9 @@ class WorkflowSnapshot:
     children: tuple[ChildRunSnapshot, ...]
     workflow_version: int = 2
     current_stage: int | None = None
+    parent: ParentSnapshot | None = None
+    project_ids: tuple[str, ...] = ()
+    parent_project_id: str = ""
 
     def first_terminal_run_needing_transition(
         self,
@@ -781,6 +785,7 @@ def _strict_gate_identity_matches(
             or item.assignee_type != "agent"
             or not _is_uuid(item.assignee_id)
             or not _is_uuid(item.project_id)
+            or item.pr_url
         ):
             return False
         if item.kind in {"review", "qa"}:
@@ -1461,6 +1466,255 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
     )
 
 
+def _phase_assignment_identity(value: PhaseSnapshot) -> tuple[object, ...]:
+    """Return only immutable assignment/provenance fields."""
+
+    return (
+        value.issue_key,
+        value.stage,
+        value.kind,
+        value.result,
+        value.attempt,
+        value.frontend_sha,
+        value.backend_sha,
+        value.project_id,
+        value.creation_action,
+        value.phase_target,
+        value.phase_role,
+        value.evidence_comment,
+        value.responsible_repositories,
+        value.evidence_comment_url,
+        value.failure_bundle_digest,
+        value.failure_evidence_uuids,
+        value.authorizing_comment_uuid,
+        value.repair_repository,
+        value.repair_pull_request,
+        value.repair_round,
+        value.repair_source_candidates,
+        value.pr_url,
+        value.assignee_id,
+        value.assignee_type,
+        value.workflow_version,
+    )
+
+
+def _recovery_authority_identity(
+    snapshot: WorkflowSnapshot,
+) -> tuple[object, ...] | None:
+    parent = snapshot.parent
+    if parent is None:
+        return None
+    return (
+        snapshot.parent_issue_id,
+        snapshot.parent_identifier,
+        snapshot.parent_project_id,
+        parent.classification,
+        parent.attempt,
+        parent.last_action,
+        parent.merge_state,
+        parent.candidate_frontend_sha,
+        parent.candidate_backend_sha,
+        parent.workflow_version,
+        parent.parent_status,
+        parent.next_stage,
+        parent.authorization_comment_uuid,
+        parent.consumed_authorization_uuid,
+        (
+            None
+            if parent.repair_reservation is None
+            else _canonical_json(parent.repair_reservation)
+        ),
+        snapshot.project_ids,
+        tuple(
+            sorted(
+                (
+                    item.repository,
+                    item.url,
+                    item.head_sha,
+                    item.state,
+                )
+                for item in parent.pull_requests
+            )
+        ),
+        tuple(
+            sorted(
+                (
+                    child.identifier,
+                    child.stage,
+                    None
+                    if child.phase is None
+                    else _phase_assignment_identity(child.phase),
+                )
+                for child in snapshot.children
+            )
+        ),
+    )
+
+
+def _implementation_assignment_problem(
+    snapshot: WorkflowSnapshot,
+    parent: ParentSnapshot,
+    phases: tuple[PhaseSnapshot, ...],
+) -> str | None:
+    expected_repositories = _expected_repositories(parent)
+    expected_action = _action_key(
+        replace(
+            parent,
+            next_stage=parent.next_stage - 1,
+            last_action=None,
+        ),
+        "create_implementation_stage",
+        parent.attempt,
+    )
+    expected_projects = (
+        dict(zip(("frontend", "backend"), snapshot.project_ids, strict=True))
+        if len(snapshot.project_ids) == 2
+        else {}
+    )
+    observed: dict[str, PhaseSnapshot] = {}
+    assignees: set[str] = set()
+    for phase in phases:
+        repositories = tuple(
+            repository
+            for repository, sha in (
+                ("frontend", phase.frontend_sha),
+                ("backend", phase.backend_sha),
+            )
+            if sha is not None
+        )
+        if len(repositories) != 1:
+            return "current implementation assignment candidate scope is malformed"
+        repository = repositories[0]
+        if repository in observed:
+            return "current implementation assignment membership is conflicting"
+        expected_sha = _candidate_sha_map(parent).get(repository)
+        if (
+            phase.workflow_version != 2
+            or phase.kind != "implementation"
+            or phase.stage != parent.next_stage - 1
+            or phase.attempt != parent.attempt
+            or phase.creation_action != expected_action
+            or parent.last_action != expected_action
+            or phase.phase_target != f"repository:{repository}"
+            or phase.phase_role != f"{repository}_engineer"
+            or phase.assignee_type != "agent"
+            or not _is_uuid(phase.assignee_id)
+            or not _is_uuid(phase.project_id)
+            or (
+                expected_projects
+                and phase.project_id != expected_projects[repository]
+            )
+            or phase.frontend_sha != (
+                expected_sha if repository == "frontend" else None
+            )
+            or phase.backend_sha != (
+                expected_sha if repository == "backend" else None
+            )
+            or not phase.pr_url
+            or _repository_for_pr(phase.pr_url) != repository
+            or phase.failure_bundle_digest
+            or phase.failure_evidence_uuids
+            or phase.authorizing_comment_uuid
+            or phase.repair_repository
+            or phase.repair_pull_request
+            or phase.repair_source_candidates
+        ):
+            return "current implementation assignment provenance is conflicting"
+        observed[repository] = phase
+        assignees.add(phase.assignee_id)
+    if set(observed) != expected_repositories or len(assignees) != len(observed):
+        return "current implementation assignment membership is incomplete"
+    if _assignment_pull_request_problem(parent) is not None:
+        return "current implementation pull-request authority is conflicting"
+    return None
+
+
+def _gate_assignment_problem(
+    snapshot: WorkflowSnapshot,
+    parent: ParentSnapshot,
+    phases: tuple[PhaseSnapshot, ...],
+) -> str | None:
+    if not _gate_coverage(parent, phases, strict_identity=True):
+        return "current Gate assignment provenance is conflicting"
+    if _assignment_pull_request_problem(parent) is not None:
+        return "current Gate pull-request authority is conflicting"
+    if len(snapshot.project_ids) == 2:
+        projects = dict(
+            zip(("frontend", "backend"), snapshot.project_ids, strict=True)
+        )
+        for phase in phases:
+            repositories = tuple(
+                repository
+                for repository, sha in (
+                    ("frontend", phase.frontend_sha),
+                    ("backend", phase.backend_sha),
+                )
+                if sha is not None
+            )
+            expected_project = (
+                projects["frontend"]
+                if phase.kind == "integration_qa"
+                else projects[repositories[0]]
+            )
+            if phase.project_id != expected_project:
+                return "current Gate assignment project provenance is conflicting"
+    return None
+
+
+def _assignment_pull_request_problem(snapshot: ParentSnapshot) -> str | None:
+    expected = _candidate_sha_map(snapshot)
+    observed = {
+        item.repository: item
+        for item in snapshot.pull_requests
+    }
+    if len(observed) != len(snapshot.pull_requests) or set(observed) != set(expected):
+        return "current managed pull-request identity set is incomplete"
+    if any(
+        item.head_sha != expected[repository]
+        or item.state != "open"
+        for repository, item in observed.items()
+    ):
+        return "current managed pull-request state is conflicting"
+    return None
+
+
+def _current_assignment_provenance_problem(
+    snapshot: WorkflowSnapshot,
+) -> str | None:
+    parent = snapshot.parent
+    if parent is None or parent.workflow_version != 2:
+        return "current assignment lacks authoritative parent provenance"
+    current_children = tuple(
+        child
+        for child in snapshot.children
+        if child.stage == snapshot.current_stage
+    )
+    if not current_children or any(child.phase is None for child in current_children):
+        return "current assignment metadata is incomplete"
+    phases = tuple(
+        child.phase for child in current_children if child.phase is not None
+    )
+    if (
+        len(phases) != len(current_children)
+        or any(
+            phase.issue_key != child.identifier
+            or phase.stage != child.stage
+            or phase.workflow_version != 2
+            for child, phase in zip(current_children, phases, strict=True)
+        )
+        or any(phase.attempt != parent.attempt for phase in phases)
+    ):
+        return "current assignment child identity is conflicting"
+    kinds = {phase.kind for phase in phases}
+    if kinds == {"implementation"}:
+        return _implementation_assignment_problem(snapshot, parent, phases)
+    if kinds <= {"review", "qa", "integration_qa"}:
+        return _gate_assignment_problem(snapshot, parent, phases)
+    if kinds == {"repair"}:
+        return _current_repair_provenance_problem(parent, phases)
+    return "current assignment phase membership is malformed"
+
+
 def decide_recovery(snapshot: WorkflowSnapshot) -> RecoveryDecision:
     """Choose at most one safe stalled-work rerun."""
 
@@ -1502,6 +1756,9 @@ def decide_recovery(snapshot: WorkflowSnapshot) -> RecoveryDecision:
         )
     stalled_child = snapshot.first_terminal_run_needing_transition()
     if stalled_child is not None:
+        assignment_problem = _current_assignment_provenance_problem(snapshot)
+        if assignment_problem is not None:
+            return RecoveryDecision("noop", None, assignment_problem)
         return RecoveryDecision(
             "rerun_child",
             stalled_child.identifier,
@@ -1521,6 +1778,9 @@ def decide_recovery(snapshot: WorkflowSnapshot) -> RecoveryDecision:
         None,
     )
     if unstarted_child is not None:
+        assignment_problem = _current_assignment_provenance_problem(snapshot)
+        if assignment_problem is not None:
+            return RecoveryDecision("noop", None, assignment_problem)
         return RecoveryDecision(
             "rerun_child",
             unstarted_child.identifier,
@@ -1544,11 +1804,17 @@ def decide_recovery(snapshot: WorkflowSnapshot) -> RecoveryDecision:
 def recover_once(runner: MulticaRunner, snapshot_loader) -> RecoveryResult:
     """Reread one workflow, rerun once, and require a fresh active task."""
 
-    initial = decide_recovery(snapshot_loader())
+    initial_snapshot = snapshot_loader()
+    initial = decide_recovery(initial_snapshot)
     if initial.kind == "noop":
         return RecoveryResult(initial, 0)
-    fresh = decide_recovery(snapshot_loader())
-    if fresh != initial:
+    fresh_snapshot = snapshot_loader()
+    fresh = decide_recovery(fresh_snapshot)
+    if (
+        fresh != initial
+        or _recovery_authority_identity(fresh_snapshot)
+        != _recovery_authority_identity(initial_snapshot)
+    ):
         return RecoveryResult(
             RecoveryDecision("noop", None, "workflow changed before recovery"),
             0,
@@ -1583,6 +1849,15 @@ def recover_once(runner: MulticaRunner, snapshot_loader) -> RecoveryResult:
     if not any(
         item["id"] not in before_ids and item["status"] in ACTIVE_RUN_STATUSES
         for item in after
+    ):
+        raise RuntimeError("recovery verification failed")
+    try:
+        post_snapshot = snapshot_loader()
+    except (RuntimeError, TypeError, ValueError):
+        raise RuntimeError("recovery verification failed") from None
+    if (
+        _recovery_authority_identity(post_snapshot)
+        != _recovery_authority_identity(fresh_snapshot)
     ):
         raise RuntimeError("recovery verification failed")
     return RecoveryResult(fresh, 1)
@@ -3207,6 +3482,8 @@ def _is_human_wait(issue: dict[str, object]) -> bool:
 def load_workflow_snapshot(
     runner: MulticaRunner,
     parent_key: str,
+    project_ids: Sequence[str] = (),
+    github: GitHubRunner | None = None,
 ) -> WorkflowSnapshot:
     """Read one complete parent/child/run view from authoritative CLI reads."""
 
@@ -3222,6 +3499,12 @@ def load_workflow_snapshot(
     workflow_version = parent_metadata.get("eventra.workflow.version")
     if workflow_version not in {"1", "2"}:
         raise RuntimeError("unsupported workflow metadata")
+    decoded_parent: dict[str, object] | None = None
+    if workflow_version == "2":
+        try:
+            decoded_parent = _parent_metadata(parent_metadata)
+        except RuntimeError:
+            decoded_parent = None
     children = parse_issue_children(
         runner.run(["issue", "children", parent_key, "--output", "json"]),
         str(parent["id"]),
@@ -3231,6 +3514,7 @@ def load_workflow_snapshot(
         str(parent["id"]),
     )
     snapshots: list[ChildRunSnapshot] = []
+    phases: list[PhaseSnapshot] = []
     has_human_wait = _is_human_wait(parent)
     for child in children:
         child_key = str(child["identifier"])
@@ -3246,6 +3530,14 @@ def load_workflow_snapshot(
         latest = max(runs, key=lambda item: item["activity_at"]) if runs else None
         has_active = any(item["status"] in ACTIVE_RUN_STATUSES for item in runs)
         has_human_wait = has_human_wait or _is_human_wait(child)
+        phase_value = None
+        if child["stage"] is not None and workflow_version == "2":
+            try:
+                phase_value = _phase_snapshot(child, metadata)
+            except (RuntimeError, TypeError, ValueError):
+                phase_value = None
+            if phase_value is not None:
+                phases.append(phase_value)
         snapshots.append(
             ChildRunSnapshot(
                 issue_id=str(child["id"]),
@@ -3258,6 +3550,7 @@ def load_workflow_snapshot(
                 ),
                 has_active_run=has_active,
                 has_phase_completion=_has_phase_completion(metadata),
+                phase=phase_value,
             )
         )
 
@@ -3278,6 +3571,16 @@ def load_workflow_snapshot(
         current_stage is None
         or any(int(item["stage"]) > current_stage for item in staged)
         or (bool(staged) and not current_stage_children)
+        or (
+            bool(project_ids)
+            and str(parent["project_id"]) not in set(project_ids)
+        )
+        or decoded_parent is None
+        or any(
+            child.phase is None
+            for child in snapshots
+            if child.stage == current_stage
+        )
     )
     latest_stage_finished = bool(current_stage_children) and all(
         item["status"] == "done" for item in current_stage_children
@@ -3292,6 +3595,78 @@ def load_workflow_snapshot(
     parent_active = any(
         item["status"] in ACTIVE_RUN_STATUSES for item in parent_runs
     )
+    parent_snapshot = None
+    if workflow_version == "2" and decoded_parent is not None:
+        try:
+            candidates = {
+                repository: sha
+                for repository, sha in (
+                    ("frontend", decoded_parent["frontend_sha"]),
+                    ("backend", decoded_parent["backend_sha"]),
+                )
+                if sha is not None
+            }
+            pr_urls: dict[str, tuple[int, str]] = {}
+            for phase_value in phases:
+                if not phase_value.pr_url:
+                    continue
+                repository = _repository_for_pr(phase_value.pr_url)
+                candidate = (phase_value.stage, phase_value.pr_url)
+                previous = pr_urls.get(repository)
+                if (
+                    previous is not None
+                    and previous[0] == candidate[0]
+                    and previous[1] != candidate[1]
+                ):
+                    raise RuntimeError("conflicting phase pull requests")
+                if previous is None or candidate[0] > previous[0]:
+                    pr_urls[repository] = candidate
+            if github is None:
+                pull_requests = ()
+            else:
+                pull_requests = tuple(
+                    _parse_pull_request(
+                        github.run(
+                            [
+                                "pr", "view", url,
+                                "--json",
+                                (
+                                    "url,headRefOid,state,mergeable,"
+                                    "mergeStateStatus,statusCheckRollup"
+                                ),
+                            ]
+                        ),
+                        url,
+                        repository,
+                    )
+                    for repository, (_, url) in sorted(pr_urls.items())
+                    if repository in candidates
+                )
+            parent_snapshot = ParentSnapshot(
+                identifier=parent_key,
+                classification=str(decoded_parent["classification"]),
+                attempt=int(decoded_parent["attempt"]),
+                last_action=decoded_parent["last_action"],
+                merge_state=str(decoded_parent["merge_state"]),
+                candidate_frontend_sha=decoded_parent["frontend_sha"],
+                candidate_backend_sha=decoded_parent["backend_sha"],
+                children=tuple(phases),
+                pull_requests=pull_requests,
+                workflow_version=2,
+                parent_status=str(parent["status"]),
+                next_stage=int(decoded_parent["next_stage"]),
+                authorization_comment_uuid=str(
+                    decoded_parent["authorization_comment_uuid"]
+                ),
+                consumed_authorization_uuid=str(
+                    decoded_parent["consumed_authorization_uuid"]
+                ),
+                repair_reservation=decoded_parent["repair_reservation"],
+                parent_id=str(parent["id"]),
+            )
+        except (KeyError, RuntimeError, TypeError, ValueError):
+            parent_snapshot = None
+            malformed_current_stage = True
     return WorkflowSnapshot(
         parent_issue_id=str(parent["id"]),
         parent_identifier=parent_key,
@@ -3307,6 +3682,9 @@ def load_workflow_snapshot(
         children=tuple(snapshots),
         workflow_version=int(workflow_version),
         current_stage=current_stage,
+        parent=parent_snapshot,
+        project_ids=tuple(project_ids),
+        parent_project_id=str(parent["project_id"]),
     )
 
 
@@ -3380,16 +3758,25 @@ def watch_projects(
     project_ids: Sequence[str],
     *,
     apply: bool,
+    github: GitHubRunner | None = None,
 ) -> WatchResult:
     """Scan only the configured projects and recover at most one workflow."""
 
     if len(project_ids) != 2 or len(set(project_ids)) != 2:
         raise ValueError("watcher requires two distinct project identifiers")
+    authoritative_github = GitHubRunner() if github is None else github
     parent_keys = _list_workflow_parents(runner, project_ids)
     candidates: list[tuple[str, RecoveryDecision]] = []
     migrations: list[tuple[str, RecoveryDecision]] = []
     for parent_key in parent_keys:
-        decision = decide_recovery(load_workflow_snapshot(runner, parent_key))
+        decision = decide_recovery(
+            load_workflow_snapshot(
+                runner,
+                parent_key,
+                project_ids,
+                authoritative_github,
+            )
+        )
         if decision.reason == "version 1 workflow requires explicit migration":
             migrations.append((parent_key, decision))
         elif decision.kind != "noop":
@@ -3411,7 +3798,12 @@ def watch_projects(
         )
     recovered = recover_once(
         runner,
-        lambda: load_workflow_snapshot(runner, first_parent),
+        lambda: load_workflow_snapshot(
+            runner,
+            first_parent,
+            project_ids,
+            authoritative_github,
+        ),
     )
     return WatchResult(
         len(parent_keys),

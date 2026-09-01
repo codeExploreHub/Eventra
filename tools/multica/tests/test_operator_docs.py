@@ -99,6 +99,14 @@ class OperatorDocsTests(unittest.TestCase):
             backend,
         )
         self.assertIn("cannot create a FailureBundle or dispatch repair", watcher)
+        self.assertIn(
+            "complete immutable v2 assignment provenance",
+            watcher,
+        )
+        self.assertIn(
+            "never changes parent metadata, status, Stage, or action history",
+            watcher,
+        )
 
         forbidden = (
             "Route failures to the owning implementer",

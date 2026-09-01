@@ -3430,6 +3430,25 @@ class ParentCompletionTests(unittest.TestCase):
 
 
 def stalled_workflow(**overrides):
+    current_stage = overrides.pop("current_stage", 1)
+    creation_action = (
+        "2:PRO-35:create_implementation_stage:0:frontend:"
+        + FRONTEND_SHA
+        + f":-:next-stage:{current_stage}"
+    )
+    assignment = phase(
+        "PRO-36",
+        current_stage,
+        "implementation",
+        result=None,
+        status="in_review",
+        project_id=PROJECT_ID,
+        pr_url=FRONTEND_PR,
+        assignee_id=AGENT_ID,
+        creation_action=creation_action,
+        phase_target="repository:frontend",
+        phase_role="frontend_engineer",
+    )
     child = ChildRunSnapshot(
         issue_id=ISSUE_ID,
         identifier="PRO-36",
@@ -3439,6 +3458,7 @@ def stalled_workflow(**overrides):
         latest_run_activity_at="2026-08-25T08:50:28Z",
         has_active_run=False,
         has_phase_completion=False,
+        phase=assignment,
     )
     values = {
         "parent_issue_id": PARENT_ID,
@@ -3450,8 +3470,45 @@ def stalled_workflow(**overrides):
         "active_parent_has_no_executable_successor": False,
         "children": (child,),
     }
-    current_stage = overrides.pop("current_stage", 1)
     values.update(overrides)
+    children = tuple(
+        child_value
+        if (
+            child_value.phase is not None
+            and child_value.phase.issue_key == child_value.identifier
+            and child_value.phase.stage == child_value.stage
+        )
+        else replace(
+            child_value,
+            phase=replace(
+                assignment,
+                issue_key=child_value.identifier,
+                stage=child_value.stage,
+                status=child_value.issue_status,
+            ),
+        )
+        for child_value in values["children"]
+    )
+    parent = ParentSnapshot(
+        identifier="PRO-35",
+        classification="frontend-only",
+        attempt=0,
+        last_action=creation_action,
+        merge_state="not_ready",
+        candidate_frontend_sha=FRONTEND_SHA,
+        candidate_backend_sha=None,
+        children=tuple(
+            child_value.phase
+            for child_value in children
+            if child_value.phase is not None
+        ),
+        pull_requests=(frontend_pr(),),
+        next_stage=current_stage + 1,
+        parent_id=PARENT_ID,
+    )
+    values["children"] = children
+    values["parent"] = parent
+    values["project_ids"] = (PROJECT_ID, BACKEND_PROJECT_ID)
     snapshot = WorkflowSnapshot(**values)
     object.__setattr__(snapshot, "current_stage", current_stage)
     return snapshot
@@ -3529,7 +3586,7 @@ class RecoveryDecisionTests(unittest.TestCase):
             "version 1 workflow requires explicit migration",
         )
 
-    def test_completed_child_run_left_in_review_recovers_oldest_child(self):
+    def test_duplicate_current_assignment_is_not_recovered_as_oldest_child(self):
         newer = ChildRunSnapshot(
             issue_id="01a00000-0000-7000-8000-000000000020",
             identifier="PRO-40",
@@ -3543,14 +3600,9 @@ class RecoveryDecisionTests(unittest.TestCase):
         snapshot = stalled_workflow(
             children=stalled_workflow().children + (newer,)
         )
-        self.assertEqual(
-            decide_recovery(snapshot),
-            RecoveryDecision(
-                "rerun_child",
-                "PRO-36",
-                "terminal run without terminal phase transition",
-            ),
-        )
+        decision = decide_recovery(snapshot)
+        self.assertEqual(decision.kind, "noop")
+        self.assertIn("membership", decision.reason)
 
     def test_finished_stage_without_successor_recovers_parent_once(self):
         decision = decide_recovery(
@@ -3661,7 +3713,11 @@ class FakeRecoveryRunner:
 class RecoveryMutationTests(unittest.TestCase):
     def test_recover_once_rereads_then_verifies_new_active_task(self):
         runner = FakeRecoveryRunner()
-        snapshots = [stalled_workflow(), stalled_workflow()]
+        snapshots = [
+            stalled_workflow(),
+            stalled_workflow(),
+            stalled_workflow(),
+        ]
 
         result = recover_once(runner, lambda: snapshots.pop(0))
 
@@ -3710,9 +3766,14 @@ class RecoveryMutationTests(unittest.TestCase):
 
 
 class FakeWatchRunner:
-    PROJECTS = (PROJECT_ID, "00000000-0000-4000-8000-000000000040")
+    PROJECTS = (PROJECT_ID, BACKEND_PROJECT_ID)
 
     def __init__(self):
+        implementation_action = (
+            "2:PRO-35:create_implementation_stage:0:frontend:"
+            + FRONTEND_SHA
+            + ":-:next-stage:1"
+        )
         self.parent = raw_issue(
             id=PARENT_ID,
             identifier="PRO-35",
@@ -3723,12 +3784,28 @@ class FakeWatchRunner:
             updated_at="2026-08-25T08:33:49Z",
         )
         self.child = raw_issue()
+        self.children = [self.child]
         self.metadata = {
             "PRO-35": {
                 "eventra.workflow.version": "2",
+                "eventra.workflow.classification": "frontend-only",
                 "eventra.workflow.next_stage": "2",
+                "eventra.workflow.attempt": "0",
+                "eventra.workflow.frontend_sha": FRONTEND_SHA,
+                "eventra.workflow.merge_state": "not_ready",
+                "eventra.workflow.last_action": implementation_action,
             },
-            "PRO-36": {},
+            "PRO-36": {
+                "eventra.workflow.version": "2",
+                "eventra.phase.kind": "implementation",
+                "eventra.phase.attempt": "0",
+                "eventra.phase.failure_repositories": "[]",
+                "eventra.phase.sha.frontend": FRONTEND_SHA,
+                "eventra.phase.pr": FRONTEND_PR,
+                "eventra.phase.creation_action": implementation_action,
+                "eventra.phase.target": "repository:frontend",
+                "eventra.phase.role": "frontend_engineer",
+            },
         }
         self.runs = {
             "PRO-35": [
@@ -3745,6 +3822,10 @@ class FakeWatchRunner:
             "PRO-36": copy.deepcopy(FakeRecoveryRunner().runs),
         }
         self.calls = []
+        self.post_rerun_child_metadata = None
+        self.post_rerun_child_detail = None
+        self.post_rerun_parent_detail = None
+        self.github = FakeSnapshotGitHubRunner((frontend_pr(),))
 
     def run(self, args, *, stdin_json=None):
         call = tuple(args)
@@ -3772,30 +3853,53 @@ class FakeWatchRunner:
                 "total": len(issues),
             }
         if call[:2] == ("issue", "get"):
-            return copy.deepcopy(self.parent if call[2] == "PRO-35" else self.child)
+            if call[2] == "PRO-35":
+                return copy.deepcopy(self.parent)
+            return copy.deepcopy(
+                next(
+                    child
+                    for child in self.children
+                    if child["identifier"] == call[2]
+                )
+            )
         if call == ("issue", "children", "PRO-35", "--output", "json"):
-            child_done = int(self.child["status"] == "done")
-            return {
-                "stages": [
+            stages = []
+            for stage in sorted({child["stage"] for child in self.children}):
+                children = [
+                    copy.deepcopy(child)
+                    for child in self.children
+                    if child["stage"] == stage
+                ]
+                stages.append(
                     {
-                        "stage": 1,
-                        "total": 1,
-                        "done": child_done,
-                        "issues": [copy.deepcopy(self.child)],
+                        "stage": stage,
+                        "total": len(children),
+                        "done": sum(
+                            child["status"] == "done" for child in children
+                        ),
+                        "issues": children,
                     }
-                ],
-                "total": 1,
+                )
+            return {
+                "stages": stages,
+                "total": len(self.children),
                 "unstaged": [],
             }
         if call[:3] == ("issue", "metadata", "list"):
             return copy.deepcopy(self.metadata[call[3]])
         if call[:2] == ("issue", "runs"):
             return copy.deepcopy(self.runs[call[2]])
-        if call == ("issue", "rerun", "PRO-36", "--output", "json"):
-            self.runs["PRO-36"].append(
-                {
-                    "id": "01a00000-0000-7000-8000-000000000051",
-                    "issue_id": ISSUE_ID,
+        if (
+            call[:2] == ("issue", "rerun")
+            and len(call) == 5
+            and call[2] in self.runs
+            and call[3:] == ("--output", "json")
+        ):
+            target_key = call[2]
+            self.runs[target_key].append(
+                    {
+                        "id": "01a00000-0000-7000-8000-000000000051",
+                        "issue_id": str(self.child["id"]),
                     "status": "queued",
                     "created_at": "2026-08-25T10:00:00Z",
                     "dispatched_at": None,
@@ -3803,8 +3907,48 @@ class FakeWatchRunner:
                     "completed_at": None,
                 }
             )
+            if self.post_rerun_child_metadata is not None:
+                self.metadata[target_key] = copy.deepcopy(
+                    self.post_rerun_child_metadata
+                )
+            if self.post_rerun_child_detail is not None:
+                self.child.update(copy.deepcopy(self.post_rerun_child_detail))
+            if self.post_rerun_parent_detail is not None:
+                self.parent.update(copy.deepcopy(self.post_rerun_parent_detail))
             return {"ignored": "ack"}
         raise AssertionError(f"unsupported argv: {call!r}")
+
+    def install_parent_snapshot(self, snapshot, target_key):
+        source = FakeSnapshotFinishRunner(snapshot, target_key)
+        self.parent = source.parent
+        self.children = list(source.issues.values())
+        self.child = next(
+            child
+            for child in self.children
+            if child["identifier"] == target_key
+        )
+        self.metadata = {
+            snapshot.identifier: source.parent_metadata,
+            **source.metadata,
+        }
+        self.runs = {
+            snapshot.identifier: [
+                {
+                    "id": "01a00000-0000-7000-8000-000000000050",
+                    "issue_id": PARENT_ID,
+                    "status": "completed",
+                    "created_at": "2026-08-25T08:31:59Z",
+                    "dispatched_at": "2026-08-25T08:32:00Z",
+                    "started_at": "2026-08-25T08:32:17Z",
+                    "completed_at": "2026-08-25T08:34:02Z",
+                }
+            ],
+            **source.runs,
+        }
+        self.runs[target_key] = copy.deepcopy(FakeRecoveryRunner().runs)
+        for run in self.runs[target_key]:
+            run["issue_id"] = str(self.child["id"])
+        self.github = FakeSnapshotGitHubRunner(snapshot.pull_requests)
 
     def _assert_list_flags(self, flags):
         expected = {
@@ -3827,11 +3971,476 @@ class FakeWatchRunner:
 
 
 class WatchWorkflowTests(unittest.TestCase):
+    def _watch(self, runner, *, apply):
+        return watch_projects(
+            runner,
+            runner.PROJECTS,
+            apply=apply,
+            github=runner.github,
+        )
+
+    def _cross_stack_gate_snapshot(self):
+        backend_sha = "b" * 40
+        children = (
+            phase(
+                "PRO-10", 1, "implementation", frontend_sha=FRONTEND_SHA,
+                pr_url=FRONTEND_PR, project_id=PROJECT_ID,
+                assignee_id=AGENT_ID,
+                evidence_comment=(
+                    "00000000-0000-4000-8000-000000000010"
+                ),
+            ),
+            phase(
+                "PRO-11", 1, "implementation", frontend_sha=None,
+                backend_sha=backend_sha,
+                pr_url=(
+                    "https://github.com/codeExploreHub/"
+                    "Eventra-Backend/pull/7"
+                ),
+                project_id=BACKEND_PROJECT_ID,
+                assignee_id=QA_ID,
+                evidence_comment=(
+                    "00000000-0000-4000-8000-000000000011"
+                ),
+            ),
+            phase(
+                "PRO-36", 2, "review", result=None, status="in_review",
+                evidence_comment="00000000-0000-4000-8000-000000000031",
+            ),
+            phase(
+                "PRO-37", 2, "qa", result=None, status="in_review",
+                evidence_comment="00000000-0000-4000-8000-000000000032",
+            ),
+            phase(
+                "PRO-38", 2, "review", result=None, status="in_review",
+                frontend_sha=None, backend_sha=backend_sha,
+                evidence_comment="00000000-0000-4000-8000-000000000033",
+            ),
+            phase(
+                "PRO-39", 2, "qa", result=None, status="in_review",
+                frontend_sha=None, backend_sha=backend_sha,
+                evidence_comment="00000000-0000-4000-8000-000000000034",
+            ),
+            phase(
+                "PRO-40", 2, "integration_qa", result=None,
+                status="in_review", backend_sha=backend_sha,
+                evidence_comment="00000000-0000-4000-8000-000000000035",
+            ),
+        )
+        return parent_snapshot(
+            classification="cross-stack",
+            candidate_backend_sha=backend_sha,
+            children=children,
+            next_stage=3,
+            pull_requests=(
+                frontend_pr(),
+                PullRequestSnapshot(
+                    "backend",
+                    "https://github.com/codeExploreHub/Eventra-Backend/pull/7",
+                    backend_sha,
+                    "open",
+                    True,
+                    True,
+                ),
+            ),
+        )
+
+    def _current_repair_snapshot(self, repair_round):
+        source_sha = {1: FRONTEND_SHA, 2: "c" * 40, 3: "d" * 40}[
+            repair_round
+        ]
+        source_stage = repair_round * 2
+        review_uuid = (
+            f"00000000-0000-4000-8000-{70 + repair_round:012d}"
+        )
+        history = [
+            phase(
+                "PRO-20", 1, "implementation", attempt=0,
+                frontend_sha=FRONTEND_SHA, pr_url=FRONTEND_PR,
+                project_id=PROJECT_ID, assignee_id=AGENT_ID,
+            )
+        ]
+        if repair_round >= 2:
+            history.append(
+                phase(
+                    "PRO-21", 3, "repair", attempt=1,
+                    frontend_sha="c" * 40, pr_url=FRONTEND_PR,
+                    project_id=PROJECT_ID, assignee_id=AGENT_ID,
+                )
+            )
+        if repair_round >= 3:
+            history.append(
+                phase(
+                    "PRO-22", 5, "repair", attempt=2,
+                    frontend_sha="d" * 40, pr_url=FRONTEND_PR,
+                    project_id=PROJECT_ID, assignee_id=AGENT_ID,
+                )
+            )
+        gates = (
+            phase(
+                "PRO-30", source_stage, "review", result="fail",
+                attempt=repair_round - 1, frontend_sha=source_sha,
+                evidence_comment=review_uuid,
+                responsible_repositories=("frontend",),
+                evidence_comment_url=(
+                    f"https://multica.example.test/comments/{review_uuid}"
+                ),
+            ),
+            phase(
+                "PRO-31", source_stage, "qa", result="pass",
+                attempt=repair_round - 1, frontend_sha=source_sha,
+                evidence_comment=(
+                    f"00000000-0000-4000-8000-{80 + repair_round:012d}"
+                ),
+            ),
+        )
+        auth_uuid = (
+            "00000000-0000-4000-8000-000000000099"
+            if repair_round == 3
+            else ""
+        )
+        source = parent_snapshot(
+            attempt=repair_round - 1,
+            candidate_frontend_sha=source_sha,
+            children=tuple(history) + gates,
+            next_stage=source_stage + 1,
+            authorization_comment_uuid=auth_uuid,
+            pull_requests=(frontend_pr(head_sha=source_sha),),
+        )
+        if repair_round == 3:
+            bundle = _failure_bundle(source, source.children[-2:])
+            source = replace(
+                source,
+                authorizing_comment=AuthorizingComment(
+                    auth_uuid,
+                    "member",
+                    json.dumps(
+                        {
+                            "bundle_digest": bundle["digest"],
+                            "granted_round": 3,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+        decision = decide_parent_action(source)
+        self.assertEqual(
+            decision.kind,
+            "create_repair_stage",
+            msg=decision.reason,
+        )
+        bundle = decision.failure_bundle
+        self.assertIsInstance(bundle, dict)
+        current = phase(
+            "PRO-36", source_stage + 1, "repair", result=None,
+            attempt=repair_round, status="in_review",
+            frontend_sha=source_sha, project_id=PROJECT_ID,
+            pr_url=FRONTEND_PR, assignee_id=AGENT_ID,
+            creation_action=decision.action_key or "",
+            failure_bundle_digest=str(bundle["digest"]),
+            failure_evidence_uuids=(review_uuid,),
+            authorizing_comment_uuid=auth_uuid,
+            repair_repository="frontend",
+            repair_pull_request=FRONTEND_PR,
+            repair_round=repair_round,
+            repair_source_candidates=(("frontend", source_sha),),
+        )
+        return replace(
+            source,
+            attempt=repair_round,
+            last_action=decision.action_key,
+            next_stage=source_stage + 2,
+            children=source.children + (current,),
+            consumed_authorization_uuid=auth_uuid,
+            authorization_comment_uuid="",
+            authorizing_comment=None,
+        )
+
+    def test_watcher_rejects_current_child_without_assignment_provenance(self):
+        runner = FakeWatchRunner()
+        runner.metadata["PRO-36"] = {}
+
+        result = self._watch(runner, apply=True)
+
+        self.assertEqual(result, WatchResult(1, 0, 0, "noop"))
+        self.assertFalse(
+            any(call[:2] == ("issue", "rerun") for call in runner.calls)
+        )
+
+    def test_watcher_rejects_typed_assignment_provenance_drift(self):
+        corruptions = {
+            "partial metadata": lambda runner: runner.metadata["PRO-36"].pop(
+                "eventra.phase.role"
+            ),
+            "workflow version": lambda runner: runner.metadata["PRO-36"].__setitem__(
+                "eventra.workflow.version", "1"
+            ),
+            "attempt": lambda runner: runner.metadata["PRO-36"].__setitem__(
+                "eventra.phase.attempt", "1"
+            ),
+            "kind": lambda runner: runner.metadata["PRO-36"].__setitem__(
+                "eventra.phase.kind", "qa"
+            ),
+            "role": lambda runner: runner.metadata["PRO-36"].__setitem__(
+                "eventra.phase.role", "backend_engineer"
+            ),
+            "target": lambda runner: runner.metadata["PRO-36"].__setitem__(
+                "eventra.phase.target", "repository:backend"
+            ),
+            "creation action": lambda runner: runner.metadata["PRO-36"].__setitem__(
+                "eventra.phase.creation_action", "forged"
+            ),
+            "candidate": lambda runner: runner.metadata["PRO-36"].__setitem__(
+                "eventra.phase.sha.frontend", "c" * 40
+            ),
+            "pull request": lambda runner: runner.metadata["PRO-36"].__setitem__(
+                "eventra.phase.pr",
+                "https://github.com/codeExploreHub/Eventra-Backend/pull/7",
+            ),
+            "project": lambda runner: runner.child.__setitem__(
+                "project_id", BACKEND_PROJECT_ID
+            ),
+            "agent type": lambda runner: runner.child.__setitem__(
+                "assignee_type", "member"
+            ),
+            "agent identity": lambda runner: runner.child.__setitem__(
+                "assignee_id", "not-a-uuid"
+            ),
+            "parent action": lambda runner: runner.metadata["PRO-35"].__setitem__(
+                "eventra.workflow.last_action", "forged"
+            ),
+        }
+        for label, corrupt in corruptions.items():
+            with self.subTest(label=label):
+                runner = FakeWatchRunner()
+                corrupt(runner)
+
+                result = self._watch(runner, apply=True)
+
+                self.assertEqual(result, WatchResult(1, 0, 0, "noop"))
+                self.assertFalse(
+                    any(
+                        call[:2] == ("issue", "rerun")
+                        for call in runner.calls
+                    )
+                )
+
+    def test_watcher_rejects_post_rerun_immutable_assignment_drift(self):
+        corruptions = {
+            "stage": (None, {"stage": 0}),
+            "project": (None, {"project_id": BACKEND_PROJECT_ID}),
+            "agent": (None, {"assignee_id": REVIEWER_ID}),
+            "target": ({"eventra.phase.target": "repository:backend"}, None),
+            "role": ({"eventra.phase.role": "backend_engineer"}, None),
+            "action": ({"eventra.phase.creation_action": "forged"}, None),
+            "candidate": ({"eventra.phase.sha.frontend": "c" * 40}, None),
+            "pull request": (
+                {
+                    "eventra.phase.pr": (
+                        "https://github.com/codeExploreHub/"
+                        "Eventra-Backend/pull/7"
+                    )
+                },
+                None,
+            ),
+            "completion evidence": (
+                {
+                    "eventra.phase.result": "pass",
+                    "eventra.phase.evidence_comment": (
+                        "00000000-0000-4000-8000-000000000099"
+                    ),
+                },
+                None,
+            ),
+        }
+        for label, (metadata_updates, detail_updates) in corruptions.items():
+            with self.subTest(label=label):
+                runner = FakeWatchRunner()
+                if metadata_updates is not None:
+                    corrupt = copy.deepcopy(runner.metadata["PRO-36"])
+                    corrupt.update(metadata_updates)
+                    runner.post_rerun_child_metadata = corrupt
+                runner.post_rerun_child_detail = detail_updates
+
+                with self.assertRaisesRegex(
+                    RuntimeError, "recovery verification failed"
+                ):
+                    self._watch(runner, apply=True)
+
+    def test_watcher_rejects_post_rerun_parent_project_drift(self):
+        runner = FakeWatchRunner()
+        runner.post_rerun_parent_detail = {
+            "project_id": "00000000-0000-4000-8000-000000000099",
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "recovery verification failed"):
+            self._watch(runner, apply=True)
+
+    def test_watcher_allows_completion_metadata_on_exact_active_assignment(self):
+        runner = FakeWatchRunner()
+        runner.metadata["PRO-36"].update(
+            {
+                "eventra.phase.result": "pass",
+                "eventra.phase.evidence_comment": COMMENT_ID,
+            }
+        )
+
+        result = self._watch(runner, apply=True)
+
+        self.assertEqual(result.applied, 1)
+        self.assertEqual(result.decision, "rerun_child")
+
+    def test_watcher_rechecks_repair_provenance_after_rerun(self):
+        runner = FakeWatchRunner()
+        runner.install_parent_snapshot(self._current_repair_snapshot(3), "PRO-36")
+        corrupt = copy.deepcopy(runner.metadata["PRO-36"])
+        corrupt["eventra.repair.failure_bundle_digest"] = "f" * 64
+        runner.post_rerun_child_metadata = corrupt
+
+        with self.assertRaisesRegex(RuntimeError, "recovery verification failed"):
+            self._watch(runner, apply=True)
+
+    def test_watcher_recovers_each_typed_current_gate_assignment(self):
+        snapshot = self._cross_stack_gate_snapshot()
+        for target_key in ("PRO-36", "PRO-37", "PRO-40"):
+            with self.subTest(target=target_key):
+                runner = FakeWatchRunner()
+                runner.install_parent_snapshot(snapshot, target_key)
+
+                result = self._watch(runner, apply=True)
+
+                self.assertEqual(result.applied, 1)
+                self.assertEqual(result.decision, "rerun_child")
+
+    def test_watcher_rejects_incomplete_or_forged_gate_assignment(self):
+        corruptions = {
+            "missing member": lambda runner: (
+                runner.children.pop(),
+                runner.metadata.pop("PRO-40"),
+                runner.runs.pop("PRO-40"),
+            ),
+            "wrong role": lambda runner: runner.metadata["PRO-37"].__setitem__(
+                "eventra.phase.role", "independent_reviewer"
+            ),
+            "wrong action": lambda runner: runner.metadata["PRO-38"].__setitem__(
+                "eventra.phase.creation_action", "forged"
+            ),
+            "wrong suite target": lambda runner: runner.metadata["PRO-40"].__setitem__(
+                "eventra.phase.target", "suite:forged"
+            ),
+            "unexpected pull request": lambda runner: runner.metadata[
+                "PRO-36"
+            ].__setitem__("eventra.phase.pr", FRONTEND_PR),
+        }
+        for label, corrupt in corruptions.items():
+            with self.subTest(label=label):
+                runner = FakeWatchRunner()
+                runner.install_parent_snapshot(
+                    self._cross_stack_gate_snapshot(), "PRO-36"
+                )
+                corrupt(runner)
+
+                result = self._watch(runner, apply=True)
+
+                self.assertEqual(result, WatchResult(1, 0, 0, "noop"))
+                self.assertFalse(
+                    any(
+                        call[:2] == ("issue", "rerun")
+                        for call in runner.calls
+                    )
+                )
+
+    def test_watcher_rejects_authoritative_current_gate_head_drift(self):
+        runner = FakeWatchRunner()
+        snapshot = self._cross_stack_gate_snapshot()
+        runner.install_parent_snapshot(snapshot, "PRO-36")
+        runner.github.pull_requests[FRONTEND_PR] = replace(
+            runner.github.pull_requests[FRONTEND_PR],
+            head_sha="f" * 40,
+        )
+
+        result = self._watch(runner, apply=True)
+
+        self.assertEqual(result, WatchResult(1, 0, 0, "noop"))
+        self.assertFalse(
+            any(call[:2] == ("issue", "rerun") for call in runner.calls)
+        )
+
+    def test_watcher_recovers_exact_current_repairs_for_all_rounds(self):
+        for repair_round in (1, 2, 3):
+            with self.subTest(repair_round=repair_round):
+                runner = FakeWatchRunner()
+                runner.install_parent_snapshot(
+                    self._current_repair_snapshot(repair_round), "PRO-36"
+                )
+
+                result = self._watch(runner, apply=True)
+
+                self.assertEqual(result.applied, 1)
+                self.assertEqual(result.decision, "rerun_child")
+
+    def test_watcher_allows_current_repair_owner_head_to_move_while_active(self):
+        runner = FakeWatchRunner()
+        snapshot = self._current_repair_snapshot(2)
+        runner.install_parent_snapshot(snapshot, "PRO-36")
+        runner.github.pull_requests[FRONTEND_PR] = replace(
+            runner.github.pull_requests[FRONTEND_PR],
+            head_sha="f" * 40,
+        )
+
+        result = self._watch(runner, apply=True)
+
+        self.assertEqual(result.applied, 1)
+        self.assertEqual(result.decision, "rerun_child")
+
+    def test_watcher_rejects_repair_bundle_partition_and_authorization_drift(self):
+        corruptions = {
+            "bundle": lambda metadata: metadata.__setitem__(
+                "eventra.repair.failure_bundle_digest", "f" * 64
+            ),
+            "partition": lambda metadata: metadata.__setitem__(
+                "eventra.repair.failure_evidence_uuids",
+                '["00000000-0000-4000-8000-000000000098"]',
+            ),
+            "source candidates": lambda metadata: metadata.__setitem__(
+                "eventra.repair.source_candidates",
+                json.dumps({"frontend": "e" * 40}, separators=(",", ":")),
+            ),
+            "authorization": lambda metadata: metadata.__setitem__(
+                "eventra.repair.authorizing_comment_uuid",
+                "00000000-0000-4000-8000-000000000098",
+            ),
+        }
+        for repair_round in (1, 2, 3):
+            for label, corrupt in corruptions.items():
+                if label == "authorization" and repair_round != 3:
+                    continue
+                with self.subTest(repair_round=repair_round, label=label):
+                    runner = FakeWatchRunner()
+                    runner.install_parent_snapshot(
+                        self._current_repair_snapshot(repair_round), "PRO-36"
+                    )
+                    corrupt(runner.metadata["PRO-36"])
+
+                    result = self._watch(runner, apply=True)
+
+                    self.assertEqual(
+                        result,
+                        WatchResult(1, 0, 0, "noop"),
+                    )
+                    self.assertFalse(
+                        any(
+                            call[:2] == ("issue", "rerun")
+                            for call in runner.calls
+                        )
+                    )
+
     def test_version_one_watcher_state_never_mutates(self):
         runner = FakeWatchRunner()
         runner.metadata["PRO-35"] = {"eventra.workflow.version": "1"}
 
-        result = watch_projects(runner, runner.PROJECTS, apply=True)
+        result = self._watch(runner, apply=True)
 
         self.assertEqual(result.scanned, 1)
         self.assertEqual(result.applied, 0)
@@ -3857,20 +4466,24 @@ class WatchWorkflowTests(unittest.TestCase):
 
     def test_watch_dry_run_detects_but_does_not_mutate_stalled_pro_35(self):
         runner = FakeWatchRunner()
-        result = watch_projects(runner, runner.PROJECTS, apply=False)
+        result = self._watch(runner, apply=False)
         self.assertEqual(result, WatchResult(1, 1, 0, "rerun_child"))
         self.assertFalse(any(call[:2] == ("issue", "rerun") for call in runner.calls))
 
     def test_watch_apply_recovers_at_most_once_and_second_apply_is_noop(self):
         runner = FakeWatchRunner()
-        first = watch_projects(runner, runner.PROJECTS, apply=True)
-        second = watch_projects(runner, runner.PROJECTS, apply=True)
+        parent_before = copy.deepcopy(runner.parent)
+        parent_metadata_before = copy.deepcopy(runner.metadata["PRO-35"])
+        first = self._watch(runner, apply=True)
+        second = self._watch(runner, apply=True)
         self.assertEqual(first.applied, 1)
         self.assertEqual(second.applied, 0)
         self.assertEqual(
             sum(call[:2] == ("issue", "rerun") for call in runner.calls),
             1,
         )
+        self.assertEqual(runner.parent, parent_before)
+        self.assertEqual(runner.metadata["PRO-35"], parent_metadata_before)
 
     def test_watch_parser_requires_two_project_ids_and_defaults_to_dry_run(self):
         args = build_workflow_parser().parse_args(
@@ -3892,7 +4505,7 @@ class WatchWorkflowTests(unittest.TestCase):
         )
         runner.child["updated_at"] = "2026-08-25T08:51:00Z"
 
-        result = watch_projects(runner, runner.PROJECTS, apply=False)
+        result = self._watch(runner, apply=False)
 
         self.assertEqual(result.decision, "rerun_parent")
 
@@ -3900,7 +4513,7 @@ class WatchWorkflowTests(unittest.TestCase):
         runner = FakeWatchRunner()
         runner.child["assignee_type"] = "member"
 
-        result = watch_projects(runner, runner.PROJECTS, apply=False)
+        result = self._watch(runner, apply=False)
 
         self.assertEqual(result, WatchResult(1, 0, 0, "noop"))
 

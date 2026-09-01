@@ -310,6 +310,14 @@ one quoted CSV field with doubled internal quotes before it is passed through
 argv. This preserves the server-side string comparison while retaining the
 two-Project scope and bounded recovery behavior.
 
+Before rerunning a child, the Watcher requires its complete immutable version-2
+assignment to match the authoritative current parent: typed phase/role and
+repository or suite target, Stage and attempt, Project and Agent, candidate
+SHAs and pull request, creation action, and all repair bundle/evidence/round
+provenance when applicable. It rereads the same immutable authority after the
+rerun. The Watcher never writes parent metadata, status, Stage, or action
+history; only the selected child's run/liveness state may change.
+
 Provisioning migrates the existing scheduled Autopilot in place to this Agent:
 it preserves the existing Autopilot and trigger IDs, updates only the
 assignee and any desired drift, and leaves the existing schedule trigger
