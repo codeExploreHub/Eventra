@@ -219,6 +219,13 @@ class ParentSnapshot:
     quarantined_repair_children: tuple[QuarantinedRepairChild, ...] = ()
     assignment_agent_ids: tuple[tuple[str, str], ...] = ()
     assignment_project_ids: tuple[tuple[str, str], ...] = ()
+    parent_project_id: str = ""
+    parent_assignee_id: str = ""
+    parent_assignee_type: str = ""
+    delivery_squad_id: str = ""
+    delivery_lead_id: str = ""
+    delivery_squad_leader_id: str = ""
+    delivery_squad_members: tuple[tuple[str, str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1363,6 +1370,9 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
         )
     if snapshot.workflow_version != 2:
         return ParentDecision("block_parent", None, "malformed parent workflow state")
+    parent_authority_problem = _parent_assignment_authority_problem(snapshot)
+    if parent_authority_problem is not None:
+        return ParentDecision("block_parent", None, parent_authority_problem)
     if snapshot.repair_reservation is not None:
         return _parent_decision(
             snapshot,
@@ -1652,40 +1662,42 @@ def _recovery_authority_identity(
 
 
 def _parent_assignment_problem(snapshot: WorkflowSnapshot) -> str | None:
-    assignment_agents = dict(snapshot.agent_ids)
-    expected_members = tuple(
-        sorted(
-            (
-                member_id,
-                "agent",
-                "leader" if role == DELIVERY_LEAD_ROLE else role,
-            )
-            for role, member_id in {
-                DELIVERY_LEAD_ROLE: snapshot.delivery_lead_id,
-                **assignment_agents,
-            }.items()
-        )
-    )
+    if snapshot.parent is None:
+        return "parent workflow authority is incomplete"
     if (
-        len(snapshot.project_ids) != 2
-        or snapshot.parent_project_id != snapshot.project_ids[0]
+        tuple(snapshot.project_ids)
+        != tuple(
+            dict(snapshot.parent.assignment_project_ids).get(repository, "")
+            for repository in ("frontend", "backend")
+        )
+        or snapshot.parent_project_id != snapshot.parent.parent_project_id
     ):
         return "parent control Project authority is conflicting"
     if (
-        not _is_uuid(snapshot.delivery_squad_id)
-        or not _is_uuid(snapshot.delivery_lead_id)
-        or snapshot.delivery_squad_leader_id != snapshot.delivery_lead_id
-        or snapshot.delivery_squad_members != expected_members
-        or snapshot.parent_assignee_type != "squad"
-        or snapshot.parent_assignee_id != snapshot.delivery_squad_id
+        snapshot.agent_ids != snapshot.parent.assignment_agent_ids
+        or snapshot.parent_assignee_id != snapshot.parent.parent_assignee_id
+        or snapshot.parent_assignee_type != snapshot.parent.parent_assignee_type
+        or snapshot.delivery_squad_id != snapshot.parent.delivery_squad_id
+        or snapshot.delivery_lead_id != snapshot.parent.delivery_lead_id
+        or snapshot.delivery_squad_leader_id
+        != snapshot.parent.delivery_squad_leader_id
+        or snapshot.delivery_squad_members
+        != snapshot.parent.delivery_squad_members
     ):
         return "parent Delivery squad authority is conflicting"
-    return None
+    return _parent_assignment_authority_problem(snapshot.parent)
 
 
 def _exact_assignment_authority(
     runner: MulticaRunner,
-) -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]]:
+) -> tuple[
+    tuple[tuple[str, str], ...],
+    tuple[tuple[str, str], ...],
+    str,
+    str,
+    str,
+    tuple[tuple[str, str, str], ...],
+]:
     agents = parse_agent_list(
         runner.run(["agent", "list", "--output", "json"])
     )
@@ -1704,7 +1716,75 @@ def _exact_assignment_authority(
         if len(matches) != 1 or not _is_uuid(matches[0]):
             raise RuntimeError("assignment project authority is incomplete")
         project_ids.append((repository, matches[0]))
-    return tuple(agent_ids), tuple(project_ids)
+    lead_matches = [
+        item["id"]
+        for item in agents
+        if item["name"] == SQUAD_AGENT_NAMES[DELIVERY_LEAD_ROLE]
+    ]
+    if len(lead_matches) != 1 or not _is_uuid(lead_matches[0]):
+        raise RuntimeError("Delivery Lead authority is incomplete")
+    delivery_lead_id = lead_matches[0]
+    squads = parse_squad_list(
+        runner.run(["squad", "list", "--output", "json"])
+    )
+    squad_matches = [
+        item["id"] for item in squads if item["name"] == DELIVERY_SQUAD_NAME
+    ]
+    if len(squad_matches) != 1 or not _is_uuid(squad_matches[0]):
+        raise RuntimeError("Delivery squad authority is incomplete")
+    delivery_squad_id = squad_matches[0]
+    detail = parse_squad_detail(
+        runner.run(
+            ["squad", "get", delivery_squad_id, "--output", "json"]
+        ),
+        delivery_squad_id,
+    )
+    members = parse_squad_members(
+        runner.run(
+            [
+                "squad", "member", "list", delivery_squad_id,
+                "--output", "json",
+            ]
+        ),
+        delivery_squad_id,
+    )
+    observed_members = tuple(
+        sorted(
+            (
+                item["member_id"],
+                item["member_type"],
+                item["role"],
+            )
+            for item in members
+        )
+    )
+    expected_members = tuple(
+        sorted(
+            (
+                member_id,
+                "agent",
+                "leader" if role == DELIVERY_LEAD_ROLE else role,
+            )
+            for role, member_id in {
+                DELIVERY_LEAD_ROLE: delivery_lead_id,
+                **dict(agent_ids),
+            }.items()
+        )
+    )
+    if (
+        detail["name"] != DELIVERY_SQUAD_NAME
+        or detail["leader_id"] != delivery_lead_id
+        or observed_members != expected_members
+    ):
+        raise RuntimeError("Delivery squad authority is conflicting")
+    return (
+        tuple(agent_ids),
+        tuple(project_ids),
+        delivery_squad_id,
+        delivery_lead_id,
+        str(detail["leader_id"]),
+        observed_members,
+    )
 
 
 def _parent_assignment_authority_problem(snapshot: ParentSnapshot) -> str | None:
@@ -1718,6 +1798,52 @@ def _parent_assignment_authority_problem(snapshot: ParentSnapshot) -> str | None
         or any(not _is_uuid(item) for item in (*agents.values(), *projects.values()))
     ):
         return "current assignment authority is incomplete"
+    expected_members = tuple(
+        sorted(
+            (
+                member_id,
+                "agent",
+                "leader" if role == DELIVERY_LEAD_ROLE else role,
+            )
+            for role, member_id in {
+                DELIVERY_LEAD_ROLE: snapshot.delivery_lead_id,
+                **agents,
+            }.items()
+        )
+    )
+    if snapshot.parent_project_id != projects["frontend"]:
+        return "parent control Project authority is conflicting"
+    if (
+        not _is_uuid(snapshot.delivery_squad_id)
+        or not _is_uuid(snapshot.delivery_lead_id)
+        or snapshot.delivery_squad_leader_id != snapshot.delivery_lead_id
+        or snapshot.delivery_squad_members != expected_members
+        or snapshot.parent_assignee_type != "squad"
+        or snapshot.parent_assignee_id != snapshot.delivery_squad_id
+    ):
+        return "parent Delivery squad authority is conflicting"
+    return None
+
+
+def _parent_control_detail_problem(
+    detail: dict[str, object],
+    authority: tuple[
+        tuple[tuple[str, str], ...],
+        tuple[tuple[str, str], ...],
+        str,
+        str,
+        str,
+        tuple[tuple[str, str, str], ...],
+    ],
+) -> str | None:
+    projects = dict(authority[1])
+    if detail["project_id"] != projects.get("frontend"):
+        return "parent control Project authority is conflicting"
+    if (
+        detail["assignee_type"] != "squad"
+        or detail["assignee_id"] != authority[2]
+    ):
+        return "parent Delivery squad authority is conflicting"
     return None
 
 
@@ -2920,7 +3046,7 @@ def load_parent_snapshot(
     assignment_authority_before = (
         _exact_assignment_authority(runner)
         if needs_assignment_authority
-        else ((), ())
+        else ((), (), "", "", "", ())
     )
     pull_requests = []
     for repository, (_, url) in sorted(pr_candidates.items()):
@@ -3003,7 +3129,20 @@ def load_parent_snapshot(
         quarantined_repair_children=tuple(quarantined),
         assignment_agent_ids=assignment_authority_before[0],
         assignment_project_ids=assignment_authority_before[1],
+        parent_project_id=str(parent["project_id"]),
+        parent_assignee_id=(
+            "" if parent["assignee_id"] is None else str(parent["assignee_id"])
+        ),
+        parent_assignee_type=str(parent["assignee_type"]),
+        delivery_squad_id=assignment_authority_before[2],
+        delivery_lead_id=assignment_authority_before[3],
+        delivery_squad_leader_id=assignment_authority_before[4],
+        delivery_squad_members=assignment_authority_before[5],
     )
+    if snapshot.workflow_version == 2:
+        authority_problem = _parent_assignment_authority_problem(snapshot)
+        if authority_problem is not None:
+            raise RuntimeError(authority_problem)
     if quarantined:
         if snapshot.repair_reservation is None:
             raise RuntimeError("quarantined repair child lacks a reservation")
@@ -4215,7 +4354,16 @@ def execute_parent_repair(
                     expected_action_key,
                     0,
                 )
-            reservation = _build_repair_reservation(snapshot, decision)
+            fresh_snapshot = load_parent_snapshot(runner, github, parent_key)
+            fresh_decision = decide_parent_action(fresh_snapshot)
+            if fresh_snapshot != snapshot or fresh_decision != decision:
+                raise RuntimeError(
+                    "repair parent authority changed before reservation write"
+                )
+            reservation = _build_repair_reservation(
+                fresh_snapshot,
+                fresh_decision,
+            )
             observed_effects[0] += _metadata_set_observed(
                 runner,
                 parent_key,
@@ -4589,6 +4737,15 @@ def _read_smoke_reservation_authority(
         next_stage=smoke_stage,
         assignment_agent_ids=assignment_authority[0],
         assignment_project_ids=assignment_authority[1],
+        parent_project_id=str(parent["project_id"]),
+        parent_assignee_id=(
+            "" if parent["assignee_id"] is None else str(parent["assignee_id"])
+        ),
+        parent_assignee_type=str(parent["assignee_type"]),
+        delivery_squad_id=assignment_authority[2],
+        delivery_lead_id=assignment_authority[3],
+        delivery_squad_leader_id=assignment_authority[4],
+        delivery_squad_members=assignment_authority[5],
     )
     if (
         not _historical_gate_identity_matches(source_snapshot, source_gate)
@@ -4807,16 +4964,16 @@ def execute_parent_smoke(
             or decision.action_key != expected_action_key
         ):
             raise RuntimeError("fresh parent plan does not authorize smoke action")
-        assignment_authority_before = _exact_assignment_authority(runner)
-        assignment_authority_after = _exact_assignment_authority(runner)
-        if assignment_authority_after != assignment_authority_before:
-            raise RuntimeError("smoke assignment authority changed during read")
-        snapshot = replace(
-            snapshot,
-            assignment_agent_ids=assignment_authority_before[0],
-            assignment_project_ids=assignment_authority_before[1],
+        fresh_snapshot = load_parent_snapshot(runner, github, parent_key)
+        fresh_decision = decide_parent_action(fresh_snapshot)
+        if fresh_snapshot != snapshot or fresh_decision != decision:
+            raise RuntimeError(
+                "smoke parent authority changed before reservation write"
+            )
+        reservation = _build_smoke_reservation(
+            fresh_snapshot,
+            fresh_decision,
         )
-        reservation = _build_smoke_reservation(snapshot, decision)
         encoded = _canonical_json(reservation)
         effects[0] += _metadata_set_observed(
             runner,
@@ -4941,98 +5098,21 @@ def load_workflow_snapshot(
         except RuntimeError:
             decoded_parent = None
         if project_ids:
-            records = parse_agent_list(
-                runner.run(["agent", "list", "--output", "json"])
-            )
-            resolved: dict[str, str] = {}
-            for role, name in SQUAD_AGENT_NAMES.items():
-                matches = [item["id"] for item in records if item["name"] == name]
-                if len(matches) != 1 or not _is_uuid(matches[0]):
-                    resolved = {}
-                    break
-                resolved[role] = matches[0]
-            if len(resolved) == len(SQUAD_AGENT_NAMES):
-                delivery_lead_id = resolved[DELIVERY_LEAD_ROLE]
-                assignment_agent_ids = tuple(
-                    sorted(
-                        (role, resolved[role])
-                        for role in ASSIGNMENT_AGENT_NAMES
-                    )
-                )
-            project_records = parse_project_list(
-                runner.run(["project", "list", "--output", "json"])
-            )
-            resolved_projects: list[tuple[str, str]] = []
-            for repository, title in sorted(ASSIGNMENT_PROJECT_TITLES.items()):
-                matches = [
-                    item["id"] for item in project_records
-                    if item["title"] == title
-                ]
-                if len(matches) != 1 or not _is_uuid(matches[0]):
-                    resolved_projects = []
-                    break
-                resolved_projects.append((repository, matches[0]))
-            if tuple(project_ids) == tuple(
-                dict(resolved_projects).get(repository, "")
-                for repository in ("frontend", "backend")
-            ):
-                assignment_project_ids = tuple(resolved_projects)
-            squad_records = parse_squad_list(
-                runner.run(["squad", "list", "--output", "json"])
-            )
-            squad_matches = [
-                item["id"]
-                for item in squad_records
-                if item["name"] == DELIVERY_SQUAD_NAME
-            ]
-            if len(squad_matches) == 1 and _is_uuid(squad_matches[0]):
-                squad_id = squad_matches[0]
-                try:
-                    detail = parse_squad_detail(
-                        runner.run(
-                            ["squad", "get", squad_id, "--output", "json"]
-                        ),
-                        squad_id,
-                    )
-                    members = parse_squad_members(
-                        runner.run(
-                            [
-                                "squad", "member", "list", squad_id,
-                                "--output", "json",
-                            ]
-                        ),
-                        squad_id,
-                    )
-                    observed_members = tuple(
-                        sorted(
-                            (
-                                item["member_id"],
-                                item["member_type"],
-                                item["role"],
-                            )
-                            for item in members
-                        )
-                    )
-                    expected_members = tuple(
-                        sorted(
-                            (
-                                member_id,
-                                "agent",
-                                "leader" if role == DELIVERY_LEAD_ROLE else role,
-                            )
-                            for role, member_id in resolved.items()
-                        )
-                    )
-                    if (
-                        detail["name"] == DELIVERY_SQUAD_NAME
-                        and detail["leader_id"] == delivery_lead_id
-                        and observed_members == expected_members
-                    ):
-                        delivery_squad_id = squad_id
-                        delivery_squad_leader_id = detail["leader_id"]
-                        delivery_squad_members = observed_members
-                except (RuntimeError, TypeError, ValueError):
-                    pass
+            try:
+                authority = _exact_assignment_authority(runner)
+                if tuple(project_ids) != tuple(
+                    dict(authority[1]).get(repository, "")
+                    for repository in ("frontend", "backend")
+                ):
+                    raise RuntimeError("watcher Project authority is conflicting")
+                assignment_agent_ids = authority[0]
+                assignment_project_ids = authority[1]
+                delivery_squad_id = authority[2]
+                delivery_lead_id = authority[3]
+                delivery_squad_leader_id = authority[4]
+                delivery_squad_members = authority[5]
+            except (RuntimeError, TypeError, ValueError):
+                pass
     children = parse_issue_children(
         runner.run(["issue", "children", parent_key, "--output", "json"]),
         str(parent["id"]),
@@ -5252,6 +5332,17 @@ def load_workflow_snapshot(
                 parent_id=str(parent["id"]),
                 assignment_agent_ids=assignment_agent_ids,
                 assignment_project_ids=assignment_project_ids,
+                parent_project_id=str(parent["project_id"]),
+                parent_assignee_id=(
+                    ""
+                    if parent["assignee_id"] is None
+                    else str(parent["assignee_id"])
+                ),
+                parent_assignee_type=str(parent["assignee_type"]),
+                delivery_squad_id=delivery_squad_id,
+                delivery_lead_id=delivery_lead_id,
+                delivery_squad_leader_id=delivery_squad_leader_id,
+                delivery_squad_members=delivery_squad_members,
             )
         except (KeyError, RuntimeError, TypeError, ValueError):
             parent_snapshot = None
@@ -5859,6 +5950,17 @@ def _finish_phase_authority_problem(
                 parent_id=str(parent["id"]),
                 assignment_agent_ids=assignment_authority[0],
                 assignment_project_ids=assignment_authority[1],
+                parent_project_id=str(parent["project_id"]),
+                parent_assignee_id=(
+                    ""
+                    if parent["assignee_id"] is None
+                    else str(parent["assignee_id"])
+                ),
+                parent_assignee_type=str(parent["assignee_type"]),
+                delivery_squad_id=assignment_authority[2],
+                delivery_lead_id=assignment_authority[3],
+                delivery_squad_leader_id=assignment_authority[4],
+                delivery_squad_members=assignment_authority[5],
             )
         except (RuntimeError, TypeError, ValueError):
             return "authoritative current Gate metadata is malformed"
@@ -5909,7 +6011,12 @@ def _finish_phase_authority_problem(
 def _finish_parent_authority_envelope(
     runner: MulticaRunner,
     detail: dict[str, object],
-) -> tuple[dict[str, object], dict[str, str], tuple[dict[str, object], ...]]:
+) -> tuple[
+    dict[str, object],
+    dict[str, str],
+    tuple[dict[str, object], ...],
+    tuple[object, ...],
+]:
     parent_id = str(detail["parent_issue_id"])
     raw_parent = runner.run(["issue", "get", parent_id, "--output", "json"])
     if not isinstance(raw_parent, dict) or type(raw_parent.get("identifier")) is not str:
@@ -5939,7 +6046,14 @@ def _finish_parent_authority_envelope(
         ),
         str(parent["id"]),
     )
-    return parent, parent_metadata, children
+    try:
+        authority = _exact_assignment_authority(runner)
+    except (RuntimeError, TypeError, ValueError):
+        raise RuntimeError("parent workflow authority is incomplete") from None
+    problem = _parent_control_detail_problem(parent, authority)
+    if problem is not None:
+        raise RuntimeError(problem)
+    return parent, parent_metadata, children, authority
 
 
 def _controlled_phase_authority(metadata: dict[str, str]) -> dict[str, str]:
@@ -6238,10 +6352,16 @@ def finish_parent(
     )
     if detail["parent_issue_id"] is not None or detail["stage"] is not None:
         raise RuntimeError("parent completion requires a parent issue")
-    if detail["status"] == "done":
-        return ParentCompletionResult(str(detail["id"]), parent_key, "done", 0)
     if detail["assignee_type"] == "member":
         raise RuntimeError("parent has a human approval wait")
+    try:
+        authority = _exact_assignment_authority(runner)
+    except (RuntimeError, TypeError, ValueError):
+        raise RuntimeError("parent completion is not authorized") from None
+    if _parent_control_detail_problem(detail, authority) is not None:
+        raise RuntimeError("parent completion is not authorized")
+    if detail["status"] == "done":
+        return ParentCompletionResult(str(detail["id"]), parent_key, "done", 0)
     if detail["status"] not in {"in_progress", "in_review"}:
         raise RuntimeError("parent issue is not mutable")
 
@@ -6261,11 +6381,17 @@ def finish_parent(
         runner.run(["issue", "get", parent_key, "--output", "json"]),
         parent_key,
     )
+    try:
+        before_write_authority = _exact_assignment_authority(runner)
+    except (RuntimeError, TypeError, ValueError):
+        raise RuntimeError("parent completion is not authorized") from None
     if (
         before_write["parent_issue_id"] is not None
         or before_write["stage"] is not None
         or before_write["status"] not in {"in_progress", "in_review"}
         or before_write["assignee_type"] == "member"
+        or before_write_authority != authority
+        or _parent_control_detail_problem(before_write, authority) is not None
     ):
         raise RuntimeError("parent completion is not authorized")
     runner.run(
@@ -6283,7 +6409,15 @@ def finish_parent(
         runner.run(["issue", "get", parent_key, "--output", "json"]),
         parent_key,
     )
-    if final["status"] != "done":
+    try:
+        final_authority = _exact_assignment_authority(runner)
+    except (RuntimeError, TypeError, ValueError):
+        raise RuntimeError("parent completion failed") from None
+    if (
+        final["status"] != "done"
+        or final_authority != authority
+        or _parent_control_detail_problem(final, authority) is not None
+    ):
         raise RuntimeError("parent completion failed")
     return ParentCompletionResult(str(final["id"]), parent_key, "done", 1)
 

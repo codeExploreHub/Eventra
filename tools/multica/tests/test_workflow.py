@@ -82,6 +82,42 @@ def assignment_projects():
     ]
 
 
+def assignment_squads():
+    return [{"id": SQUAD_ID, "name": "Eventra Local Delivery"}]
+
+
+def assignment_squad_detail():
+    return {
+        "id": SQUAD_ID,
+        "name": "Eventra Local Delivery",
+        "description": "Coordinates Eventra delivery.",
+        "instructions": "Exact Eventra squad contract.",
+        "leader_id": DELIVERY_LEAD_ID,
+    }
+
+
+def assignment_squad_members():
+    return [
+        {
+            "id": f"membership-{index}",
+            "squad_id": SQUAD_ID,
+            "member_id": member_id,
+            "member_type": "agent",
+            "role": role,
+        }
+        for index, (member_id, role) in enumerate(
+            (
+                (DELIVERY_LEAD_ID, "leader"),
+                (AGENT_ID, "frontend_engineer"),
+                (BACKEND_AGENT_ID, "backend_engineer"),
+                (QA_ID, "integration_qa"),
+                (REVIEWER_ID, "independent_reviewer"),
+            ),
+            start=1,
+        )
+    ]
+
+
 def raw_issue(**overrides):
     value = {
         "id": ISSUE_ID,
@@ -116,6 +152,7 @@ class FakeWorkflowRunner:
             parent_issue_id=None,
             stage=None,
             status="in_progress",
+            assignee_id=SQUAD_ID,
             assignee_type="squad",
         )
         self.metadata = {
@@ -169,6 +206,14 @@ class FakeWorkflowRunner:
             return assignment_agents()
         if call == ("project", "list", "--output", "json"):
             return assignment_projects()
+        if call == ("squad", "list", "--output", "json"):
+            return assignment_squads()
+        if call == ("squad", "get", SQUAD_ID, "--output", "json"):
+            return assignment_squad_detail()
+        if call == (
+            "squad", "member", "list", SQUAD_ID, "--output", "json"
+        ):
+            return assignment_squad_members()
         if call == ("issue", "get", "PRO-36", "--output", "json"):
             if self.issue["status"] == "done":
                 self._post_done_detail_reads += 1
@@ -295,8 +340,13 @@ class FakeSnapshotFinishRunner:
         self.evidence_drift_after_first_read = set()
         self.assignment_agents = assignment_agents()
         self.assignment_projects = assignment_projects()
+        self.assignment_squads = assignment_squads()
+        self.assignment_squad_detail = assignment_squad_detail()
+        self.assignment_squad_members = assignment_squad_members()
         self.assignment_read_count = 0
         self.assignment_drift_after_first_read = False
+        self.post_status_parent_updates = None
+        self.post_status_squad_members = None
         for index, item in enumerate(snapshot.children, start=100):
             issue_id = f"01a00000-0000-7000-8000-{index:012d}"
             self.issues[item.issue_key] = raw_issue(
@@ -536,6 +586,18 @@ class FakeSnapshotFinishRunner:
             return copy.deepcopy(self.assignment_agents)
         if call == ("project", "list", "--output", "json"):
             return copy.deepcopy(self.assignment_projects)
+        if call == ("squad", "list", "--output", "json"):
+            return copy.deepcopy(self.assignment_squads)
+        if call == ("squad", "get", SQUAD_ID, "--output", "json"):
+            return copy.deepcopy(self.assignment_squad_detail)
+        if call[:2] == ("squad", "get"):
+            raise RuntimeError("unknown squad detail")
+        if call == (
+            "squad", "member", "list", SQUAD_ID, "--output", "json"
+        ):
+            return copy.deepcopy(self.assignment_squad_members)
+        if call[:3] == ("squad", "member", "list"):
+            raise RuntimeError("unknown squad membership")
         if call[:2] == ("issue", "get"):
             identifier = call[2]
             if identifier in {PARENT_ID, self.snapshot.identifier}:
@@ -571,6 +633,12 @@ class FakeSnapshotFinishRunner:
             return copy.deepcopy(self.runs[call[2]])
         if call[:3] == ("issue", "status", self.target_key):
             self.issues[self.target_key]["status"] = call[3]
+            if self.post_status_parent_updates is not None:
+                self.parent.update(copy.deepcopy(self.post_status_parent_updates))
+            if self.post_status_squad_members is not None:
+                self.assignment_squad_members = copy.deepcopy(
+                    self.post_status_squad_members
+                )
             return copy.deepcopy(self.issues[self.target_key])
         raise AssertionError(f"unsupported snapshot completion argv: {call!r}")
 
@@ -1176,6 +1244,65 @@ class PhaseCompletionTests(unittest.TestCase):
                     finish_phase(runner, "PRO-36", completion)
 
                 self.assertEqual(runner.mutation_count, 0)
+
+    def test_finish_phase_requires_the_exact_parent_control_envelope(self):
+        snapshot = parent_snapshot(
+            children=(
+                phase(
+                    "PRO-36", 1, "implementation",
+                    result=None, status="in_review",
+                ),
+            )
+        )
+        cases = {
+            "backend parent project": lambda runner: runner.parent.update(
+                {"project_id": BACKEND_PROJECT_ID}
+            ),
+            "agent parent assignee": lambda runner: runner.parent.update(
+                {"assignee_id": AGENT_ID, "assignee_type": "agent"}
+            ),
+            "foreign squad": lambda runner: runner.parent.update(
+                {"assignee_id": FOREIGN_SQUAD_ID}
+            ),
+            "missing squad authority": lambda runner: setattr(
+                runner, "assignment_squads", []
+            ),
+            "foreign squad member": lambda runner: runner.assignment_squad_members.append(
+                {
+                    "id": "membership-foreign",
+                    "squad_id": SQUAD_ID,
+                    "member_id": WATCHER_ID,
+                    "member_type": "agent",
+                    "role": "watcher",
+                }
+            ),
+        }
+        for label, corrupt in cases.items():
+            with self.subTest(label=label):
+                runner = FakeSnapshotFinishRunner(snapshot, "PRO-36")
+                corrupt(runner)
+
+                with self.assertRaises(RuntimeError):
+                    finish_phase(runner, "PRO-36", implementation_completion())
+
+                self.assertEqual(runner.mutation_count, 0)
+
+    def test_finish_phase_reports_parent_authority_drift_after_status_write(self):
+        snapshot = parent_snapshot(
+            children=(
+                phase(
+                    "PRO-36", 1, "implementation",
+                    result=None, status="in_review",
+                ),
+            )
+        )
+        runner = FakeSnapshotFinishRunner(snapshot, "PRO-36")
+        runner.post_status_parent_updates = {"project_id": BACKEND_PROJECT_ID}
+
+        with self.assertRaises(RuntimeError):
+            finish_phase(runner, "PRO-36", implementation_completion())
+
+        self.assertEqual(runner.issues["PRO-36"]["status"], "done")
 
     def test_finish_phase_accepts_valid_repository_qa_and_integration_suite(self):
         backend_sha = "b" * 40
@@ -2121,6 +2248,23 @@ def parent_snapshot(**overrides):
         "assignment_project_ids": (
             ("backend", BACKEND_PROJECT_ID),
             ("frontend", PROJECT_ID),
+        ),
+        "parent_project_id": PROJECT_ID,
+        "parent_assignee_id": SQUAD_ID,
+        "parent_assignee_type": "squad",
+        "delivery_squad_id": SQUAD_ID,
+        "delivery_lead_id": DELIVERY_LEAD_ID,
+        "delivery_squad_leader_id": DELIVERY_LEAD_ID,
+        "delivery_squad_members": tuple(
+            sorted(
+                (
+                    (DELIVERY_LEAD_ID, "agent", "leader"),
+                    (AGENT_ID, "agent", "frontend_engineer"),
+                    (BACKEND_AGENT_ID, "agent", "backend_engineer"),
+                    (QA_ID, "agent", "integration_qa"),
+                    (REVIEWER_ID, "agent", "independent_reviewer"),
+                )
+            )
         ),
     }
     values.update(overrides)
@@ -4262,16 +4406,40 @@ class FakeParentCompletionRunner:
             parent_issue_id=None,
             stage=None,
             status=status,
+            assignee_id=SQUAD_ID,
             assignee_type=assignee_type,
         )
         self.calls = []
         self.freeze_status = False
+        self.assignment_agents = assignment_agents()
+        self.assignment_projects = assignment_projects()
+        self.assignment_squads = assignment_squads()
+        self.assignment_squad_detail = assignment_squad_detail()
+        self.assignment_squad_members = assignment_squad_members()
+        self.post_status_parent_updates = None
+        self.post_status_squad_members = None
 
     def run(self, args, *, stdin_json=None):
         if stdin_json is not None:
             raise AssertionError("workflow commands never accept stdin JSON")
         call = tuple(args)
         self.calls.append(call)
+        if call == ("agent", "list", "--output", "json"):
+            return copy.deepcopy(self.assignment_agents)
+        if call == ("project", "list", "--output", "json"):
+            return copy.deepcopy(self.assignment_projects)
+        if call == ("squad", "list", "--output", "json"):
+            return copy.deepcopy(self.assignment_squads)
+        if call == ("squad", "get", SQUAD_ID, "--output", "json"):
+            return copy.deepcopy(self.assignment_squad_detail)
+        if call[:2] == ("squad", "get"):
+            raise RuntimeError("unknown squad detail")
+        if call == (
+            "squad", "member", "list", SQUAD_ID, "--output", "json"
+        ):
+            return copy.deepcopy(self.assignment_squad_members)
+        if call[:3] == ("squad", "member", "list"):
+            raise RuntimeError("unknown squad membership")
         if call == ("issue", "get", "PRO-35", "--output", "json"):
             return copy.deepcopy(self.issue)
         if call == (
@@ -4279,6 +4447,12 @@ class FakeParentCompletionRunner:
         ):
             if not self.freeze_status:
                 self.issue["status"] = "done"
+            if self.post_status_parent_updates is not None:
+                self.issue.update(copy.deepcopy(self.post_status_parent_updates))
+            if self.post_status_squad_members is not None:
+                self.assignment_squad_members = copy.deepcopy(
+                    self.post_status_squad_members
+                )
             return {"ignored": "mutation acknowledgement"}
         raise AssertionError(f"unsupported argv: {call!r}")
 
@@ -4377,6 +4551,38 @@ class ParentCompletionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "parent completion failed"):
             finish_parent(frozen, "PRO-35", self.completion_snapshot)
 
+    def test_parent_completion_requires_the_exact_parent_control_envelope(self):
+        cases = {
+            "backend parent project": {"project_id": BACKEND_PROJECT_ID},
+            "agent parent assignee": {
+                "assignee_id": AGENT_ID,
+                "assignee_type": "agent",
+            },
+            "foreign squad": {"assignee_id": FOREIGN_SQUAD_ID},
+        }
+        for label, updates in cases.items():
+            with self.subTest(label=label):
+                runner = FakeParentCompletionRunner()
+                runner.issue.update(updates)
+
+                with self.assertRaisesRegex(
+                    RuntimeError, "parent completion is not authorized"
+                ):
+                    finish_parent(runner, "PRO-35", self.completion_snapshot)
+
+                self.assertFalse(
+                    any(call[:2] == ("issue", "status") for call in runner.calls)
+                )
+
+    def test_parent_completion_reports_control_envelope_post_write_drift(self):
+        runner = FakeParentCompletionRunner()
+        runner.post_status_squad_members = assignment_squad_members()[:-1]
+
+        with self.assertRaisesRegex(RuntimeError, "parent completion failed"):
+            finish_parent(runner, "PRO-35", self.completion_snapshot)
+
+        self.assertEqual(runner.issue["status"], "done")
+
     def test_parser_accepts_finish_parent_without_deployment_flags(self):
         args = build_workflow_parser().parse_args(["finish-parent", "PRO-35"])
         self.assertEqual(args.command, "finish-parent")
@@ -4469,6 +4675,23 @@ def stalled_workflow(**overrides):
         assignment_project_ids=(
             ("backend", BACKEND_PROJECT_ID),
             ("frontend", PROJECT_ID),
+        ),
+        parent_project_id=PROJECT_ID,
+        parent_assignee_id=SQUAD_ID,
+        parent_assignee_type="squad",
+        delivery_squad_id=SQUAD_ID,
+        delivery_lead_id=DELIVERY_LEAD_ID,
+        delivery_squad_leader_id=DELIVERY_LEAD_ID,
+        delivery_squad_members=tuple(
+            sorted(
+                (
+                    (DELIVERY_LEAD_ID, "agent", "leader"),
+                    (AGENT_ID, "agent", "frontend_engineer"),
+                    (BACKEND_AGENT_ID, "agent", "backend_engineer"),
+                    (QA_ID, "agent", "integration_qa"),
+                    (REVIEWER_ID, "agent", "independent_reviewer"),
+                )
+            )
         ),
     )
     values["children"] = children
@@ -6309,6 +6532,7 @@ class FakeRepairRunner:
             parent_issue_id=None,
             stage=None,
             status="in_progress",
+            assignee_id=SQUAD_ID,
             assignee_type="squad",
         )
         self.children = []
@@ -6326,6 +6550,11 @@ class FakeRepairRunner:
         self.comments = []
         self.authorization_comment_reads = 0
         self.authorization_drift_after_first_read = False
+        self.assignment_agents = assignment_agents()
+        self.assignment_projects = assignment_projects()
+        self.assignment_squads = assignment_squads()
+        self.assignment_squad_detail = assignment_squad_detail()
+        self.assignment_squad_members = assignment_squad_members()
         self.evidence_comments = {}
         self.evidence_reads = {}
         self.evidence_drift_after_first_read = set()
@@ -6503,9 +6732,21 @@ class FakeRepairRunner:
         call = tuple(args)
         self.calls.append(call)
         if call == ("agent", "list", "--output", "json"):
-            return assignment_agents()
+            return copy.deepcopy(self.assignment_agents)
         if call == ("project", "list", "--output", "json"):
-            return assignment_projects()
+            return copy.deepcopy(self.assignment_projects)
+        if call == ("squad", "list", "--output", "json"):
+            return copy.deepcopy(self.assignment_squads)
+        if call == ("squad", "get", SQUAD_ID, "--output", "json"):
+            return copy.deepcopy(self.assignment_squad_detail)
+        if call[:2] == ("squad", "get"):
+            raise RuntimeError("unknown squad detail")
+        if call == (
+            "squad", "member", "list", SQUAD_ID, "--output", "json"
+        ):
+            return copy.deepcopy(self.assignment_squad_members)
+        if call[:3] == ("squad", "member", "list"):
+            raise RuntimeError("unknown squad membership")
         if call[:2] == ("issue", "get"):
             identifier = call[2]
             if identifier in {"PRO-65", PARENT_ID}:
@@ -7275,6 +7516,61 @@ class RepairExecutionTests(unittest.TestCase):
                         runner.child_drift_after_first_evidence_read.add(key)
 
                 with self.assertRaisesRegex(RuntimeError, "evidence"):
+                    load_parent_snapshot(
+                        runner,
+                        FakeRepairGitHubRunner(),
+                        "PRO-65",
+                    )
+
+                self.assertEqual(runner.mutation_calls, [])
+
+    def test_parent_load_requires_the_exact_direct_parent_control_envelope(self):
+        cases = {
+            "backend parent project": lambda runner: runner.parent.update(
+                {"project_id": BACKEND_PROJECT_ID}
+            ),
+            "agent parent assignee": lambda runner: runner.parent.update(
+                {"assignee_id": BACKEND_AGENT_ID, "assignee_type": "agent"}
+            ),
+            "foreign squad": lambda runner: runner.parent.update(
+                {"assignee_id": FOREIGN_SQUAD_ID}
+            ),
+            "missing squad": lambda runner: setattr(
+                runner, "assignment_squads", []
+            ),
+            "duplicate squad": lambda runner: runner.assignment_squads.append(
+                {
+                    "id": FOREIGN_SQUAD_ID,
+                    "name": "Eventra Local Delivery",
+                }
+            ),
+            "foreign leader": lambda runner: runner.assignment_squad_detail.update(
+                {"leader_id": WATCHER_ID}
+            ),
+            "missing member": lambda runner: setattr(
+                runner,
+                "assignment_squad_members",
+                runner.assignment_squad_members[:-1],
+            ),
+            "wrong member role": lambda runner: runner.assignment_squad_members[1].update(
+                {"role": "backend_engineer"}
+            ),
+            "watcher in squad": lambda runner: runner.assignment_squad_members.append(
+                {
+                    "id": "membership-watcher",
+                    "squad_id": SQUAD_ID,
+                    "member_id": WATCHER_ID,
+                    "member_type": "agent",
+                    "role": "watcher",
+                }
+            ),
+        }
+        for label, corrupt in cases.items():
+            with self.subTest(label=label):
+                runner = FakeRepairRunner(attempt=0)
+                corrupt(runner)
+
+                with self.assertRaises(RuntimeError):
                     load_parent_snapshot(
                         runner,
                         FakeRepairGitHubRunner(),

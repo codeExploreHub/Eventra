@@ -233,6 +233,14 @@ product-neutral HTTPS, but its normalized path must end exactly in
 fragment, or traversal. Any malformed JSON or bundle, version mismatch, stale
 or deleted evidence comment, stale child, or PR drift is a human-visible block.
 
+Every direct version-2 parent command uses the frontend Project as the sole
+control Project and requires the exact provisioned `Eventra Local Delivery`
+Squad assignment, Delivery Lead leader, and five-Agent canonical membership.
+The same read-only authority envelope is used by planning, repair/smoke
+execution, phase and parent completion, and Watcher recovery, and is reread at
+each mutation boundary. Backend repository children still route to the backend
+Project; that does not authorize a parent in the backend Project.
+
 An implementation assignment is usable only after Delivery Lead creates it in
 backlog and persists the canonical Stage action, single repository target,
 Engineer role, exact Engineer/Project identity, and its creation provenance and
