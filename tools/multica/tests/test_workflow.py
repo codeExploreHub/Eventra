@@ -662,13 +662,21 @@ class FakeSnapshotFinishRunner:
 
 
 class FakeSnapshotGitHubRunner:
-    def __init__(self, pull_requests):
+    def __init__(self, pull_requests, *, drift_after=None, drifted=None):
         self.pull_requests = {item.url: item for item in pull_requests}
         self.calls = []
+        self.drift_after = drift_after
+        self.drifted = drifted
 
     def run(self, args):
         self.calls.append(tuple(args))
         item = self.pull_requests[args[2]]
+        if (
+            self.drift_after is not None
+            and len(self.calls) > self.drift_after
+            and self.drifted is not None
+        ):
+            item = self.drifted
         return {
             "url": item.url,
             "headRefOid": item.head_sha,
@@ -976,14 +984,56 @@ class PhaseCompletionTests(unittest.TestCase):
         self.assertEqual(runner._post_done_metadata_reads, 2)
         self.assertEqual(runner._post_done_detail_reads, 2)
 
-    def test_finish_phase_accepts_live_implementation_seed_and_replacement(self):
+    def test_finish_phase_accepts_live_backend_seed_and_replacement(self):
         runner = FakeWorkflowRunner()
-        runner.metadata.pop("eventra.phase.failure_repositories")
-        runner.metadata.pop("eventra.phase.pr")
+        source_sha = "b" * 40
         replacement_sha = "c" * 40
-        completion = implementation_completion(frontend_sha=replacement_sha)
+        backend_pr_url = "https://github.com/codeExploreHub/Eventra-Backend/pull/7"
+        action = (
+            "2:PRO-35:create_implementation_stage:0:backend:-:"
+            + source_sha
+            + ":next-stage:1"
+        )
+        runner.issue.update(
+            {
+                "project_id": BACKEND_PROJECT_ID,
+                "assignee_id": BACKEND_AGENT_ID,
+            }
+        )
+        runner.metadata = {
+            "eventra.workflow.version": "2",
+            "eventra.phase.kind": "implementation",
+            "eventra.phase.attempt": "0",
+            "eventra.phase.sha.backend": source_sha,
+            "eventra.phase.creation_action": action,
+            "eventra.phase.target": "repository:backend",
+            "eventra.phase.role": "backend_engineer",
+        }
+        runner.parent_metadata.update(
+            {
+                "eventra.workflow.classification": "backend-only",
+                "eventra.workflow.frontend_sha": None,
+                "eventra.workflow.backend_sha": source_sha,
+                "eventra.workflow.last_action": action,
+            }
+        )
+        runner.parent_metadata.pop("eventra.workflow.frontend_sha")
+        completion = implementation_completion(
+            frontend_sha=None,
+            backend_sha=replacement_sha,
+            pr_url=backend_pr_url,
+        )
         github = FakeSnapshotGitHubRunner(
-            (frontend_pr(head_sha=replacement_sha),)
+            (
+                PullRequestSnapshot(
+                    "backend",
+                    backend_pr_url,
+                    replacement_sha,
+                    "open",
+                    True,
+                    True,
+                ),
+            )
         )
 
         with patch.object(
@@ -996,14 +1046,85 @@ class PhaseCompletionTests(unittest.TestCase):
         self.assertEqual(result.status, "done")
         self.assertEqual(result.mutation_count, 9)
         self.assertEqual(
-            runner.metadata["eventra.phase.sha.frontend"],
+            runner.metadata["eventra.phase.sha.backend"],
             replacement_sha,
         )
-        self.assertEqual(runner.metadata["eventra.phase.pr"], FRONTEND_PR)
+        self.assertEqual(runner.metadata["eventra.phase.pr"], backend_pr_url)
         self.assertEqual(
             runner.metadata["eventra.phase.failure_repositories"],
             "[]",
         )
+
+    def test_finish_phase_rechecks_replacement_pr_before_terminal_status(self):
+        runner = FakeWorkflowRunner()
+        runner.metadata.pop("eventra.phase.failure_repositories")
+        runner.metadata.pop("eventra.phase.pr")
+        replacement_sha = "c" * 40
+        completion = implementation_completion(frontend_sha=replacement_sha)
+        github = FakeSnapshotGitHubRunner(
+            (frontend_pr(head_sha=replacement_sha),),
+            drift_after=1,
+            drifted=frontend_pr(head_sha="d" * 40),
+        )
+
+        with patch.object(
+            workflow_module,
+            "GitHubRunner",
+            return_value=github,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "pull-request authority changed",
+            ):
+                finish_phase(runner, "PRO-36", completion)
+
+        self.assertFalse(
+            any(call[:2] == ("issue", "status") for call in runner.calls)
+        )
+
+    def test_finish_phase_retries_exact_replacement_envelope_at_status_boundary(self):
+        runner = FakeWorkflowRunner()
+        runner.metadata.pop("eventra.phase.failure_repositories")
+        runner.metadata.pop("eventra.phase.pr")
+        runner.freeze_status = True
+        replacement_sha = "c" * 40
+        completion = implementation_completion(frontend_sha=replacement_sha)
+        github = FakeSnapshotGitHubRunner(
+            (frontend_pr(head_sha=replacement_sha),)
+        )
+
+        with patch.object(
+            workflow_module,
+            "GitHubRunner",
+            return_value=github,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "phase completion failed"):
+                finish_phase(runner, "PRO-36", completion)
+            retry_start = len(runner.calls)
+            runner.freeze_status = False
+            result = finish_phase(runner, "PRO-36", completion)
+
+        retry_calls = runner.calls[retry_start:]
+        self.assertEqual(result.status, "done")
+        self.assertFalse(
+            any(call[:3] == ("issue", "metadata", "set") for call in retry_calls)
+        )
+        self.assertEqual(
+            sum(call[:2] == ("issue", "status") for call in retry_calls),
+            1,
+        )
+
+    def test_terminal_version_two_phase_requires_failure_repository_envelope(self):
+        runner = FakeWorkflowRunner()
+        runner.issue["status"] = "done"
+        runner.metadata = build_phase_metadata(implementation_completion())
+        runner.metadata.pop("eventra.phase.failure_repositories")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "terminal phase metadata conflicts",
+        ):
+            finish_phase(runner, "PRO-36", implementation_completion())
 
     def test_finish_phase_never_returns_done_after_write_boundary_drift(self):
         cases = (

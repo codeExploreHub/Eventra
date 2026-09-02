@@ -1939,7 +1939,7 @@ def _implementation_assignment_problem(
             if repository == "frontend"
             else phase.frontend_sha
         )
-        completed = phase.status == "done" and phase.result in PHASE_RESULTS
+        completion_recorded = phase.result in PHASE_RESULTS
         if (
             phase.workflow_version != 2
             or phase.kind != "implementation"
@@ -1955,10 +1955,10 @@ def _implementation_assignment_problem(
             or other_sha is not None
             or phase_sha is None
             or (
-                not completed
+                not completion_recorded
                 and phase_sha != source_candidates.get(repository)
             )
-            or (completed and not phase.pr_url)
+            or (completion_recorded and not phase.pr_url)
             or (
                 phase.pr_url
                 and _repository_for_pr(phase.pr_url) != repository
@@ -5932,6 +5932,7 @@ def _finish_phase_authority_problem(
     detail: dict[str, object],
     metadata: dict[str, str],
     value: PhaseCompletion,
+    implementation_pr_authority: PullRequestSnapshot | None = None,
 ) -> str | None:
     parent_id = str(detail["parent_issue_id"])
     raw_parent = runner.run(
@@ -6082,22 +6083,13 @@ def _finish_phase_authority_problem(
                 not in {None, value.pr_url}
             ):
                 return "phase completion conflicts with current assignment provenance"
-            try:
-                pull_request = _parse_pull_request(
-                    GitHubRunner().run(
-                        [
-                            "pr", "view", str(value.pr_url),
-                            "--json",
-                            "url,headRefOid,state,mergeable,"
-                            "mergeStateStatus,statusCheckRollup",
-                        ]
-                    ),
-                    str(value.pr_url),
-                    repository,
-                )
-            except (RuntimeError, TypeError, ValueError):
-                return "implementation pull-request authority is malformed"
-            if pull_request.head_sha != requested_sha or pull_request.state != "open":
+            if (
+                implementation_pr_authority is None
+                or implementation_pr_authority.repository != repository
+                or implementation_pr_authority.url != value.pr_url
+                or implementation_pr_authority.head_sha != requested_sha
+                or implementation_pr_authority.state != "open"
+            ):
                 return "implementation pull-request authority is conflicting"
         elif (
             loaded_candidates != requested_candidates
@@ -6387,6 +6379,34 @@ def _finish_gate_evidence_authority(
     )
 
 
+def _finish_implementation_pr_authority(
+    value: PhaseCompletion,
+) -> PullRequestSnapshot | None:
+    if value.kind != "implementation":
+        return None
+    repository = _repository_for_pr(str(value.pr_url))
+    raw = GitHubRunner().run(
+        [
+            "pr", "view", str(value.pr_url),
+            "--json",
+            "url,headRefOid,state,mergeable,mergeStateStatus,statusCheckRollup",
+        ]
+    )
+    pull_request = _parse_pull_request(
+        raw,
+        str(value.pr_url),
+        repository,
+    )
+    expected_sha = (
+        value.frontend_sha
+        if repository == "frontend"
+        else value.backend_sha
+    )
+    if pull_request.head_sha != expected_sha or pull_request.state != "open":
+        raise RuntimeError("implementation pull-request authority is conflicting")
+    return pull_request
+
+
 def finish_phase(
     runner: MulticaRunner,
     issue_key: str,
@@ -6420,6 +6440,9 @@ def finish_phase(
                 }
                 else None
             )
+            implementation_pr_authority = (
+                _finish_implementation_pr_authority(value)
+            )
             evidence_before = _finish_gate_evidence_authority(
                 runner,
                 detail,
@@ -6434,6 +6457,7 @@ def finish_phase(
                 detail,
                 before,
                 value,
+                implementation_pr_authority,
             )
             if authority_problem is not None:
                 raise RuntimeError(authority_problem)
@@ -6454,6 +6478,13 @@ def finish_phase(
             )
             if evidence_after != evidence_before:
                 raise RuntimeError("Gate evidence comment changed during replay")
+            if (
+                _finish_implementation_pr_authority(value)
+                != implementation_pr_authority
+            ):
+                raise RuntimeError(
+                    "implementation pull-request authority changed during replay"
+                )
             return PhaseResult(
                 str(detail["id"]), issue_key, "done", value.kind, value.result, 0
             )
@@ -6479,6 +6510,7 @@ def finish_phase(
         }
         else None
     )
+    implementation_pr_authority = _finish_implementation_pr_authority(value)
     evidence_before = _finish_gate_evidence_authority(runner, detail, value)
     authority_envelope = _finish_parent_authority_envelope(runner, detail)
     authority_problem = _finish_phase_authority_problem(
@@ -6486,6 +6518,7 @@ def finish_phase(
         detail,
         before,
         value,
+        implementation_pr_authority,
     )
     if authority_problem is not None:
         raise RuntimeError(authority_problem)
@@ -6519,6 +6552,18 @@ def finish_phase(
     ):
         raise RuntimeError("phase metadata conflicts with request")
 
+    def require_stable_implementation_pr(boundary: str) -> None:
+        try:
+            current = _finish_implementation_pr_authority(value)
+        except (RuntimeError, TypeError, ValueError):
+            raise RuntimeError(
+                f"implementation pull-request authority changed {boundary}"
+            ) from None
+        if current != implementation_pr_authority:
+            raise RuntimeError(
+                f"implementation pull-request authority changed {boundary}"
+            )
+
     def require_stable_write_authority(boundary: str) -> None:
         try:
             current_parent_authority = _finish_parent_authority_envelope(
@@ -6547,26 +6592,30 @@ def finish_phase(
             raise RuntimeError(
                 f"phase authority changed {boundary} metadata mutation"
             )
+        require_stable_implementation_pr(f"{boundary} metadata mutation")
 
-    for key, item in wanted.items():
-        require_stable_write_authority("before")
-        runner.run(
-            [
-                "issue",
-                "metadata",
-                "set",
-                issue_key,
-                "--key",
-                key,
-                "--value",
-                item,
-                "--type",
-                "string",
-                "--output",
-                "json",
-            ]
-        )
-        require_stable_write_authority("after")
+    metadata_mutations = 0
+    if controlled_before != wanted:
+        for key, item in wanted.items():
+            require_stable_write_authority("before")
+            runner.run(
+                [
+                    "issue",
+                    "metadata",
+                    "set",
+                    issue_key,
+                    "--key",
+                    key,
+                    "--value",
+                    item,
+                    "--type",
+                    "string",
+                    "--output",
+                    "json",
+                ]
+            )
+            metadata_mutations += 1
+            require_stable_write_authority("after")
     expected_authority = _controlled_phase_authority(before)
     expected_authority.update(wanted)
     observed_authorities = tuple(
@@ -6614,6 +6663,7 @@ def finish_phase(
         or evidence_after_status_gate != evidence_before
     ):
         raise RuntimeError("Gate evidence comment changed before terminal transition")
+    require_stable_implementation_pr("before terminal transition")
     runner.run(
         [
             "issue",
@@ -6676,6 +6726,7 @@ def finish_phase(
         or final_assignment_authority != assignment_authority
     ):
         raise RuntimeError("phase authority changed after terminal transition")
+    require_stable_implementation_pr("before completion return")
     final = final_observations[0][0]
     return PhaseResult(
         str(final["id"]),
@@ -6683,7 +6734,7 @@ def finish_phase(
         "done",
         value.kind,
         value.result,
-        len(wanted) + 1,
+        metadata_mutations + 1,
     )
 
 
