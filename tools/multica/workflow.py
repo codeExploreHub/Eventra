@@ -6312,9 +6312,9 @@ def _finish_parent_authority_envelope(
     runner: MulticaRunner,
     detail: dict[str, object],
 ) -> tuple[
-    dict[str, object],
+    tuple[object, ...],
     dict[str, str],
-    tuple[dict[str, object], ...],
+    tuple[tuple[object, ...], ...],
     tuple[object, ...],
 ]:
     parent_id = str(detail["parent_issue_id"])
@@ -6353,7 +6353,28 @@ def _finish_parent_authority_envelope(
     problem = _parent_control_detail_problem(parent, authority)
     if problem is not None:
         raise RuntimeError(problem)
-    return parent, parent_metadata, children, authority
+
+    def issue_authority_identity(issue: dict[str, object]) -> tuple[object, ...]:
+        return tuple(
+            issue[key]
+            for key in (
+                "id",
+                "identifier",
+                "parent_issue_id",
+                "stage",
+                "status",
+                "assignee_id",
+                "assignee_type",
+                "project_id",
+            )
+        )
+
+    return (
+        issue_authority_identity(parent),
+        parent_metadata,
+        tuple(issue_authority_identity(child) for child in children),
+        authority,
+    )
 
 
 def _controlled_phase_authority(metadata: dict[str, str]) -> dict[str, str]:

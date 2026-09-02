@@ -188,6 +188,7 @@ class FakeWorkflowRunner:
         self.drift_post_done_detail = False
         self.after_metadata_set_number = None
         self.after_metadata_set = None
+        self.touch_child_on_metadata_set = False
         self._metadata_sets = 0
         self._post_write_metadata_reads = 0
         self._post_done_metadata_reads = 0
@@ -299,6 +300,8 @@ class FakeWorkflowRunner:
             if key == self.fail_metadata_key:
                 raise RuntimeError("Multica command failed with exit 1")
             self.metadata[key] = call[7]
+            if self.touch_child_on_metadata_set:
+                self.issue["updated_at"] = "2026-08-25T08:55:00Z"
             self._metadata_sets += 1
             if (
                 self.after_metadata_set_number == self._metadata_sets
@@ -1054,6 +1057,14 @@ class PhaseCompletionTests(unittest.TestCase):
             runner.metadata["eventra.phase.failure_repositories"],
             "[]",
         )
+
+    def test_finish_phase_ignores_own_child_updated_at_refresh(self):
+        runner = FakeWorkflowRunner()
+        runner.touch_child_on_metadata_set = True
+
+        result = finish_phase(runner, "PRO-36", implementation_completion())
+
+        self.assertEqual(result.status, "done")
 
     def test_finish_phase_rechecks_replacement_pr_before_terminal_status(self):
         runner = FakeWorkflowRunner()
