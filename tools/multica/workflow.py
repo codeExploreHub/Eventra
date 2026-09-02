@@ -610,6 +610,44 @@ def _repair_action_source_candidates(value: str) -> dict[str, str]:
     return dict(sorted(candidates.items()))
 
 
+def _implementation_action_source_candidates(value: str) -> dict[str, str]:
+    parts = value.split(":") if type(value) is str else []
+    if (
+        len(parts) != 9
+        or parts[0] != "2"
+        or ISSUE_KEY_PATTERN.fullmatch(parts[1]) is None
+        or parts[2] != "create_implementation_stage"
+        or parts[3] not in {"0", "1", "2", "3"}
+        or parts[4] not in {"frontend", "backend", "cross-stack"}
+        or any(
+            candidate != "-" and SHA_PATTERN.fullmatch(candidate) is None
+            for candidate in parts[5:7]
+        )
+        or parts[7] != "next-stage"
+        or not parts[8].isdigit()
+        or str(int(parts[8])) != parts[8]
+        or int(parts[8]) < 1
+    ):
+        raise RuntimeError("malformed implementation action identity")
+    candidates = {
+        repository: candidate
+        for repository, candidate in zip(
+            ("frontend", "backend"),
+            parts[5:7],
+            strict=True,
+        )
+        if candidate != "-"
+    }
+    expected = {
+        "frontend": {"frontend"},
+        "backend": {"backend"},
+        "cross-stack": {"frontend", "backend"},
+    }[parts[4]]
+    if set(candidates) != expected:
+        raise RuntimeError("malformed implementation action source candidates")
+    return dict(sorted(candidates.items()))
+
+
 def _decode_source_candidates(value: str) -> dict[str, str]:
     try:
         decoded = json.loads(value)
@@ -1863,9 +1901,16 @@ def _implementation_assignment_problem(
     if authority_problem is not None:
         return authority_problem
     expected_repositories = _expected_repositories(parent)
+    try:
+        source_candidates = _implementation_action_source_candidates(
+            parent.last_action or ""
+        )
+    except RuntimeError:
+        return "current implementation assignment action is malformed"
+    source_snapshot = _snapshot_with_candidates(parent, source_candidates)
     expected_action = _action_key(
         replace(
-            parent,
+            source_snapshot,
             next_stage=parent.next_stage - 1,
             last_action=None,
         ),
@@ -1877,20 +1922,24 @@ def _implementation_assignment_problem(
     observed: dict[str, PhaseSnapshot] = {}
     assignees: set[str] = set()
     for phase in phases:
-        repositories = tuple(
-            repository
-            for repository, sha in (
-                ("frontend", phase.frontend_sha),
-                ("backend", phase.backend_sha),
-            )
-            if sha is not None
-        )
-        if len(repositories) != 1:
+        if not phase.phase_target.startswith("repository:"):
             return "current implementation assignment candidate scope is malformed"
-        repository = repositories[0]
+        repository = phase.phase_target.removeprefix("repository:")
+        if repository not in expected_repositories:
+            return "current implementation assignment candidate scope is malformed"
         if repository in observed:
             return "current implementation assignment membership is conflicting"
-        expected_sha = _candidate_sha_map(parent).get(repository)
+        phase_sha = (
+            phase.frontend_sha
+            if repository == "frontend"
+            else phase.backend_sha
+        )
+        other_sha = (
+            phase.backend_sha
+            if repository == "frontend"
+            else phase.frontend_sha
+        )
+        completed = phase.status == "done" and phase.result in PHASE_RESULTS
         if (
             phase.workflow_version != 2
             or phase.kind != "implementation"
@@ -1903,14 +1952,17 @@ def _implementation_assignment_problem(
             or phase.assignee_type != "agent"
             or phase.assignee_id != expected_agents[f"{repository}_engineer"]
             or phase.project_id != expected_projects[repository]
-            or phase.frontend_sha != (
-                expected_sha if repository == "frontend" else None
+            or other_sha is not None
+            or phase_sha is None
+            or (
+                not completed
+                and phase_sha != source_candidates.get(repository)
             )
-            or phase.backend_sha != (
-                expected_sha if repository == "backend" else None
+            or (completed and not phase.pr_url)
+            or (
+                phase.pr_url
+                and _repository_for_pr(phase.pr_url) != repository
             )
-            or not phase.pr_url
-            or _repository_for_pr(phase.pr_url) != repository
             or phase.failure_bundle_digest
             or phase.failure_evidence_uuids
             or phase.authorizing_comment_uuid
@@ -1923,8 +1975,49 @@ def _implementation_assignment_problem(
         assignees.add(phase.assignee_id)
     if set(observed) != expected_repositories or len(assignees) != len(observed):
         return "current implementation assignment membership is incomplete"
-    if _assignment_pull_request_problem(parent) is not None:
+    pull_requests = {item.repository: item for item in parent.pull_requests}
+    pr_bound = {
+        repository: phase
+        for repository, phase in observed.items()
+        if phase.pr_url
+    }
+    if (
+        len(pull_requests) != len(parent.pull_requests)
+        or set(pull_requests) != set(pr_bound)
+        or any(
+            pull_requests[repository].url != phase.pr_url
+            or pull_requests[repository].head_sha
+            != (
+                phase.frontend_sha
+                if repository == "frontend"
+                else phase.backend_sha
+            )
+            or pull_requests[repository].state != "open"
+            for repository, phase in pr_bound.items()
+        )
+    ):
         return "current implementation pull-request authority is conflicting"
+    parent_candidates = _candidate_sha_map(parent)
+    completed_candidates = {
+        repository: (
+            phase.frontend_sha
+            if repository == "frontend"
+            else phase.backend_sha
+        )
+        for repository, phase in observed.items()
+    }
+    all_completed = all(
+        phase.status == "done" and phase.result in PHASE_RESULTS
+        for phase in observed.values()
+    )
+    if (
+        parent_candidates != source_candidates
+        and (
+            not all_completed
+            or parent_candidates != completed_candidates
+        )
+    ):
+        return "current implementation parent candidates are conflicting"
     return None
 
 
@@ -2614,10 +2707,14 @@ def _phase_snapshot(
     failure_evidence_uuids: tuple[str, ...] = ()
     repair_source_candidates: tuple[tuple[str, str], ...] = ()
     if version == "2":
-        try:
-            decoded_repositories = json.loads(failure_repositories)
-        except (json.JSONDecodeError, TypeError):
-            raise RuntimeError("malformed child phase metadata") from None
+        if failure_repositories is None:
+            decoded_repositories = []
+            failure_repositories = "[]"
+        else:
+            try:
+                decoded_repositories = json.loads(failure_repositories)
+            except (json.JSONDecodeError, TypeError):
+                raise RuntimeError("malformed child phase metadata") from None
         if (
             not isinstance(decoded_repositories, list)
             or any(
@@ -5943,7 +6040,7 @@ def _finish_phase_authority_problem(
             )
             if sha is not None
         }
-        if (
+        common_problem = (
             assignment_snapshot.identifier != str(parent["identifier"])
             or assignment_snapshot.parent_id != str(parent["id"])
             or assignment_snapshot.attempt != attempt
@@ -5951,15 +6048,59 @@ def _finish_phase_authority_problem(
             or assignment_problem is not None
             or len(loaded_target) != 1
             or loaded_target[0].kind != value.kind
-            or {
-                repository: sha
-                for repository, sha in (
-                    ("frontend", loaded_target[0].frontend_sha),
-                    ("backend", loaded_target[0].backend_sha),
+        )
+        if common_problem:
+            return "phase completion conflicts with current assignment provenance"
+        loaded_candidates = {
+            repository: sha
+            for repository, sha in (
+                ("frontend", loaded_target[0].frontend_sha),
+                ("backend", loaded_target[0].backend_sha),
+            )
+            if sha is not None
+        }
+        if value.kind == "implementation":
+            try:
+                source_candidates = _implementation_action_source_candidates(
+                    assignment_snapshot.last_action or ""
                 )
-                if sha is not None
-            }
-            != requested_candidates
+            except RuntimeError:
+                return "phase completion conflicts with current assignment provenance"
+            repository = loaded_target[0].phase_target.removeprefix(
+                "repository:"
+            )
+            requested_sha = requested_candidates.get(repository)
+            if (
+                set(requested_candidates) != {repository}
+                or requested_sha is None
+                or loaded_candidates
+                not in (
+                    {repository: source_candidates.get(repository)},
+                    requested_candidates,
+                )
+                or (loaded_target[0].pr_url or None)
+                not in {None, value.pr_url}
+            ):
+                return "phase completion conflicts with current assignment provenance"
+            try:
+                pull_request = _parse_pull_request(
+                    GitHubRunner().run(
+                        [
+                            "pr", "view", str(value.pr_url),
+                            "--json",
+                            "url,headRefOid,state,mergeable,"
+                            "mergeStateStatus,statusCheckRollup",
+                        ]
+                    ),
+                    str(value.pr_url),
+                    repository,
+                )
+            except (RuntimeError, TypeError, ValueError):
+                return "implementation pull-request authority is malformed"
+            if pull_request.head_sha != requested_sha or pull_request.state != "open":
+                return "implementation pull-request authority is conflicting"
+        elif (
+            loaded_candidates != requested_candidates
             or (loaded_target[0].pr_url or None) != value.pr_url
         ):
             return "phase completion conflicts with current assignment provenance"
@@ -6361,7 +6502,15 @@ def finish_phase(
     allowed_replacement_key = (
         f"eventra.phase.sha.{before['eventra.repair.repository']}"
         if value.kind == "repair" and value.result == "pass"
-        else None
+        else (
+            "eventra.phase.sha.frontend"
+            if value.kind == "implementation" and value.frontend_sha is not None
+            else (
+                "eventra.phase.sha.backend"
+                if value.kind == "implementation" and value.backend_sha is not None
+                else None
+            )
+        )
     )
     if any(
         key not in wanted

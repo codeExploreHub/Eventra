@@ -976,6 +976,35 @@ class PhaseCompletionTests(unittest.TestCase):
         self.assertEqual(runner._post_done_metadata_reads, 2)
         self.assertEqual(runner._post_done_detail_reads, 2)
 
+    def test_finish_phase_accepts_live_implementation_seed_and_replacement(self):
+        runner = FakeWorkflowRunner()
+        runner.metadata.pop("eventra.phase.failure_repositories")
+        runner.metadata.pop("eventra.phase.pr")
+        replacement_sha = "c" * 40
+        completion = implementation_completion(frontend_sha=replacement_sha)
+        github = FakeSnapshotGitHubRunner(
+            (frontend_pr(head_sha=replacement_sha),)
+        )
+
+        with patch.object(
+            workflow_module,
+            "GitHubRunner",
+            return_value=github,
+        ):
+            result = finish_phase(runner, "PRO-36", completion)
+
+        self.assertEqual(result.status, "done")
+        self.assertEqual(result.mutation_count, 9)
+        self.assertEqual(
+            runner.metadata["eventra.phase.sha.frontend"],
+            replacement_sha,
+        )
+        self.assertEqual(runner.metadata["eventra.phase.pr"], FRONTEND_PR)
+        self.assertEqual(
+            runner.metadata["eventra.phase.failure_repositories"],
+            "[]",
+        )
+
     def test_finish_phase_never_returns_done_after_write_boundary_drift(self):
         cases = (
             "metadata double-read",
@@ -2508,6 +2537,76 @@ def parent_snapshot(**overrides):
 
 
 class ParentDecisionTests(unittest.TestCase):
+    def test_implementation_replacement_keeps_its_original_creation_authority(self):
+        source = parent_snapshot()
+        replacement_sha = "c" * 40
+        completed = replace(
+            source.children[0],
+            result="pass",
+            status="done",
+            frontend_sha=replacement_sha,
+            evidence_comment=COMMENT_ID,
+        )
+        adopted = replace(
+            source,
+            candidate_frontend_sha=replacement_sha,
+            children=(completed,),
+            pull_requests=(frontend_pr(head_sha=replacement_sha),),
+        )
+
+        decision = decide_parent_action(adopted)
+
+        self.assertEqual(decision.kind, "create_gate_stage")
+
+    def test_cross_stack_implementation_rejects_partial_parent_adoption(self):
+        backend_sha = "b" * 40
+        replacement_sha = "c" * 40
+        backend_pr = "https://github.com/codeExploreHub/Eventra-Backend/pull/7"
+        source = parent_snapshot(
+            classification="cross-stack",
+            candidate_backend_sha=backend_sha,
+            children=(
+                phase("PRO-36", 1, "implementation"),
+                phase(
+                    "PRO-37",
+                    1,
+                    "implementation",
+                    frontend_sha=None,
+                    backend_sha=backend_sha,
+                    status="in_progress",
+                    project_id=BACKEND_PROJECT_ID,
+                    assignee_id=BACKEND_AGENT_ID,
+                    pr_url=backend_pr,
+                ),
+            ),
+            pull_requests=(
+                frontend_pr(),
+                PullRequestSnapshot(
+                    "backend", backend_pr, backend_sha, "open", True, True,
+                ),
+            ),
+        )
+        completed_frontend = replace(
+            source.children[0],
+            result="pass",
+            status="done",
+            frontend_sha=replacement_sha,
+            evidence_comment=COMMENT_ID,
+        )
+        partially_adopted = replace(
+            source,
+            candidate_frontend_sha=replacement_sha,
+            children=(completed_frontend, source.children[1]),
+            pull_requests=(
+                frontend_pr(head_sha=replacement_sha),
+                source.pull_requests[1],
+            ),
+        )
+
+        decision = decide_parent_action(partially_adopted)
+
+        self.assertEqual(decision.kind, "block_parent")
+
     def _authoritative_current_repair_snapshot(self, *, parent_copied=True):
         replacement_sha = "c" * 40
         project_id = PROJECT_ID
