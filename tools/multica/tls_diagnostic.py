@@ -40,9 +40,21 @@ def diagnose_multica_tls(*, timeout_seconds: float = 10) -> TLSDiagnosticResult:
 
     if not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
         raise ValueError("diagnostic timeout must be positive")
-    proxy = None if proxy_bypass("api.multica.ai") else getproxies().get("https")
+    proxy = (
+        None
+        if proxy_bypass("api.multica.ai:443")
+        else getproxies().get("https")
+    )
     parsed_proxy = urlparse(proxy) if proxy else None
-    proxy_ports = {"http": 80, "https": 443, "socks": 1080, "socks5": 1080}
+    proxy_ports = {
+        "http": 80,
+        "https": 443,
+        "socks": 1080,
+        "socks4": 1080,
+        "socks4a": 1080,
+        "socks5": 1080,
+        "socks5h": 1080,
+    }
     target = (
         (
             parsed_proxy.hostname,

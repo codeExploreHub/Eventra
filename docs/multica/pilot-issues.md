@@ -299,8 +299,8 @@ authorization content, source evidence, candidate SHA, merged PR,
 Project/Squad assignment, Stage/attempt, unique run, and durable commit checks
 while allowing only expected child/run startup transitions. Full authority is
 reread immediately before and after child promotion. The deterministic retry
-and recovery fixtures reduce external reads from `1293 -> 475` and `898 ->
-314`, respectively.
+and recovery fixtures reduce external reads from `1293 -> 488` and `898 ->
+324`, respectively.
 
 For an ambiguous Multica connectivity failure, use the read-only
 `tools.multica.workflow diagnose-tls` entry point. It distinguishes route, TLS

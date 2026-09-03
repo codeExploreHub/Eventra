@@ -5703,6 +5703,8 @@ def _read_smoke_checkpoint_authority(
     parent_key: str,
     reservation: dict[str, object],
     trusted: tuple[object, ...],
+    *,
+    expected_parent_revision_advance: int = 0,
 ) -> tuple[object, ...]:
     """Validate a revision-fenced cached Smoke authority envelope.
 
@@ -5716,6 +5718,12 @@ def _read_smoke_checkpoint_authority(
     )
     start_parent = parse_issue_detail(start_raw_parent, parent_key)
     parent_revision = _issue_revision(start_raw_parent, label="parent issue")
+    if (
+        expected_parent_revision_advance not in {0, 1}
+        or parent_revision
+        != int(trusted[14]) + expected_parent_revision_advance
+    ):
+        raise RuntimeError("smoke parent revision checkpoint conflicts")
     start_raw_metadata = parse_issue_metadata(
         runner.run(
             ["issue", "metadata", "list", parent_key, "--output", "json"]
@@ -5876,10 +5884,20 @@ def _read_smoke_checkpoint_authority(
             ["issue", "metadata", "list", parent_key, "--output", "json"]
         )
     )
+    end_raw_children = runner.run(
+        ["issue", "children", parent_key, "--output", "json"]
+    )
+    end_children = parse_issue_children(
+        end_raw_children, str(end_parent["id"])
+    )
+    end_source_revisions = _source_issue_revisions(
+        end_raw_children, end_children, smoke_stage
+    )
     if (
         end_parent != start_parent
         or end_raw_parent != start_raw_parent
         or end_raw_metadata != start_raw_metadata
+        or end_source_revisions != source_revisions
     ):
         raise RuntimeError("smoke authority changed during checkpoint read")
     return (
@@ -5909,12 +5927,15 @@ def _resume_smoke_reservation(
     )
     authority = [first]
 
-    def checkpoint() -> tuple[object, ...]:
+    def checkpoint(
+        *, expected_parent_revision_advance: int = 0
+    ) -> tuple[object, ...]:
         authority[0] = _read_smoke_checkpoint_authority(
             runner,
             parent_key,
             reservation,
             authority[0],
+            expected_parent_revision_advance=expected_parent_revision_advance,
         )
         return authority[0]
 
@@ -5965,18 +5986,24 @@ def _resume_smoke_reservation(
             raise RuntimeError("smoke metadata prefix reconciliation failed")
     initialized = authority[0]
     if reservation["mode"] == "retry":
-        effects[0] += _parent_status_set_observed(
+        parent_status_effect = _parent_status_set_observed(
             runner,
             parent_key,
             expected="blocked",
             desired="in_progress",
         )
-        initialized = checkpoint()
+        effects[0] += parent_status_effect
+        initialized = checkpoint(
+            expected_parent_revision_advance=parent_status_effect
+        )
     detail = parse_issue_detail(initialized[3], child_key)
     if detail["status"] == "backlog":
-        authority[0] = _require_stable_smoke_reservation_authority(
+        stable_before = _require_stable_smoke_reservation_authority(
             runner, github, parent_key, reservation
         )
+        if stable_before[14] != authority[0][14]:
+            raise RuntimeError("smoke parent revision changed before promotion")
+        authority[0] = stable_before
         initialized = authority[0]
         before_runs = initialized[5]
         before_ids = {item["id"] for item in before_runs}
@@ -6003,9 +6030,12 @@ def _resume_smoke_reservation(
             ) != 1
         ):
             raise RuntimeError("smoke child promotion effect was not observed")
-        authority[0] = _require_stable_smoke_reservation_authority(
+        stable_after = _require_stable_smoke_reservation_authority(
             runner, github, parent_key, reservation
         )
+        if stable_after[14] != authority[0][14]:
+            raise RuntimeError("smoke parent revision changed during promotion")
+        authority[0] = stable_after
     desired_parent = {
         "eventra.workflow.next_stage": str(int(reservation["next_stage"]) + 1),
         "eventra.workflow.last_action": str(reservation["action_key"]),
@@ -6015,8 +6045,13 @@ def _resume_smoke_reservation(
             reservation["authorization_comment_uuid"]
         )
     for key, value in desired_parent.items():
-        effects[0] += _metadata_set_observed(runner, parent_key, key, value)
-        checkpoint()
+        parent_metadata_effect = _metadata_set_observed(
+            runner, parent_key, key, value
+        )
+        effects[0] += parent_metadata_effect
+        checkpoint(
+            expected_parent_revision_advance=parent_metadata_effect
+        )
     effects[0] += _metadata_delete_observed(
         runner, parent_key, SMOKE_RESERVATION_KEY
     )

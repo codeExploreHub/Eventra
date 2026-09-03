@@ -379,8 +379,8 @@ checkpoints reread mutable parent/child metadata, the exact source revisions,
 retry authorization, child/run cardinality, and assignment authority. Expected
 `backlog -> todo -> in_progress` and `queued -> dispatched -> running` changes
 normalize to one active state; any second active run or other identity drift
-still blocks. Deterministic fixtures reduce external reads from `1004 -> 399`
-for initial execution, `1293 -> 475` for retry, and `898 -> 314` for
+still blocks. Deterministic fixtures reduce external reads from `1004 -> 410`
+for initial execution, `1293 -> 488` for retry, and `898 -> 324` for
 reservation recovery.
 
 ### Read-only Multica TLS diagnostic

@@ -7396,6 +7396,7 @@ class FakeRepairRunner:
         self.run_reads_before_progress = None
         self.source_drift_after_child_metadata_write = None
         self.authorization_revision_drift_after_child_metadata_write = None
+        self.parent_revision_drift_after_child_metadata_write = None
         self._add_done_child(1, "implementation", 0, result="pass", pr=True)
         if attempt >= 1:
             self._add_done_child(3, "repair", 1, result="pass", pr=True)
@@ -7683,6 +7684,8 @@ class FakeRepairRunner:
             if self.metadata[identifier].get(key) != value:
                 self.metadata[identifier][key] = value
                 self.committed_mutations += 1
+                if identifier == "PRO-65":
+                    self.parent["revision"] += 1
             if identifier != "PRO-65":
                 self.child_metadata_writes += 1
                 if (
@@ -7710,6 +7713,12 @@ class FakeRepairRunner:
                     self.authorization_revision_drift_after_child_metadata_write = None
                     self.comments[0]["revision"] += 1
                 if (
+                    self.parent_revision_drift_after_child_metadata_write
+                    == self.child_metadata_writes
+                ):
+                    self.parent_revision_drift_after_child_metadata_write = None
+                    self.parent["revision"] += 1
+                if (
                     self.authority_drift_after_child_metadata_write
                     == self.child_metadata_writes
                 ):
@@ -7736,6 +7745,8 @@ class FakeRepairRunner:
             if key in self.metadata[identifier]:
                 self.metadata[identifier].pop(key)
                 self.committed_mutations += 1
+                if identifier == "PRO-65":
+                    self.parent["revision"] += 1
             if key == self.authority_drift_after_parent_delete_key:
                 self.authority_drift_after_parent_delete_key = None
                 self._apply_authority_drift("members")
@@ -7752,6 +7763,7 @@ class FakeRepairRunner:
                 if self.parent["status"] != status:
                     self.parent["status"] = status
                     self.committed_mutations += 1
+                    self.parent["revision"] += 1
                 self._maybe_lose_ack("parent-status")
                 return copy.deepcopy(self.parent)
             child = next(child for child in self.children if child["identifier"] == identifier)
@@ -8136,6 +8148,22 @@ class SmokeExecutionTests(unittest.TestCase):
         self.assertIn(
             workflow_module.SMOKE_RESERVATION_KEY,
             runner.metadata["PRO-65"],
+        )
+
+    def test_parent_revision_drift_stops_before_smoke_run_start(self):
+        runner, github, decision = self._planned()
+        runner.parent_revision_drift_after_child_metadata_write = 1
+
+        result = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(result.next_action, "block")
+        self.assertFalse(
+            any(call[:2] == ("issue", "status") for call in runner.mutation_calls)
         )
 
     def test_retry_authorization_revision_drift_stops_before_smoke_run_start(self):

@@ -140,6 +140,28 @@ class TLSDiagnosticTests(unittest.TestCase):
         self.assertEqual(result.classification, "ok")
         self.assertEqual(addresses, [("api.multica.ai", 443)])
 
+    def test_bypass_lookup_includes_the_effective_api_port(self):
+        from tools.multica.tls_diagnostic import diagnose_multica_tls
+
+        bypass_hosts = []
+
+        def bypass(host):
+            bypass_hosts.append(host)
+            return True
+
+        with patch(
+            "tools.multica.tls_diagnostic.proxy_bypass", bypass
+        ), patch(
+            "tools.multica.tls_diagnostic.socket.create_connection",
+            return_value=_Socket(),
+        ), patch(
+            "tools.multica.tls_diagnostic.subprocess.run",
+            return_value=subprocess.CompletedProcess(["multica"], 0, "[]", ""),
+        ):
+            diagnose_multica_tls(timeout_seconds=5)
+
+        self.assertEqual(bypass_hosts, ["api.multica.ai:443"])
+
     def test_http_proxy_without_explicit_port_uses_port_80(self):
         from tools.multica.tls_diagnostic import diagnose_multica_tls
 
@@ -164,6 +186,31 @@ class TLSDiagnosticTests(unittest.TestCase):
 
         self.assertEqual(result.classification, "ok")
         self.assertEqual(addresses, [("proxy.example", 80)])
+
+    def test_socks5h_proxy_without_explicit_port_uses_port_1080(self):
+        from tools.multica.tls_diagnostic import diagnose_multica_tls
+
+        addresses = []
+
+        def connect(address, _timeout):
+            addresses.append(address)
+            return _Socket()
+
+        with patch(
+            "tools.multica.tls_diagnostic.proxy_bypass", return_value=False
+        ), patch(
+            "tools.multica.tls_diagnostic.getproxies",
+            return_value={"https": "socks5h://proxy.example"},
+        ), patch(
+            "tools.multica.tls_diagnostic.socket.create_connection", connect
+        ), patch(
+            "tools.multica.tls_diagnostic.subprocess.run",
+            return_value=subprocess.CompletedProcess(["multica"], 0, "[]", ""),
+        ):
+            result = diagnose_multica_tls(timeout_seconds=5)
+
+        self.assertEqual(result.classification, "ok")
+        self.assertEqual(addresses, [("proxy.example", 1080)])
 
     def test_successful_read_only_auth_probe_reports_ok_without_payload(self):
         result = self._diagnose(
