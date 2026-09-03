@@ -245,6 +245,7 @@ class ParentDecision:
         "create_repair_stage",
         "merge",
         "create_smoke_stage",
+        "retry_smoke_stage",
         "complete_parent",
         "block_parent",
     ]
@@ -697,6 +698,7 @@ def _parent_decision(
     attempt: int | None = None,
     failure_bundle: dict[str, object] | None = None,
     authorizing_comment_uuid: str | None = None,
+    source_stage: int | None = None,
 ) -> ParentDecision:
     if kind == "noop":
         return ParentDecision("noop", None, reason, failure_bundle)
@@ -710,9 +712,13 @@ def _parent_decision(
         bundle_digest,
         authorizing_comment_uuid,
         (
-            None
-            if failure_bundle is None
-            else int(failure_bundle["source_stage_ordinal"])
+            source_stage
+            if source_stage is not None
+            else (
+                None
+                if failure_bundle is None
+                else int(failure_bundle["source_stage_ordinal"])
+            )
         ),
     )
     if snapshot.last_action == key:
@@ -1517,6 +1523,35 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
                     snapshot,
                     "complete_parent",
                     "merged local smoke passed",
+                )
+            source_smoke = latest[0] if len(latest) == 1 else None
+            authorization_uuid = (
+                None
+                if source_smoke is None
+                else _validated_smoke_retry_authorization(
+                    snapshot,
+                    source_smoke,
+                )
+            )
+            if (
+                snapshot.parent_status == "blocked"
+                and source_smoke is not None
+                and source_smoke.status == "done"
+                and source_smoke.result == "blocked"
+                and not source_smoke.responsible_repositories
+                and source_smoke.evidence_comment
+                and authorization_uuid is not None
+                and not any(
+                    item.stage > source_smoke.stage
+                    for item in snapshot.children
+                )
+            ):
+                return _parent_decision(
+                    snapshot,
+                    "retry_smoke_stage",
+                    "member authorized one infrastructure-blocked smoke retry",
+                    source_stage=source_smoke.stage,
+                    authorizing_comment_uuid=authorization_uuid,
                 )
             return _repair_or_block(snapshot)
         expected_merge_action = _action_key(

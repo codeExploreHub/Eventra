@@ -2670,7 +2670,158 @@ def parent_snapshot(**overrides):
     return ParentSnapshot(**values)
 
 
+def authorized_smoke_retry_snapshot(**overrides):
+    backend_sha = "b" * 40
+    gate_action = (
+        "2:PRO-65:create_gate_stage:0:backend:-:"
+        + backend_sha
+        + ":next-stage:2"
+    )
+    values = {
+        "identifier": "PRO-65",
+        "classification": "backend-only",
+        "candidate_frontend_sha": None,
+        "candidate_backend_sha": backend_sha,
+        "parent_status": "blocked",
+        "merge_state": "merged",
+        "next_stage": 4,
+        "children": (
+            phase(
+                "PRO-66", 1, "implementation",
+                frontend_sha=None, backend_sha=backend_sha,
+                project_id=BACKEND_PROJECT_ID,
+                assignee_id=BACKEND_AGENT_ID,
+            ),
+            phase(
+                "PRO-67", 2, "review",
+                frontend_sha=None, backend_sha=backend_sha,
+                project_id=BACKEND_PROJECT_ID,
+                assignee_id=REVIEWER_ID,
+                creation_action=gate_action,
+                phase_target="repository:backend",
+                phase_role="independent_reviewer",
+            ),
+            phase(
+                "PRO-69", 2, "qa",
+                frontend_sha=None, backend_sha=backend_sha,
+                project_id=BACKEND_PROJECT_ID,
+                assignee_id=QA_ID,
+                creation_action=gate_action,
+                phase_target="repository:backend",
+                phase_role="integration_qa",
+            ),
+            phase(
+                "PRO-68", 3, "smoke", result="blocked",
+                frontend_sha=None, backend_sha=backend_sha,
+                evidence_comment=SMOKE_EVIDENCE_UUID,
+                responsible_repositories=(),
+            ),
+        ),
+        "pull_requests": (
+            PullRequestSnapshot(
+                "backend",
+                "https://github.com/codeExploreHub/Eventra-Backend/pull/7",
+                backend_sha,
+                "merged",
+                True,
+                True,
+            ),
+        ),
+        "smoke_retry_authorization_comment_uuid": SMOKE_RETRY_AUTH_UUID,
+        "consumed_smoke_retry_authorization_uuid": "",
+        "smoke_retry_authorizing_comment": AuthorizingComment(
+            SMOKE_RETRY_AUTH_UUID,
+            "member",
+            json.dumps(
+                {
+                    "candidate_shas": {"backend": backend_sha},
+                    "granted_smoke_retry": 1,
+                    "source_evidence_comment_uuid": SMOKE_EVIDENCE_UUID,
+                    "source_smoke": "PRO-68",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        ),
+    }
+    values.update(overrides)
+    return parent_snapshot(**values)
+
+
 class ParentDecisionTests(unittest.TestCase):
+    def test_blocked_infrastructure_smoke_with_member_authorization_plans_one_retry(self):
+        decision = decide_parent_action(authorized_smoke_retry_snapshot())
+
+        self.assertEqual(decision.kind, "retry_smoke_stage", decision.reason)
+        self.assertEqual(
+            decision.action_key,
+            (
+                "2:PRO-65:retry_smoke_stage:0:backend:-:"
+                + "b" * 40
+                + ":next-stage:4:source-stage:3:authorization:"
+                + SMOKE_RETRY_AUTH_UUID
+            ),
+        )
+
+    def test_smoke_retry_rejects_invalid_authority_and_non_infrastructure_results(self):
+        baseline = authorized_smoke_retry_snapshot()
+        source = next(item for item in baseline.children if item.issue_key == "PRO-68")
+        cases = {
+            "missing authorization": replace(
+                baseline,
+                smoke_retry_authorizing_comment=None,
+            ),
+            "non-member authorization": replace(
+                baseline,
+                smoke_retry_authorizing_comment=replace(
+                    baseline.smoke_retry_authorizing_comment,
+                    author_type="agent",
+                ),
+            ),
+            "noncanonical authorization": replace(
+                baseline,
+                smoke_retry_authorizing_comment=replace(
+                    baseline.smoke_retry_authorizing_comment,
+                    content=json.dumps(
+                        json.loads(
+                            baseline.smoke_retry_authorizing_comment.content
+                        )
+                    ),
+                ),
+            ),
+            "authorization already consumed": replace(
+                baseline,
+                consumed_smoke_retry_authorization_uuid=(
+                    SMOKE_RETRY_AUTH_UUID
+                ),
+            ),
+            "parent is not blocked": replace(
+                baseline,
+                parent_status="in_review",
+            ),
+            "smoke failed": replace(
+                baseline,
+                children=tuple(
+                    replace(item, result="fail")
+                    if item.issue_key == source.issue_key else item
+                    for item in baseline.children
+                ),
+            ),
+            "smoke owns repository failure": replace(
+                baseline,
+                children=tuple(
+                    replace(item, responsible_repositories=("backend",))
+                    if item.issue_key == source.issue_key else item
+                    for item in baseline.children
+                ),
+            ),
+        }
+        for label, snapshot in cases.items():
+            with self.subTest(label=label):
+                decision = decide_parent_action(snapshot)
+                self.assertEqual(decision.kind, "block_parent")
+                self.assertIsNone(decision.action_key)
+
     def test_implementation_replacement_keeps_its_original_creation_authority(self):
         source = parent_snapshot()
         replacement_sha = "c" * 40
