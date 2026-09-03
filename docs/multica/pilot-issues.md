@@ -290,6 +290,23 @@ SHA, merged PR #6, source Smoke, evidence UUID, and original PASS Gate. The
 retry retains the mandatory fresh fetch, exact `FETCH_HEAD`, clean detached
 worktree, health/OpenAPI evidence, Context Receipt, and owned cleanup.
 
+The executor is single-flight for the exact parent/action across local
+processes and linked worktrees. Same-key contenders perform no writes;
+conflicting keys fail closed; a process crash releases the kernel lease while
+the durable Smoke reservation preserves resumability. Its revision-fenced
+authority envelope keeps the exact authorization, source evidence, candidate
+SHA, merged PR, Project/Squad assignment, Stage/attempt, unique run, and durable
+commit checks while allowing only expected child/run startup transitions. The
+audited retry and recovery fixtures reduce external reads from `1293 -> 564`
+and `898 -> 415`, respectively.
+
+For an ambiguous Multica connectivity failure, use the read-only
+`tools.multica.workflow diagnose-tls` entry point. It distinguishes route, TLS
+handshake, HTTP authentication, and business timeout failures without returning
+credentials. The Multica 0.4.38 / Go 1.26 local-proxy ML-KEM case uses only the
+process-level `GODEBUG=tlsmlkem=0` workaround; global configuration changes are
+forbidden.
+
 ```text
 PRO-120 done+blocked -> member authorization -> retry_smoke_stage
 -> exactly one Stage 4 Smoke -> done+pass -> complete_parent -> PRO-116 done

@@ -359,8 +359,47 @@ starts Integration QA. It commits the exact parent action and clears the
 reservation only after verifying the complete effect. Retry resumes a missing
 create, canonical metadata prefix, promotion, or lost acknowledgement without
 duplicating the child. Conflicting identity, metadata, Gate evidence, assignment,
-or merged PR state blocks without overwrite. This recovery uses the same single
-serialized Delivery Lead and is not generic CAS or transaction safety.
+or merged PR state blocks without overwrite.
+
+Smoke execution is single-flight across local processes and linked worktrees.
+The executor takes a nonblocking kernel lease below the repository's shared Git
+common directory, keyed by parent and carrying the exact action key. A contender
+for the same key returns a non-writing `noop`; a different key fails closed. A
+process exit releases the kernel lease, and the next owner explicitly reports
+and replaces the stale record. The durable Multica reservation remains the
+recovery authority for lost acknowledgements and interruptions; the file lease
+never replaces it.
+
+The executor reads the expensive immutable authority envelope twice before the
+first effect. That envelope binds the parent/action, source child identities and
+update revisions, immutable evidence comment identities, candidate SHA/merged
+PR identities, Project, Squad, and agent assignment. Mutation checkpoints then
+reread only mutable parent/child metadata, child/run cardinality, and exact
+assignment authority behind parent revision fences. Expected `backlog -> todo
+-> in_progress` and `queued -> dispatched -> running` changes normalize to one
+active state; any second active run or other identity drift still blocks. The
+audited deterministic fixture counts are initial `1004 -> 500`, retry `1293 ->
+564`, and reservation recovery `898 -> 415` external reads.
+
+### Read-only Multica TLS diagnostic
+
+Before treating a CLI failure as an authentication problem, run:
+
+```text
+python3 -B -m tools.multica.workflow diagnose-tls --timeout 15
+```
+
+The JSON result distinguishes `unreachable`, `tls_handshake`,
+`http_authentication`, `business_timeout`, `business_error`, and `ok`. It first
+checks the effective direct/proxy TCP route, then runs only `multica auth
+status`; response bodies and credentials are never returned. If the
+default probe times out, it repeats that read-only request once with a
+process-only `GODEBUG=tlsmlkem=0` environment. Success on only that retry is
+classified as TLS compatibility, not credential failure. This covers the known
+Multica 0.4.38 / Go 1.26 / local-proxy ML-KEM handshake case without changing a
+shell profile, global proxy, or persistent configuration. Go documents the
+`tlsmlkem=0` compatibility control and handshake-timeout use case at
+https://go.dev/doc/godebug and https://go.dev/doc/go1.24.
 
 ### One-time infrastructure-blocked Smoke retry
 

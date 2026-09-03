@@ -12,6 +12,7 @@ import subprocess
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Literal, Sequence
 
 from .blueprint import build_multi_repo_blueprint
@@ -33,6 +34,7 @@ from .issue_contracts import (
     parse_issue_runs,
 )
 from .provision import MulticaRunner
+from .runtime_guard import file_single_flight
 from .url_contracts import is_canonical_comment_url
 
 
@@ -5556,9 +5558,235 @@ def _require_stable_smoke_reservation_authority(
     second = _read_smoke_reservation_authority(
         runner, github, parent_key, reservation
     )
-    if first != second:
+    if _smoke_stability_view(first, reservation) != _smoke_stability_view(
+        second, reservation
+    ):
         raise RuntimeError("smoke reservation authority changed during read")
-    return first
+    return second
+
+
+def _smoke_stability_view(
+    value: tuple[object, ...],
+    reservation: dict[str, object],
+) -> tuple[object, ...]:
+    """Normalize only expected child/run start transitions for comparison."""
+
+    smoke_stage = int(reservation["next_stage"])
+
+    def issue_view(item: object) -> object:
+        if not isinstance(item, dict) or item.get("stage") != smoke_stage:
+            return item
+        normalized = dict(item)
+        if normalized.get("status") in {"todo", "in_progress", "in_review"}:
+            normalized["status"] = "active"
+            normalized["updated_at"] = "<server-owned-progression>"
+        return normalized
+
+    def run_view(item: object) -> object:
+        if not isinstance(item, dict) or item.get("status") not in ACTIVE_RUN_STATUSES:
+            return item
+        normalized = dict(item)
+        normalized["status"] = "active"
+        normalized["activity_at"] = "<server-owned-progression>"
+        normalized["dispatched_at"] = "<server-owned-progression>"
+        normalized["started_at"] = "<server-owned-progression>"
+        return normalized
+
+    return (
+        value[0],
+        value[1],
+        tuple(issue_view(item) for item in value[2]),
+        issue_view(value[3]),
+        value[4],
+        tuple(run_view(item) for item in value[5]),
+        *value[6:],
+    )
+
+
+def _smoke_issue_progression_matches(
+    summary: dict[str, object],
+    detail: dict[str, object],
+) -> bool:
+    """Allow only the server-owned backlog/todo/run-start progression."""
+
+    stable_keys = set(summary) - {"status", "updated_at"}
+    if stable_keys != set(detail) - {"status", "updated_at"}:
+        return False
+    if any(summary[key] != detail[key] for key in stable_keys):
+        return False
+    ranks = {"backlog": 0, "todo": 1, "in_progress": 2, "in_review": 3}
+    before = ranks.get(str(summary["status"]))
+    after = ranks.get(str(detail["status"]))
+    return before is not None and after is not None and after >= before
+
+
+def _read_smoke_checkpoint_authority(
+    runner: MulticaRunner,
+    parent_key: str,
+    reservation: dict[str, object],
+    trusted: tuple[object, ...],
+) -> tuple[object, ...]:
+    """Validate a revision-fenced cached Smoke authority envelope.
+
+    Expensive immutable evidence and merged-PR reads live in ``trusted``. Every
+    mutation boundary rereads the mutable parent/child identities, metadata,
+    run cardinality, and exact Project/Squad assignment authority.
+    """
+
+    start_parent = parse_issue_detail(
+        runner.run(["issue", "get", parent_key, "--output", "json"]),
+        parent_key,
+    )
+    start_raw_metadata = parse_issue_metadata(
+        runner.run(
+            ["issue", "metadata", "list", parent_key, "--output", "json"]
+        )
+    )
+    parent_metadata = _parent_metadata(start_raw_metadata)
+    children = parse_issue_children(
+        runner.run(["issue", "children", parent_key, "--output", "json"]),
+        str(start_parent["id"]),
+    )
+    smoke_stage = int(reservation["next_stage"])
+    source_children = tuple(
+        child
+        for child in children
+        if child["stage"] is not None and int(child["stage"]) < smoke_stage
+    )
+    trusted_source_children = tuple(
+        child
+        for child in trusted[2]
+        if child["stage"] is not None and int(child["stage"]) < smoke_stage
+    )
+    smoke_children = tuple(
+        child for child in children if child["stage"] == smoke_stage
+    )
+    allowed_parent_statuses = (
+        {"blocked", "in_progress"}
+        if reservation["mode"] == "retry"
+        else {str(reservation["previous_parent_status"])}
+    )
+    if (
+        start_parent["id"] is None
+        or start_parent["parent_issue_id"] is not None
+        or start_parent["stage"] is not None
+        or start_parent["status"] not in allowed_parent_statuses
+        or parent_metadata["workflow_version"] != 2
+        or parent_metadata["merge_state"] != "merged"
+        or parent_metadata["attempt"] != reservation["attempt"]
+        or _candidate_sha_map(
+            ParentSnapshot(
+                identifier=parent_key,
+                classification=str(parent_metadata["classification"]),
+                attempt=int(parent_metadata["attempt"]),
+                last_action=parent_metadata["last_action"],
+                merge_state="merged",
+                candidate_frontend_sha=parent_metadata["frontend_sha"],
+                candidate_backend_sha=parent_metadata["backend_sha"],
+                children=(),
+                pull_requests=(),
+            )
+        )
+        != reservation["candidate_shas"]
+        or parent_metadata["next_stage"] not in {smoke_stage, smoke_stage + 1}
+        or (parent_metadata["last_action"] or "")
+        not in {
+            str(reservation["previous_last_action"]),
+            str(reservation["action_key"]),
+        }
+        or (
+            reservation["mode"] == "retry"
+            and (
+                parent_metadata["smoke_retry_authorization_comment_uuid"]
+                != reservation["authorization_comment_uuid"]
+                or parent_metadata["consumed_smoke_retry_authorization_uuid"]
+                not in {
+                    str(reservation["previous_consumed_authorization_uuid"]),
+                    str(reservation["authorization_comment_uuid"]),
+                }
+            )
+        )
+        or start_raw_metadata.get(SMOKE_RESERVATION_KEY)
+        != _canonical_json(reservation)
+        or source_children != trusted_source_children
+        or any(
+            child["stage"] is None or int(child["stage"]) > smoke_stage
+            for child in children
+        )
+        or len(smoke_children) > 1
+    ):
+        raise RuntimeError("smoke authority checkpoint conflicts")
+
+    raw_child: object | None = None
+    metadata: dict[str, str] = {}
+    runs: list[dict[str, object]] = []
+    if smoke_children:
+        child = smoke_children[0]
+        child_key = str(child["identifier"])
+        raw_child = runner.run(["issue", "get", child_key, "--output", "json"])
+        detail = parse_issue_detail(raw_child, child_key)
+        metadata = parse_issue_metadata(
+            runner.run(
+                ["issue", "metadata", "list", child_key, "--output", "json"]
+            )
+        )
+        runs = parse_issue_runs(
+            runner.run(["issue", "runs", child_key, "--output", "json"]),
+            str(detail["id"]),
+        )
+        expected_items = sorted(_smoke_child_metadata(reservation).items())
+        prefix = dict(expected_items[: len(metadata)])
+        if (
+            not _smoke_issue_progression_matches(child, detail)
+            or detail["parent_issue_id"] != start_parent["id"]
+            or detail["stage"] != smoke_stage
+            or detail["project_id"] != reservation["project_id"]
+            or detail["assignee_id"] != reservation["assignee_id"]
+            or detail["assignee_type"] != "agent"
+            or not isinstance(raw_child, dict)
+            or raw_child.get("title") != _smoke_child_title(reservation)
+            or raw_child.get("description") != _smoke_child_description(reservation)
+            or len(metadata) > len(expected_items)
+            or metadata != prefix
+            or (detail["status"] == "backlog" and runs)
+            or (
+                detail["status"] != "backlog"
+                and len(
+                    [item for item in runs if item["status"] in ACTIVE_RUN_STATUSES]
+                )
+                != 1
+            )
+        ):
+            raise RuntimeError("smoke child checkpoint conflicts")
+
+    assignment_authority = _exact_assignment_authority(runner)
+    if (
+        assignment_authority != trusted[11]
+        or _parent_control_detail_problem(start_parent, assignment_authority)
+        is not None
+    ):
+        raise RuntimeError("smoke assignment checkpoint conflicts")
+    end_parent = parse_issue_detail(
+        runner.run(["issue", "get", parent_key, "--output", "json"]),
+        parent_key,
+    )
+    end_raw_metadata = parse_issue_metadata(
+        runner.run(
+            ["issue", "metadata", "list", parent_key, "--output", "json"]
+        )
+    )
+    if end_parent != start_parent or end_raw_metadata != start_raw_metadata:
+        raise RuntimeError("smoke authority changed during checkpoint read")
+    return (
+        start_parent,
+        start_raw_metadata,
+        children,
+        raw_child,
+        metadata,
+        runs,
+        *trusted[6:11],
+        assignment_authority,
+    )
 
 
 def _resume_smoke_reservation(
@@ -5571,6 +5799,17 @@ def _resume_smoke_reservation(
     first = _require_stable_smoke_reservation_authority(
         runner, github, parent_key, reservation
     )
+    authority = [first]
+
+    def checkpoint() -> tuple[object, ...]:
+        authority[0] = _read_smoke_checkpoint_authority(
+            runner,
+            parent_key,
+            reservation,
+            authority[0],
+        )
+        return authority[0]
+
     if not any(
         item["stage"] == reservation["next_stage"] for item in first[2]
     ):
@@ -5591,9 +5830,7 @@ def _resume_smoke_reservation(
             )
         except RuntimeError:
             pass
-        first = _require_stable_smoke_reservation_authority(
-            runner, github, parent_key, reservation
-        )
+        first = checkpoint()
         created = [
             item for item in first[2]
             if item["stage"] == reservation["next_stage"]
@@ -5610,21 +5847,15 @@ def _resume_smoke_reservation(
     expected_items = sorted(_smoke_child_metadata(reservation).items())
     prefix_length = len(first[4])
     for index in range(prefix_length, len(expected_items)):
-        before = _require_stable_smoke_reservation_authority(
-            runner, github, parent_key, reservation
-        )
+        before = checkpoint()
         if len(before[4]) != index:
             raise RuntimeError("smoke metadata prefix changed before write")
         key, value = expected_items[index]
         effects[0] += _metadata_set_observed(runner, child_key, key, value)
-        after = _require_stable_smoke_reservation_authority(
-            runner, github, parent_key, reservation
-        )
+        after = checkpoint()
         if len(after[4]) != index + 1:
             raise RuntimeError("smoke metadata prefix reconciliation failed")
-    initialized = _require_stable_smoke_reservation_authority(
-        runner, github, parent_key, reservation
-    )
+    initialized = checkpoint()
     if reservation["mode"] == "retry":
         effects[0] += _parent_status_set_observed(
             runner,
@@ -5632,9 +5863,7 @@ def _resume_smoke_reservation(
             expected="blocked",
             desired="in_progress",
         )
-        initialized = _require_stable_smoke_reservation_authority(
-            runner, github, parent_key, reservation
-        )
+        initialized = checkpoint()
     detail = parse_issue_detail(initialized[3], child_key)
     if detail["status"] == "backlog":
         before_runs = initialized[5]
@@ -5662,9 +5891,7 @@ def _resume_smoke_reservation(
             ) != 1
         ):
             raise RuntimeError("smoke child promotion effect was not observed")
-        _require_stable_smoke_reservation_authority(
-            runner, github, parent_key, reservation
-        )
+        checkpoint()
     desired_parent = {
         "eventra.workflow.next_stage": str(int(reservation["next_stage"]) + 1),
         "eventra.workflow.last_action": str(reservation["action_key"]),
@@ -5674,16 +5901,10 @@ def _resume_smoke_reservation(
             reservation["authorization_comment_uuid"]
         )
     for key, value in desired_parent.items():
-        _require_stable_smoke_reservation_authority(
-            runner, github, parent_key, reservation
-        )
+        checkpoint()
         effects[0] += _metadata_set_observed(runner, parent_key, key, value)
-        _require_stable_smoke_reservation_authority(
-            runner, github, parent_key, reservation
-        )
-    _require_stable_smoke_reservation_authority(
-        runner, github, parent_key, reservation
-    )
+        checkpoint()
+    checkpoint()
     effects[0] += _metadata_delete_observed(
         runner, parent_key, SMOKE_RESERVATION_KEY
     )
@@ -5712,7 +5933,7 @@ def _resume_smoke_reservation(
     )
 
 
-def execute_parent_smoke(
+def _execute_parent_smoke_owned(
     runner: MulticaRunner,
     github: GitHubRunner,
     parent_key: str,
@@ -5798,6 +6019,66 @@ def execute_parent_smoke(
             str(error) or "smoke execution failed closed",
             expected_action_key if isinstance(expected_action_key, str) else "",
             effects[0],
+        )
+
+
+def execute_parent_smoke(
+    runner: MulticaRunner,
+    github: GitHubRunner,
+    parent_key: str,
+    *,
+    expected_action_key: str,
+    single_flight_root: Path | None = None,
+) -> SmokeExecutionResult:
+    """Execute one exact Smoke action under a shared nonblocking lease."""
+
+    if (
+        type(expected_action_key) is not str
+        or not expected_action_key
+        or ISSUE_KEY_PATTERN.fullmatch(parent_key) is None
+    ):
+        return SmokeExecutionResult(
+            parent_key,
+            "block",
+            "smoke execution requires an exact action identity",
+            expected_action_key if isinstance(expected_action_key, str) else "",
+            0,
+        )
+    try:
+        with file_single_flight(
+            parent_key,
+            expected_action_key,
+            root=single_flight_root,
+        ) as claim:
+            if not claim.acquired:
+                if claim.outcome == "wait":
+                    return SmokeExecutionResult(
+                        parent_key,
+                        "noop",
+                        "exact smoke action already has an active executor",
+                        expected_action_key,
+                        0,
+                    )
+                return SmokeExecutionResult(
+                    parent_key,
+                    "block",
+                    "another smoke action holds the parent execution lease",
+                    expected_action_key,
+                    0,
+                )
+            return _execute_parent_smoke_owned(
+                runner,
+                github,
+                parent_key,
+                expected_action_key=expected_action_key,
+            )
+    except (OSError, RuntimeError, ValueError) as error:
+        return SmokeExecutionResult(
+            parent_key,
+            "block",
+            str(error) or "smoke single-flight failed closed",
+            expected_action_key,
+            0,
         )
 
 
@@ -7432,6 +7713,8 @@ def build_workflow_parser() -> argparse.ArgumentParser:
     execute_smoke = subparsers.add_parser("execute-parent-smoke")
     execute_smoke.add_argument("parent")
     execute_smoke.add_argument("--expected-action-key", required=True)
+    diagnose_tls = subparsers.add_parser("diagnose-tls")
+    diagnose_tls.add_argument("--timeout", type=float, default=10.0)
     finish_parent_parser = subparsers.add_parser("finish-parent")
     finish_parent_parser.add_argument("parent")
     watch = subparsers.add_parser("watch")
@@ -7517,6 +7800,12 @@ def print_smoke_execution_result(value: SmokeExecutionResult) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_workflow_parser().parse_args(argv)
+    if args.command == "diagnose-tls":
+        from .tls_diagnostic import diagnose_multica_tls
+
+        result = diagnose_multica_tls(timeout_seconds=args.timeout)
+        print(result.to_json())
+        return 0 if result.classification == "ok" else 1
     runner = MulticaRunner()
     if args.command == "finish-phase":
         completion = PhaseCompletion(
