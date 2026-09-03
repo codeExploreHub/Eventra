@@ -237,9 +237,11 @@ next barrier group, then advance `next_stage` and record `last_action`.
   action blocks, and a process interruption leaves an explicit stale record that
   the next owner replaces. Multica reservation state remains the durable
   lost-acknowledgement authority. Expensive source evidence and merged-PR reads
-  are cached only in a revision-fenced envelope bound to parent/action, source
-  child and evidence identities, candidate SHAs, PRs, and assignment authority;
-  mutable parent/child/run and assignment checks still surround every write.
+  are cached only in a revision-fenced envelope bound to parent/action, exact
+  source-Issue revisions, evidence identities, exact retry-comment revision and
+  content, candidate SHAs, PRs, and assignment authority. Full authority is
+  reread immediately before and after promotion; mutable parent/child/run and
+  assignment checks still surround every write.
   Expected child `todo -> in_progress` and active-run startup are allowed, while
   duplicate active runs fail closed.
   Complete the parent only after exact assigned smoke PASS.

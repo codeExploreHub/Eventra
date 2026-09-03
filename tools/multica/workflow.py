@@ -5252,27 +5252,104 @@ def _smoke_child_description(reservation: dict[str, object]) -> str:
     return _canonical_json(description)
 
 
+def _source_issue_revisions(
+    raw_children: object,
+    children: list[dict[str, object]],
+    smoke_stage: int,
+) -> tuple[tuple[str, int], ...]:
+    """Extract exact source-Issue revision fences from a children response."""
+
+    if not isinstance(raw_children, dict):
+        raise RuntimeError("smoke source issue revisions are malformed")
+    raw_issues: list[object] = []
+    stages = raw_children.get("stages")
+    unstaged = raw_children.get("unstaged")
+    if not isinstance(stages, list) or not isinstance(unstaged, list):
+        raise RuntimeError("smoke source issue revisions are malformed")
+    for stage in stages:
+        if not isinstance(stage, dict) or not isinstance(stage.get("issues"), list):
+            raise RuntimeError("smoke source issue revisions are malformed")
+        raw_issues.extend(stage["issues"])
+    raw_issues.extend(unstaged)
+    by_identifier: dict[str, int] = {}
+    for item in raw_issues:
+        if not isinstance(item, dict):
+            raise RuntimeError("smoke source issue revisions are malformed")
+        identifier = item.get("identifier")
+        revision = item.get("revision")
+        if (
+            type(identifier) is not str
+            or type(revision) is not int
+            or revision < 1
+            or identifier in by_identifier
+        ):
+            raise RuntimeError("smoke source issue revisions are malformed")
+        by_identifier[identifier] = revision
+    source_identifiers = {
+        str(child["identifier"])
+        for child in children
+        if child["stage"] is not None and int(child["stage"]) < smoke_stage
+    }
+    if not source_identifiers.issubset(by_identifier):
+        raise RuntimeError("smoke source issue revisions are malformed")
+    return tuple(sorted((key, by_identifier[key]) for key in source_identifiers))
+
+
+def _issue_revision(raw_issue: object, *, label: str) -> int:
+    revision = raw_issue.get("revision") if isinstance(raw_issue, dict) else None
+    if type(revision) is not int or revision < 1:
+        raise RuntimeError(f"smoke {label} revision is malformed")
+    return revision
+
+
+def _authorizing_comment_with_revision(
+    raw_comments: object,
+    comment_uuid: str,
+) -> tuple[AuthorizingComment, int]:
+    parsed = parse_authorizing_comment(raw_comments, comment_uuid)
+    if not isinstance(raw_comments, list):
+        raise RuntimeError("smoke authorization comment revision is malformed")
+    matches = [
+        item
+        for item in raw_comments
+        if isinstance(item, dict) and item.get("id") == comment_uuid
+    ]
+    revision = matches[0].get("revision") if len(matches) == 1 else None
+    if type(revision) is not int or revision < 1:
+        raise RuntimeError("smoke authorization comment revision is malformed")
+    return (
+        AuthorizingComment(
+            parsed["comment_uuid"],
+            parsed["author_type"],
+            parsed["content"],
+        ),
+        revision,
+    )
+
+
 def _read_smoke_reservation_authority(
     runner: MulticaRunner,
     github: GitHubRunner,
     parent_key: str,
     reservation: dict[str, object],
 ) -> tuple[object, ...]:
-    parent = parse_issue_detail(
-        runner.run(["issue", "get", parent_key, "--output", "json"]),
-        parent_key,
-    )
+    raw_parent = runner.run(["issue", "get", parent_key, "--output", "json"])
+    parent = parse_issue_detail(raw_parent, parent_key)
+    parent_revision = _issue_revision(raw_parent, label="parent issue")
     raw_parent_metadata = parse_issue_metadata(
         runner.run(
             ["issue", "metadata", "list", parent_key, "--output", "json"]
         )
     )
     parent_metadata = _parent_metadata(raw_parent_metadata)
-    children = parse_issue_children(
-        runner.run(["issue", "children", parent_key, "--output", "json"]),
-        str(parent["id"]),
+    raw_children = runner.run(
+        ["issue", "children", parent_key, "--output", "json"]
     )
+    children = parse_issue_children(raw_children, str(parent["id"]))
     smoke_stage = int(reservation["next_stage"])
+    source_revisions = _source_issue_revisions(
+        raw_children, children, smoke_stage
+    )
     source_children = tuple(
         child for child in children if child["stage"] is not None
         and int(child["stage"]) < smoke_stage
@@ -5454,22 +5531,20 @@ def _read_smoke_reservation_authority(
         raise RuntimeError("smoke reservation source merge authority conflicts")
     evidence = _read_gate_evidence_set(runner, source_children, source_phases)
     authorization_comment: AuthorizingComment | None = None
+    authorization_revision: int | None = None
     source_smoke_evidence: tuple[str, str, str, str] | None = None
     if reservation["mode"] == "retry":
-        raw_authorization = parse_authorizing_comment(
-            runner.run(
-                [
-                    "issue", "comment", "list", parent_key,
-                    "--thread", str(reservation["authorization_comment_uuid"]),
-                    "--full", "--compact", "--output", "json",
-                ]
-            ),
-            str(reservation["authorization_comment_uuid"]),
-        )
-        authorization_comment = AuthorizingComment(
-            raw_authorization["comment_uuid"],
-            raw_authorization["author_type"],
-            raw_authorization["content"],
+        authorization_comment, authorization_revision = (
+            _authorizing_comment_with_revision(
+                runner.run(
+                    [
+                        "issue", "comment", "list", parent_key,
+                        "--thread", str(reservation["authorization_comment_uuid"]),
+                        "--full", "--compact", "--output", "json",
+                    ]
+                ),
+                str(reservation["authorization_comment_uuid"]),
+            )
         )
         source_smokes = tuple(
             phase
@@ -5543,6 +5618,9 @@ def _read_smoke_reservation_authority(
         authorization_comment,
         source_smoke_evidence,
         assignment_authority,
+        source_revisions,
+        authorization_revision,
+        parent_revision,
     )
 
 
@@ -5633,21 +5711,25 @@ def _read_smoke_checkpoint_authority(
     run cardinality, and exact Project/Squad assignment authority.
     """
 
-    start_parent = parse_issue_detail(
-        runner.run(["issue", "get", parent_key, "--output", "json"]),
-        parent_key,
+    start_raw_parent = runner.run(
+        ["issue", "get", parent_key, "--output", "json"]
     )
+    start_parent = parse_issue_detail(start_raw_parent, parent_key)
+    parent_revision = _issue_revision(start_raw_parent, label="parent issue")
     start_raw_metadata = parse_issue_metadata(
         runner.run(
             ["issue", "metadata", "list", parent_key, "--output", "json"]
         )
     )
     parent_metadata = _parent_metadata(start_raw_metadata)
-    children = parse_issue_children(
-        runner.run(["issue", "children", parent_key, "--output", "json"]),
-        str(start_parent["id"]),
+    raw_children = runner.run(
+        ["issue", "children", parent_key, "--output", "json"]
     )
+    children = parse_issue_children(raw_children, str(start_parent["id"]))
     smoke_stage = int(reservation["next_stage"])
+    source_revisions = _source_issue_revisions(
+        raw_children, children, smoke_stage
+    )
     source_children = tuple(
         child
         for child in children
@@ -5709,6 +5791,7 @@ def _read_smoke_checkpoint_authority(
         or start_raw_metadata.get(SMOKE_RESERVATION_KEY)
         != _canonical_json(reservation)
         or source_children != trusted_source_children
+        or source_revisions != trusted[12]
         or any(
             child["stage"] is None or int(child["stage"]) > smoke_stage
             for child in children
@@ -5766,16 +5849,38 @@ def _read_smoke_checkpoint_authority(
         is not None
     ):
         raise RuntimeError("smoke assignment checkpoint conflicts")
-    end_parent = parse_issue_detail(
-        runner.run(["issue", "get", parent_key, "--output", "json"]),
-        parent_key,
+    authorization_comment = trusted[9]
+    authorization_revision = trusted[13]
+    if authorization_comment is not None:
+        observed_comment, observed_revision = _authorizing_comment_with_revision(
+            runner.run(
+                [
+                    "issue", "comment", "list", parent_key,
+                    "--thread", str(reservation["authorization_comment_uuid"]),
+                    "--full", "--compact", "--output", "json",
+                ]
+            ),
+            str(reservation["authorization_comment_uuid"]),
+        )
+        if (
+            observed_comment != authorization_comment
+            or observed_revision != authorization_revision
+        ):
+            raise RuntimeError("smoke authorization checkpoint conflicts")
+    end_raw_parent = runner.run(
+        ["issue", "get", parent_key, "--output", "json"]
     )
+    end_parent = parse_issue_detail(end_raw_parent, parent_key)
     end_raw_metadata = parse_issue_metadata(
         runner.run(
             ["issue", "metadata", "list", parent_key, "--output", "json"]
         )
     )
-    if end_parent != start_parent or end_raw_metadata != start_raw_metadata:
+    if (
+        end_parent != start_parent
+        or end_raw_parent != start_raw_parent
+        or end_raw_metadata != start_raw_metadata
+    ):
         raise RuntimeError("smoke authority changed during checkpoint read")
     return (
         start_parent,
@@ -5786,6 +5891,9 @@ def _read_smoke_checkpoint_authority(
         runs,
         *trusted[6:11],
         assignment_authority,
+        source_revisions,
+        authorization_revision,
+        parent_revision,
     )
 
 
@@ -5847,7 +5955,7 @@ def _resume_smoke_reservation(
     expected_items = sorted(_smoke_child_metadata(reservation).items())
     prefix_length = len(first[4])
     for index in range(prefix_length, len(expected_items)):
-        before = checkpoint()
+        before = authority[0]
         if len(before[4]) != index:
             raise RuntimeError("smoke metadata prefix changed before write")
         key, value = expected_items[index]
@@ -5855,7 +5963,7 @@ def _resume_smoke_reservation(
         after = checkpoint()
         if len(after[4]) != index + 1:
             raise RuntimeError("smoke metadata prefix reconciliation failed")
-    initialized = checkpoint()
+    initialized = authority[0]
     if reservation["mode"] == "retry":
         effects[0] += _parent_status_set_observed(
             runner,
@@ -5866,6 +5974,10 @@ def _resume_smoke_reservation(
         initialized = checkpoint()
     detail = parse_issue_detail(initialized[3], child_key)
     if detail["status"] == "backlog":
+        authority[0] = _require_stable_smoke_reservation_authority(
+            runner, github, parent_key, reservation
+        )
+        initialized = authority[0]
         before_runs = initialized[5]
         before_ids = {item["id"] for item in before_runs}
         try:
@@ -5891,7 +6003,9 @@ def _resume_smoke_reservation(
             ) != 1
         ):
             raise RuntimeError("smoke child promotion effect was not observed")
-        checkpoint()
+        authority[0] = _require_stable_smoke_reservation_authority(
+            runner, github, parent_key, reservation
+        )
     desired_parent = {
         "eventra.workflow.next_stage": str(int(reservation["next_stage"]) + 1),
         "eventra.workflow.last_action": str(reservation["action_key"]),
@@ -5901,10 +6015,8 @@ def _resume_smoke_reservation(
             reservation["authorization_comment_uuid"]
         )
     for key, value in desired_parent.items():
-        checkpoint()
         effects[0] += _metadata_set_observed(runner, parent_key, key, value)
         checkpoint()
-    checkpoint()
     effects[0] += _metadata_delete_observed(
         runner, parent_key, SMOKE_RESERVATION_KEY
     )

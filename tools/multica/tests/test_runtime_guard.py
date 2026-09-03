@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 def _hold_claim(root, parent, action_key, ready, release, result_queue):
@@ -129,6 +130,78 @@ class FileSingleFlightTests(unittest.TestCase):
                 self.assertTrue(claim.acquired)
                 self.assertTrue(claim.recovered_stale)
                 self.assertEqual(claim.outcome, "acquired")
+
+    def test_same_action_is_wait_during_owner_record_initialization(self):
+        guard = importlib.import_module("tools.multica.runtime_guard")
+        entered = threading.Event()
+        release = threading.Event()
+        owner_result = []
+        original = guard._write_record
+
+        def delayed_write(path, record):
+            entered.set()
+            release.wait(3)
+            original(path, record)
+
+        def own(root):
+            with guard.file_single_flight(
+                "PRO-122", "action-a", root=root
+            ) as claim:
+                owner_result.append(claim.outcome)
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            guard, "_write_record", delayed_write
+        ):
+            root = Path(directory)
+            owner = threading.Thread(target=own, args=(root,))
+            owner.start()
+            self.assertTrue(entered.wait(2))
+            try:
+                with guard.file_single_flight(
+                    "PRO-122", "action-a", root=root
+                ) as claim:
+                    self.assertFalse(claim.acquired)
+                    self.assertEqual(claim.outcome, "wait")
+            finally:
+                release.set()
+                owner.join(3)
+            self.assertEqual(owner_result, ["acquired"])
+
+    def test_same_action_is_wait_during_owner_record_teardown(self):
+        guard = importlib.import_module("tools.multica.runtime_guard")
+        removed = threading.Event()
+        release = threading.Event()
+        original = Path.unlink
+
+        def delayed_unlink(path, *args, **kwargs):
+            value = original(path, *args, **kwargs)
+            if path.suffix == ".json":
+                removed.set()
+                release.wait(3)
+            return value
+
+        def own(root):
+            with guard.file_single_flight(
+                "PRO-122", "action-a", root=root
+            ):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            Path, "unlink", delayed_unlink
+        ):
+            root = Path(directory)
+            owner = threading.Thread(target=own, args=(root,))
+            owner.start()
+            self.assertTrue(removed.wait(2))
+            try:
+                with guard.file_single_flight(
+                    "PRO-122", "action-a", root=root
+                ) as claim:
+                    self.assertFalse(claim.acquired)
+                    self.assertEqual(claim.outcome, "wait")
+            finally:
+                release.set()
+                owner.join(3)
 
 
 if __name__ == "__main__":

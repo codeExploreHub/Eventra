@@ -9,7 +9,7 @@ import subprocess
 from dataclasses import asdict, dataclass
 from typing import Literal
 from urllib.parse import urlparse
-from urllib.request import getproxies
+from urllib.request import getproxies, proxy_bypass
 
 
 @dataclass(frozen=True)
@@ -40,10 +40,14 @@ def diagnose_multica_tls(*, timeout_seconds: float = 10) -> TLSDiagnosticResult:
 
     if not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
         raise ValueError("diagnostic timeout must be positive")
-    proxy = getproxies().get("https")
+    proxy = None if proxy_bypass("api.multica.ai") else getproxies().get("https")
     parsed_proxy = urlparse(proxy) if proxy else None
+    proxy_ports = {"http": 80, "https": 443, "socks": 1080, "socks5": 1080}
     target = (
-        (parsed_proxy.hostname, parsed_proxy.port or 443)
+        (
+            parsed_proxy.hostname,
+            parsed_proxy.port or proxy_ports.get(parsed_proxy.scheme.lower(), 443),
+        )
         if parsed_proxy is not None and parsed_proxy.hostname
         else ("api.multica.ai", 443)
     )
@@ -59,7 +63,7 @@ def diagnose_multica_tls(*, timeout_seconds: float = 10) -> TLSDiagnosticResult:
     connection.close()
 
     try:
-        completed = _run_auth_probe(timeout_seconds)
+        completed = _run_api_probe(timeout_seconds)
     except subprocess.TimeoutExpired:
         workaround_environment = os.environ.copy()
         current_godebug = workaround_environment.get("GODEBUG", "")
@@ -67,12 +71,17 @@ def diagnose_multica_tls(*, timeout_seconds: float = 10) -> TLSDiagnosticResult:
             item for item in (current_godebug, "tlsmlkem=0") if item
         )
         try:
-            _run_auth_probe(
+            fallback = _run_api_probe(
                 timeout_seconds,
                 environment=workaround_environment,
             )
         except subprocess.TimeoutExpired:
-            pass
+            return TLSDiagnosticResult(
+                "business_timeout",
+                True,
+                True,
+                "The read-only authenticated request exceeded the diagnostic timeout.",
+            )
         except OSError:
             return TLSDiagnosticResult(
                 "business_error",
@@ -80,14 +89,9 @@ def diagnose_multica_tls(*, timeout_seconds: float = 10) -> TLSDiagnosticResult:
                 False,
                 "The Multica CLI could not be started for the read-only request.",
             )
-        else:
+        if fallback.returncode == 0:
             return _tls_handshake_result()
-        return TLSDiagnosticResult(
-            "business_timeout",
-            True,
-            True,
-            "The read-only authenticated request exceeded the diagnostic timeout.",
-        )
+        return _classify_completed(fallback)
     except OSError:
         return TLSDiagnosticResult(
             "business_error",
@@ -95,6 +99,12 @@ def diagnose_multica_tls(*, timeout_seconds: float = 10) -> TLSDiagnosticResult:
             False,
             "The Multica CLI could not be started for the read-only request.",
         )
+    return _classify_completed(completed)
+
+
+def _classify_completed(
+    completed: subprocess.CompletedProcess[str],
+) -> TLSDiagnosticResult:
     if completed.returncode == 0:
         return TLSDiagnosticResult(
             "ok",
@@ -146,13 +156,13 @@ def diagnose_multica_tls(*, timeout_seconds: float = 10) -> TLSDiagnosticResult:
     )
 
 
-def _run_auth_probe(
+def _run_api_probe(
     timeout_seconds: float,
     *,
     environment: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["multica", "auth", "status"],
+        ["multica", "workspace", "list", "--output", "json"],
         text=True,
         capture_output=True,
         check=False,

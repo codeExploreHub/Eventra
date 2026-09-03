@@ -72,6 +72,99 @@ class TLSDiagnosticTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertIn("tlsmlkem=0", calls[1]["env"]["GODEBUG"])
 
+    def test_default_timeout_then_http_401_reports_authentication(self):
+        from tools.multica.tls_diagnostic import diagnose_multica_tls
+
+        attempts = 0
+
+        def run(*_args, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise subprocess.TimeoutExpired("multica", 5)
+            return subprocess.CompletedProcess(
+                ["multica"], 1, "", "HTTP 401 Unauthorized"
+            )
+
+        with patch(
+            "tools.multica.tls_diagnostic.socket.create_connection",
+            return_value=_Socket(),
+        ), patch("tools.multica.tls_diagnostic.subprocess.run", run):
+            result = diagnose_multica_tls(timeout_seconds=5)
+
+        self.assertEqual(result.classification, "http_authentication")
+
+    def test_diagnostic_uses_a_real_read_only_api_command(self):
+        from tools.multica.tls_diagnostic import diagnose_multica_tls
+
+        commands = []
+
+        def run(args, **_kwargs):
+            commands.append(args)
+            return subprocess.CompletedProcess(args, 0, "[]", "")
+
+        with patch(
+            "tools.multica.tls_diagnostic.socket.create_connection",
+            return_value=_Socket(),
+        ), patch("tools.multica.tls_diagnostic.subprocess.run", run):
+            result = diagnose_multica_tls(timeout_seconds=5)
+
+        self.assertEqual(result.classification, "ok")
+        self.assertEqual(
+            commands,
+            [["multica", "workspace", "list", "--output", "json"]],
+        )
+
+    def test_no_proxy_bypass_checks_the_direct_api_route(self):
+        from tools.multica.tls_diagnostic import diagnose_multica_tls
+
+        addresses = []
+
+        def connect(address, _timeout):
+            addresses.append(address)
+            return _Socket()
+
+        with patch(
+            "tools.multica.tls_diagnostic.proxy_bypass", return_value=True
+        ), patch(
+            "tools.multica.tls_diagnostic.getproxies",
+            return_value={"https": "http://proxy.example"},
+        ), patch(
+            "tools.multica.tls_diagnostic.socket.create_connection", connect
+        ), patch(
+            "tools.multica.tls_diagnostic.subprocess.run",
+            return_value=subprocess.CompletedProcess(["multica"], 0, "[]", ""),
+        ):
+            result = diagnose_multica_tls(timeout_seconds=5)
+
+        self.assertEqual(result.classification, "ok")
+        self.assertEqual(addresses, [("api.multica.ai", 443)])
+
+    def test_http_proxy_without_explicit_port_uses_port_80(self):
+        from tools.multica.tls_diagnostic import diagnose_multica_tls
+
+        addresses = []
+
+        def connect(address, _timeout):
+            addresses.append(address)
+            return _Socket()
+
+        with patch(
+            "tools.multica.tls_diagnostic.proxy_bypass", return_value=False
+        ), patch(
+            "tools.multica.tls_diagnostic.getproxies",
+            return_value={"https": "http://proxy.example"},
+        ), patch(
+            "tools.multica.tls_diagnostic.socket.create_connection", connect
+        ), patch(
+            "tools.multica.tls_diagnostic.subprocess.run",
+            return_value=subprocess.CompletedProcess(["multica"], 0, "[]", ""),
+        ):
+            result = diagnose_multica_tls(timeout_seconds=5)
+
+        self.assertEqual(result.classification, "ok")
+        self.assertEqual(addresses, [("proxy.example", 80)])
+
     def test_successful_read_only_auth_probe_reports_ok_without_payload(self):
         result = self._diagnose(
             subprocess.CompletedProcess(["multica"], 0, '{"authenticated":true}', "")

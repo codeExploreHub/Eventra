@@ -294,11 +294,13 @@ The executor is single-flight for the exact parent/action across local
 processes and linked worktrees. Same-key contenders perform no writes;
 conflicting keys fail closed; a process crash releases the kernel lease while
 the durable Smoke reservation preserves resumability. Its revision-fenced
-authority envelope keeps the exact authorization, source evidence, candidate
-SHA, merged PR, Project/Squad assignment, Stage/attempt, unique run, and durable
-commit checks while allowing only expected child/run startup transitions. The
-audited retry and recovery fixtures reduce external reads from `1293 -> 564`
-and `898 -> 415`, respectively.
+authority envelope keeps exact source-Issue and retry-comment revisions,
+authorization content, source evidence, candidate SHA, merged PR,
+Project/Squad assignment, Stage/attempt, unique run, and durable commit checks
+while allowing only expected child/run startup transitions. Full authority is
+reread immediately before and after child promotion. The deterministic retry
+and recovery fixtures reduce external reads from `1293 -> 475` and `898 ->
+314`, respectively.
 
 For an ambiguous Multica connectivity failure, use the read-only
 `tools.multica.workflow diagnose-tls` entry point. It distinguishes route, TLS

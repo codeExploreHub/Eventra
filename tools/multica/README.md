@@ -371,15 +371,17 @@ recovery authority for lost acknowledgements and interruptions; the file lease
 never replaces it.
 
 The executor reads the expensive immutable authority envelope twice before the
-first effect. That envelope binds the parent/action, source child identities and
-update revisions, immutable evidence comment identities, candidate SHA/merged
-PR identities, Project, Squad, and agent assignment. Mutation checkpoints then
-reread only mutable parent/child metadata, child/run cardinality, and exact
-assignment authority behind parent revision fences. Expected `backlog -> todo
--> in_progress` and `queued -> dispatched -> running` changes normalize to one
-active state; any second active run or other identity drift still blocks. The
-audited deterministic fixture counts are initial `1004 -> 500`, retry `1293 ->
-564`, and reservation recovery `898 -> 415` external reads.
+first effect and again immediately before and after promotion. That envelope
+binds the parent/action, exact source-Issue revisions, immutable evidence
+comment identities, retry-authorization content and revision, candidate
+SHA/merged PR identities, Project, Squad, and agent assignment. Mutation
+checkpoints reread mutable parent/child metadata, the exact source revisions,
+retry authorization, child/run cardinality, and assignment authority. Expected
+`backlog -> todo -> in_progress` and `queued -> dispatched -> running` changes
+normalize to one active state; any second active run or other identity drift
+still blocks. Deterministic fixtures reduce external reads from `1004 -> 399`
+for initial execution, `1293 -> 475` for retry, and `898 -> 314` for
+reservation recovery.
 
 ### Read-only Multica TLS diagnostic
 
@@ -391,8 +393,9 @@ python3 -B -m tools.multica.workflow diagnose-tls --timeout 15
 
 The JSON result distinguishes `unreachable`, `tls_handshake`,
 `http_authentication`, `business_timeout`, `business_error`, and `ok`. It first
-checks the effective direct/proxy TCP route, then runs only `multica auth
-status`; response bodies and credentials are never returned. If the
+checks the effective direct/proxy TCP route, honoring `NO_PROXY`, then runs only
+the read-only API request `multica workspace list --output json`; response
+bodies and credentials are never returned. If the
 default probe times out, it repeats that read-only request once with a
 process-only `GODEBUG=tlsmlkem=0` environment. Success on only that retry is
 classified as TLS compatibility, not credential failure. This covers the known

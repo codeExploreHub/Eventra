@@ -114,52 +114,72 @@ def file_single_flight(
         lease_root.chmod(0o700)
     except OSError:
         pass
-    digest = hashlib.sha256(parent.encode("utf-8")).hexdigest()
-    lock_path = lease_root / f"{digest}.lock"
-    record_path = lease_root / f"{digest}.json"
-    lock_descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    handle = os.fdopen(lock_descriptor, "a+", encoding="utf-8")
+    parent_digest = hashlib.sha256(parent.encode("utf-8")).hexdigest()
+    action_digest = hashlib.sha256(
+        f"{parent}\0{action_key}".encode("utf-8")
+    ).hexdigest()
+    parent_lock_path = lease_root / f"{parent_digest}.lock"
+    action_lock_path = lease_root / f"{parent_digest}.{action_digest}.lock"
+    record_path = lease_root / f"{parent_digest}.json"
+    action_descriptor = os.open(action_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    action_handle = os.fdopen(action_descriptor, "a+", encoding="utf-8")
     try:
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(action_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            holder = _read_record(record_path)
-            holder_action = "" if holder is None else str(holder["action_key"])
-            outcome = "wait" if holder_action == action_key else "conflict"
             yield SingleFlightClaim(
                 False,
-                outcome,
+                "wait",
                 parent,
                 action_key,
-                holder_action_key=holder_action,
+                holder_action_key=action_key,
             )
             return
 
-        stale = record_path.exists()
-        token = str(uuid.uuid4())
-        record = {
-            "action_key": action_key,
-            "parent": parent,
-            "pid": os.getpid(),
-            "started_at": time.time(),
-            "token": token,
-        }
-        _write_record(record_path, record)
+        parent_descriptor = os.open(parent_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        parent_handle = os.fdopen(parent_descriptor, "a+", encoding="utf-8")
         try:
-            yield SingleFlightClaim(
-                True,
-                "acquired",
-                parent,
-                action_key,
-                recovered_stale=stale,
-            )
+            try:
+                fcntl.flock(parent_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                holder = _read_record(record_path)
+                holder_action = "" if holder is None else str(holder["action_key"])
+                yield SingleFlightClaim(
+                    False,
+                    "conflict",
+                    parent,
+                    action_key,
+                    holder_action_key=holder_action,
+                )
+                return
+
+            stale = record_path.exists()
+            token = str(uuid.uuid4())
+            record = {
+                "action_key": action_key,
+                "parent": parent,
+                "pid": os.getpid(),
+                "started_at": time.time(),
+                "token": token,
+            }
+            _write_record(record_path, record)
+            try:
+                yield SingleFlightClaim(
+                    True,
+                    "acquired",
+                    parent,
+                    action_key,
+                    recovered_stale=stale,
+                )
+            finally:
+                current = _read_record(record_path)
+                if current is not None and current["token"] == token:
+                    try:
+                        record_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                fcntl.flock(parent_handle.fileno(), fcntl.LOCK_UN)
         finally:
-            current = _read_record(record_path)
-            if current is not None and current["token"] == token:
-                try:
-                    record_path.unlink()
-                except FileNotFoundError:
-                    pass
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            parent_handle.close()
     finally:
-        handle.close()
+        action_handle.close()
