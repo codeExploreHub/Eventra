@@ -658,6 +658,47 @@ def _implementation_action_source_candidates(value: str) -> dict[str, str]:
     return dict(sorted(candidates.items()))
 
 
+def _parse_smoke_creation_action(value: str) -> dict[str, object] | None:
+    parts = value.split(":") if type(value) is str else []
+    if (
+        len(parts) not in {9, 13}
+        or parts[0] != "2"
+        or ISSUE_KEY_PATTERN.fullmatch(parts[1]) is None
+        or parts[2] not in {"create_smoke_stage", "retry_smoke_stage"}
+        or parts[3] not in {"0", "1", "2", "3"}
+        or parts[4] not in {"frontend", "backend", "cross-stack"}
+        or any(
+            candidate != "-" and SHA_PATTERN.fullmatch(candidate) is None
+            for candidate in parts[5:7]
+        )
+        or parts[7] != "next-stage"
+        or not parts[8].isdigit()
+        or str(int(parts[8])) != parts[8]
+        or int(parts[8]) < 1
+        or (len(parts) == 9 and parts[2] != "create_smoke_stage")
+        or (
+            len(parts) == 13
+            and (
+                parts[2] != "retry_smoke_stage"
+                or parts[9] != "source-stage"
+                or not parts[10].isdigit()
+                or str(int(parts[10])) != parts[10]
+                or int(parts[10]) < 1
+                or int(parts[10]) != int(parts[8]) - 1
+                or parts[11] != "authorization"
+                or not _is_uuid(parts[12])
+            )
+        )
+    ):
+        return None
+    return {
+        "authorization_uuid": "" if len(parts) == 9 else parts[12],
+        "kind": parts[2],
+        "next_stage": int(parts[8]),
+        "source_stage": None if len(parts) == 9 else int(parts[10]),
+    }
+
+
 def _decode_source_candidates(value: str) -> dict[str, str]:
     try:
         decoded = json.loads(value)
@@ -1713,6 +1754,17 @@ def _recovery_authority_identity(
         parent.next_stage,
         parent.authorization_comment_uuid,
         parent.consumed_authorization_uuid,
+        parent.smoke_retry_authorization_comment_uuid,
+        parent.consumed_smoke_retry_authorization_uuid,
+        (
+            None
+            if parent.smoke_retry_authorizing_comment is None
+            else (
+                parent.smoke_retry_authorizing_comment.comment_uuid,
+                parent.smoke_retry_authorizing_comment.author_type,
+                parent.smoke_retry_authorizing_comment.content,
+            )
+        ),
         (
             None
             if parent.repair_reservation is None
@@ -2072,19 +2124,32 @@ def _smoke_assignment_problem(
     authority_problem = _parent_assignment_authority_problem(parent)
     if authority_problem is not None:
         return authority_problem
-    expected_candidates = _candidate_sha_map(parent)
-    expected_action = _action_key(
-        replace(
-            parent,
-            next_stage=parent.next_stage - 1,
-            last_action=None,
-        ),
-        "create_smoke_stage",
-        parent.attempt,
-    )
     if len(phases) != 1:
         return "current smoke assignment membership is incomplete or conflicting"
     phase = phases[0]
+    action = _parse_smoke_creation_action(phase.creation_action)
+    if action is None:
+        return "current smoke assignment action is malformed"
+    expected_candidates = _candidate_sha_map(parent)
+    source_stage = action["source_stage"]
+    authorization_uuid = str(action["authorization_uuid"])
+    expected_action = _action_key(
+        replace(
+            parent,
+            next_stage=phase.stage,
+            last_action=None,
+        ),
+        str(action["kind"]),
+        parent.attempt,
+        authorizing_comment_uuid=(
+            authorization_uuid
+            if action["kind"] == "retry_smoke_stage"
+            else None
+        ),
+        source_stage=(
+            int(source_stage) if source_stage is not None else None
+        ),
+    )
     candidates = {
         repository: sha
         for repository, sha in (
@@ -2097,6 +2162,7 @@ def _smoke_assignment_problem(
         phase.workflow_version != 2
         or phase.kind != "smoke"
         or phase.stage != parent.next_stage - 1
+        or action["next_stage"] != phase.stage
         or phase.attempt != parent.attempt
         or phase.creation_action != expected_action
         or parent.last_action != expected_action
@@ -2127,6 +2193,67 @@ def _smoke_assignment_problem(
         )
     ):
         return "current smoke merged pull-request authority is conflicting"
+    if action["kind"] == "retry_smoke_stage":
+        if source_stage is None:
+            return "current smoke retry lineage is conflicting"
+        source_smokes = tuple(
+            item
+            for item in parent.children
+            if item.stage == int(source_stage) and item.kind == "smoke"
+        )
+        source_gate = tuple(
+            item
+            for item in parent.children
+            if item.stage == int(source_stage) - 1
+        )
+        if len(source_smokes) != 1:
+            return "current smoke retry lineage is conflicting"
+        source_smoke = source_smokes[0]
+        source_action = _parse_smoke_creation_action(
+            source_smoke.creation_action
+        )
+        source_snapshot = replace(
+            parent,
+            parent_status="blocked",
+            next_stage=int(source_stage) + 1,
+            last_action=source_smoke.creation_action,
+            children=tuple(
+                item
+                for item in parent.children
+                if item.stage <= int(source_stage)
+            ),
+            consumed_smoke_retry_authorization_uuid="",
+        )
+        if (
+            source_action is None
+            or source_action["kind"] != "create_smoke_stage"
+            or source_smoke.status != "done"
+            or source_smoke.result != "blocked"
+            or source_smoke.responsible_repositories
+            or not _is_uuid(source_smoke.evidence_comment)
+            or authorization_uuid
+            != parent.smoke_retry_authorization_comment_uuid
+            or authorization_uuid
+            != parent.consumed_smoke_retry_authorization_uuid
+            or not _smoke_retry_authorization_comment_matches(
+                parent,
+                source_smoke,
+            )
+            or _smoke_assignment_problem(
+                source_snapshot,
+                (source_smoke,),
+            )
+            is not None
+            or not _historical_gate_identity_matches(
+                source_snapshot,
+                source_gate,
+            )
+            or any(
+                item.status != "done" or item.result != "pass"
+                for item in source_gate
+            )
+        ):
+            return "current smoke retry lineage is conflicting"
     return None
 
 
@@ -2593,10 +2720,10 @@ def _canonical_json(value: object) -> str:
     )
 
 
-def _validated_smoke_retry_authorization(
+def _smoke_retry_authorization_comment_matches(
     snapshot: ParentSnapshot,
     source_smoke: PhaseSnapshot,
-) -> str | None:
+) -> bool:
     comment = snapshot.smoke_retry_authorizing_comment
     expected = {
         "candidate_shas": _candidate_sha_map(snapshot),
@@ -2610,8 +2737,25 @@ def _validated_smoke_retry_authorization(
         != snapshot.smoke_retry_authorization_comment_uuid
         or comment.author_type != "member"
         or comment.content != _canonical_json(expected)
-        or snapshot.consumed_smoke_retry_authorization_uuid
     ):
+        return False
+    return True
+
+
+def _validated_smoke_retry_authorization(
+    snapshot: ParentSnapshot,
+    source_smoke: PhaseSnapshot,
+) -> str | None:
+    if (
+        snapshot.consumed_smoke_retry_authorization_uuid
+        or not _smoke_retry_authorization_comment_matches(
+            snapshot,
+            source_smoke,
+        )
+    ):
+        return None
+    comment = snapshot.smoke_retry_authorizing_comment
+    if comment is None:
         return None
     return comment.comment_uuid
 

@@ -486,6 +486,23 @@ class FakeSnapshotFinishRunner:
             self.parent_metadata[
                 workflow_module.REPAIR_AUTHORIZATION_CONSUMED_KEY
             ] = snapshot.consumed_authorization_uuid
+        if snapshot.smoke_retry_authorization_comment_uuid:
+            self.parent_metadata[
+                workflow_module.SMOKE_RETRY_AUTHORIZATION_KEY
+            ] = snapshot.smoke_retry_authorization_comment_uuid
+        if snapshot.consumed_smoke_retry_authorization_uuid:
+            self.parent_metadata[
+                workflow_module.SMOKE_RETRY_AUTHORIZATION_CONSUMED_KEY
+            ] = snapshot.consumed_smoke_retry_authorization_uuid
+        if snapshot.smoke_retry_authorizing_comment is not None:
+            comment = snapshot.smoke_retry_authorizing_comment
+            self.evidence_comments[snapshot.identifier] = [
+                {
+                    "id": comment.comment_uuid,
+                    "author_type": comment.author_type,
+                    "content": comment.content,
+                }
+            ]
         if repair_replay:
             self._install_repair_replay_identity()
         self.calls = []
@@ -749,6 +766,38 @@ class PhaseCompletionTests(unittest.TestCase):
             metadata["eventra.phase.evidence_comment_url"],
             "https://multica.example/comments/00000000-0000-4000-8000-000000000031",
         )
+
+    def test_retry_smoke_completion_accepts_exact_authorized_lineage(self):
+        committed = committed_smoke_retry_snapshot()
+        active_retry = replace(
+            committed.children[-1],
+            result=None,
+            status="todo",
+            evidence_comment="",
+        )
+        snapshot = replace(
+            committed,
+            children=(*committed.children[:-1], active_retry),
+            parent_status="in_progress",
+        )
+        runner = FakeSnapshotFinishRunner(snapshot, active_retry.issue_key)
+        github = FakeSnapshotGitHubRunner(snapshot.pull_requests)
+        completion = PhaseCompletion(
+            kind="smoke",
+            result="pass",
+            attempt=0,
+            evidence_comment="00000000-0000-4000-8000-000000000074",
+            frontend_sha=None,
+            backend_sha="b" * 40,
+            pr_url=None,
+        )
+
+        with patch.object(workflow_module, "GitHubRunner", return_value=github):
+            result = finish_phase(runner, active_retry.issue_key, completion)
+
+        self.assertEqual(result.status, "done")
+        self.assertEqual(result.kind, "smoke")
+        self.assertEqual(result.result, "pass")
 
     def test_nonpassing_gate_requires_one_canonical_evidence_url(self):
         comment_uuid = "00000000-0000-4000-8000-000000000031"
@@ -2672,13 +2721,14 @@ def parent_snapshot(**overrides):
 
 def authorized_smoke_retry_snapshot(**overrides):
     backend_sha = "b" * 40
+    identifier = str(overrides.pop("identifier", "PRO-65"))
     gate_action = (
-        "2:PRO-65:create_gate_stage:0:backend:-:"
+        f"2:{identifier}:create_gate_stage:0:backend:-:"
         + backend_sha
         + ":next-stage:2"
     )
     values = {
-        "identifier": "PRO-65",
+        "identifier": identifier,
         "classification": "backend-only",
         "candidate_frontend_sha": None,
         "candidate_backend_sha": backend_sha,
@@ -2691,12 +2741,18 @@ def authorized_smoke_retry_snapshot(**overrides):
                 frontend_sha=None, backend_sha=backend_sha,
                 project_id=BACKEND_PROJECT_ID,
                 assignee_id=BACKEND_AGENT_ID,
+                evidence_comment="00000000-0000-4000-8000-000000000077",
+                pr_url=(
+                    "https://github.com/codeExploreHub/"
+                    "Eventra-Backend/pull/7"
+                ),
             ),
             phase(
                 "PRO-67", 2, "review",
                 frontend_sha=None, backend_sha=backend_sha,
                 project_id=BACKEND_PROJECT_ID,
                 assignee_id=REVIEWER_ID,
+                evidence_comment="00000000-0000-4000-8000-000000000075",
                 creation_action=gate_action,
                 phase_target="repository:backend",
                 phase_role="independent_reviewer",
@@ -2706,6 +2762,7 @@ def authorized_smoke_retry_snapshot(**overrides):
                 frontend_sha=None, backend_sha=backend_sha,
                 project_id=BACKEND_PROJECT_ID,
                 assignee_id=QA_ID,
+                evidence_comment="00000000-0000-4000-8000-000000000076",
                 creation_action=gate_action,
                 phase_target="repository:backend",
                 phase_role="integration_qa",
@@ -2748,7 +2805,129 @@ def authorized_smoke_retry_snapshot(**overrides):
     return parent_snapshot(**values)
 
 
+def committed_smoke_retry_snapshot(*, result="pass", identifier="PRO-65", **overrides):
+    source = authorized_smoke_retry_snapshot(identifier=identifier)
+    action = (
+        f"2:{identifier}:retry_smoke_stage:0:backend:-:"
+        + "b" * 40
+        + ":next-stage:4:source-stage:3:authorization:"
+        + SMOKE_RETRY_AUTH_UUID
+    )
+    retry = phase(
+        "PRO-70",
+        4,
+        "smoke",
+        result=result,
+        frontend_sha=None,
+        backend_sha="b" * 40,
+        evidence_comment="00000000-0000-4000-8000-000000000073",
+        project_id=PROJECT_ID,
+        assignee_id=QA_ID,
+        creation_action=action,
+        phase_target="suite:smoke",
+        phase_role="integration_qa",
+    )
+    values = {
+        "parent_status": "in_review",
+        "next_stage": 5,
+        "last_action": action,
+        "children": (*source.children, retry),
+        "consumed_smoke_retry_authorization_uuid": SMOKE_RETRY_AUTH_UUID,
+    }
+    values.update(overrides)
+    return replace(source, **values)
+
+
 class ParentDecisionTests(unittest.TestCase):
+    def test_committed_retry_smoke_pass_completes_and_nonpass_cannot_retry_again(self):
+        passed = decide_parent_action(committed_smoke_retry_snapshot())
+        blocked = decide_parent_action(
+            committed_smoke_retry_snapshot(result="blocked")
+        )
+        failed = decide_parent_action(
+            committed_smoke_retry_snapshot(result="fail")
+        )
+
+        self.assertEqual(passed.kind, "complete_parent", passed.reason)
+        self.assertEqual(blocked.kind, "block_parent")
+        self.assertIsNone(blocked.action_key)
+        self.assertEqual(failed.kind, "block_parent")
+        self.assertIsNone(failed.action_key)
+
+    def test_retry_smoke_assignment_rejects_forged_action_lineage(self):
+        baseline = committed_smoke_retry_snapshot()
+        retry = baseline.children[-1]
+        source = next(
+            item for item in baseline.children if item.issue_key == "PRO-68"
+        )
+        cases = {
+            "wrong source stage": replace(
+                retry,
+                creation_action=retry.creation_action.replace(
+                    "source-stage:3",
+                    "source-stage:2",
+                ),
+            ),
+            "wrong authorization": replace(
+                retry,
+                creation_action=retry.creation_action.replace(
+                    SMOKE_RETRY_AUTH_UUID,
+                    "00000000-0000-4000-8000-000000000099",
+                ),
+            ),
+            "wrong next stage": replace(
+                retry,
+                creation_action=retry.creation_action.replace(
+                    "next-stage:4",
+                    "next-stage:5",
+                ),
+            ),
+            "changed source evidence": replace(
+                source,
+                evidence_comment="00000000-0000-4000-8000-000000000099",
+            ),
+        }
+        for label, forged in cases.items():
+            with self.subTest(label=label):
+                children = tuple(
+                    forged
+                    if item.issue_key == forged.issue_key else item
+                    for item in baseline.children
+                )
+                snapshot = replace(baseline, children=children)
+                if forged.issue_key == retry.issue_key:
+                    snapshot = replace(
+                        snapshot,
+                        last_action=forged.creation_action,
+                    )
+                decision = decide_parent_action(snapshot)
+                self.assertEqual(decision.kind, "block_parent")
+                self.assertIsNone(decision.action_key)
+
+    def test_smoke_creation_action_parser_rejects_noncanonical_shapes(self):
+        valid = committed_smoke_retry_snapshot().last_action
+        parsed = workflow_module._parse_smoke_creation_action(valid)
+
+        self.assertEqual(
+            parsed,
+            {
+                "authorization_uuid": SMOKE_RETRY_AUTH_UUID,
+                "kind": "retry_smoke_stage",
+                "next_stage": 4,
+                "source_stage": 3,
+            },
+        )
+        for malformed in (
+            valid + ":extra",
+            valid.replace("next-stage", "stage"),
+            valid.replace("source-stage:3", "source-stage:03"),
+            valid.replace(SMOKE_RETRY_AUTH_UUID, "not-a-uuid"),
+        ):
+            with self.subTest(malformed=malformed):
+                self.assertIsNone(
+                    workflow_module._parse_smoke_creation_action(malformed)
+                )
+
     def test_blocked_infrastructure_smoke_with_member_authorization_plans_one_retry(self):
         decision = decide_parent_action(authorized_smoke_retry_snapshot())
 
@@ -4976,6 +5155,16 @@ class ParentCompletionTests(unittest.TestCase):
             print_parent_result(result)
         self.assertEqual(output.getvalue(), "issue=PRO-35 status=done mutations=1\n")
 
+    def test_verified_retry_smoke_moves_parent_to_done(self):
+        runner = FakeParentCompletionRunner()
+        snapshot = committed_smoke_retry_snapshot(identifier="PRO-35")
+        snapshots = iter((snapshot, snapshot))
+
+        result = finish_parent(runner, "PRO-35", lambda: next(snapshots))
+
+        self.assertEqual(result.status, "done")
+        self.assertEqual(result.mutation_count, 1)
+
     def test_parent_completion_is_idempotent_after_done(self):
         runner = FakeParentCompletionRunner(status="done")
 
@@ -5211,6 +5400,34 @@ def stalled_workflow(**overrides):
 
 
 class RecoveryDecisionTests(unittest.TestCase):
+    def test_recovery_identity_changes_with_smoke_retry_authority(self):
+        parent = authorized_smoke_retry_snapshot()
+        snapshot = WorkflowSnapshot(
+            parent_issue_id=PARENT_ID,
+            parent_identifier=parent.identifier,
+            has_human_approval_wait=False,
+            has_malformed_state=False,
+            latest_stage_finished=True,
+            has_later_parent_run=False,
+            active_parent_has_no_executable_successor=False,
+            children=(),
+            parent=parent,
+        )
+        changed = replace(
+            snapshot,
+            parent=replace(
+                parent,
+                consumed_smoke_retry_authorization_uuid=(
+                    SMOKE_RETRY_AUTH_UUID
+                ),
+            ),
+        )
+
+        self.assertNotEqual(
+            workflow_module._recovery_authority_identity(snapshot),
+            workflow_module._recovery_authority_identity(changed),
+        )
+
     def test_recovery_never_consumes_an_in_progress_smoke_reservation(self):
         snapshot = stalled_workflow()
         snapshot = replace(
