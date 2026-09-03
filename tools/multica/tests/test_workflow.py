@@ -57,6 +57,8 @@ FOREIGN_SQUAD_ID = "00000000-0000-4000-8000-000000000018"
 DELIVERY_LEAD_ID = "00000000-0000-4000-8000-000000000019"
 WATCHER_ID = "00000000-0000-4000-8000-000000000020"
 COMMENT_ID = "01a00000-0000-7000-8000-000000000010"
+SMOKE_RETRY_AUTH_UUID = "00000000-0000-4000-8000-000000000071"
+SMOKE_EVIDENCE_UUID = "00000000-0000-4000-8000-000000000072"
 FRONTEND_SHA = "a" * 40
 FRONTEND_PR = "https://github.com/codeExploreHub/Eventra/pull/6"
 
@@ -484,6 +486,23 @@ class FakeSnapshotFinishRunner:
             self.parent_metadata[
                 workflow_module.REPAIR_AUTHORIZATION_CONSUMED_KEY
             ] = snapshot.consumed_authorization_uuid
+        if snapshot.smoke_retry_authorization_comment_uuid:
+            self.parent_metadata[
+                workflow_module.SMOKE_RETRY_AUTHORIZATION_KEY
+            ] = snapshot.smoke_retry_authorization_comment_uuid
+        if snapshot.consumed_smoke_retry_authorization_uuid:
+            self.parent_metadata[
+                workflow_module.SMOKE_RETRY_AUTHORIZATION_CONSUMED_KEY
+            ] = snapshot.consumed_smoke_retry_authorization_uuid
+        if snapshot.smoke_retry_authorizing_comment is not None:
+            comment = snapshot.smoke_retry_authorizing_comment
+            self.evidence_comments[snapshot.identifier] = [
+                {
+                    "id": comment.comment_uuid,
+                    "author_type": comment.author_type,
+                    "content": comment.content,
+                }
+            ]
         if repair_replay:
             self._install_repair_replay_identity()
         self.calls = []
@@ -747,6 +766,38 @@ class PhaseCompletionTests(unittest.TestCase):
             metadata["eventra.phase.evidence_comment_url"],
             "https://multica.example/comments/00000000-0000-4000-8000-000000000031",
         )
+
+    def test_retry_smoke_completion_accepts_exact_authorized_lineage(self):
+        committed = committed_smoke_retry_snapshot()
+        active_retry = replace(
+            committed.children[-1],
+            result=None,
+            status="todo",
+            evidence_comment="",
+        )
+        snapshot = replace(
+            committed,
+            children=(*committed.children[:-1], active_retry),
+            parent_status="in_progress",
+        )
+        runner = FakeSnapshotFinishRunner(snapshot, active_retry.issue_key)
+        github = FakeSnapshotGitHubRunner(snapshot.pull_requests)
+        completion = PhaseCompletion(
+            kind="smoke",
+            result="pass",
+            attempt=0,
+            evidence_comment="00000000-0000-4000-8000-000000000074",
+            frontend_sha=None,
+            backend_sha="b" * 40,
+            pr_url=None,
+        )
+
+        with patch.object(workflow_module, "GitHubRunner", return_value=github):
+            result = finish_phase(runner, active_retry.issue_key, completion)
+
+        self.assertEqual(result.status, "done")
+        self.assertEqual(result.kind, "smoke")
+        self.assertEqual(result.result, "pass")
 
     def test_nonpassing_gate_requires_one_canonical_evidence_url(self):
         comment_uuid = "00000000-0000-4000-8000-000000000031"
@@ -2668,7 +2719,288 @@ def parent_snapshot(**overrides):
     return ParentSnapshot(**values)
 
 
+def authorized_smoke_retry_snapshot(**overrides):
+    backend_sha = "b" * 40
+    identifier = str(overrides.pop("identifier", "PRO-65"))
+    gate_action = (
+        f"2:{identifier}:create_gate_stage:0:backend:-:"
+        + backend_sha
+        + ":next-stage:2"
+    )
+    values = {
+        "identifier": identifier,
+        "classification": "backend-only",
+        "candidate_frontend_sha": None,
+        "candidate_backend_sha": backend_sha,
+        "parent_status": "blocked",
+        "merge_state": "merged",
+        "next_stage": 4,
+        "children": (
+            phase(
+                "PRO-66", 1, "implementation",
+                frontend_sha=None, backend_sha=backend_sha,
+                project_id=BACKEND_PROJECT_ID,
+                assignee_id=BACKEND_AGENT_ID,
+                evidence_comment="00000000-0000-4000-8000-000000000077",
+                pr_url=(
+                    "https://github.com/codeExploreHub/"
+                    "Eventra-Backend/pull/7"
+                ),
+            ),
+            phase(
+                "PRO-67", 2, "review",
+                frontend_sha=None, backend_sha=backend_sha,
+                project_id=BACKEND_PROJECT_ID,
+                assignee_id=REVIEWER_ID,
+                evidence_comment="00000000-0000-4000-8000-000000000075",
+                creation_action=gate_action,
+                phase_target="repository:backend",
+                phase_role="independent_reviewer",
+            ),
+            phase(
+                "PRO-69", 2, "qa",
+                frontend_sha=None, backend_sha=backend_sha,
+                project_id=BACKEND_PROJECT_ID,
+                assignee_id=QA_ID,
+                evidence_comment="00000000-0000-4000-8000-000000000076",
+                creation_action=gate_action,
+                phase_target="repository:backend",
+                phase_role="integration_qa",
+            ),
+            phase(
+                "PRO-68", 3, "smoke", result="blocked",
+                frontend_sha=None, backend_sha=backend_sha,
+                evidence_comment=SMOKE_EVIDENCE_UUID,
+                responsible_repositories=(),
+            ),
+        ),
+        "pull_requests": (
+            PullRequestSnapshot(
+                "backend",
+                "https://github.com/codeExploreHub/Eventra-Backend/pull/7",
+                backend_sha,
+                "merged",
+                True,
+                True,
+            ),
+        ),
+        "smoke_retry_authorization_comment_uuid": SMOKE_RETRY_AUTH_UUID,
+        "consumed_smoke_retry_authorization_uuid": "",
+        "smoke_retry_authorizing_comment": AuthorizingComment(
+            SMOKE_RETRY_AUTH_UUID,
+            "member",
+            json.dumps(
+                {
+                    "candidate_shas": {"backend": backend_sha},
+                    "granted_smoke_retry": 1,
+                    "source_evidence_comment_uuid": SMOKE_EVIDENCE_UUID,
+                    "source_smoke": "PRO-68",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        ),
+    }
+    values.update(overrides)
+    return parent_snapshot(**values)
+
+
+def committed_smoke_retry_snapshot(*, result="pass", identifier="PRO-65", **overrides):
+    source = authorized_smoke_retry_snapshot(identifier=identifier)
+    action = (
+        f"2:{identifier}:retry_smoke_stage:0:backend:-:"
+        + "b" * 40
+        + ":next-stage:4:source-stage:3:authorization:"
+        + SMOKE_RETRY_AUTH_UUID
+    )
+    retry = phase(
+        "PRO-70",
+        4,
+        "smoke",
+        result=result,
+        frontend_sha=None,
+        backend_sha="b" * 40,
+        evidence_comment="00000000-0000-4000-8000-000000000073",
+        project_id=PROJECT_ID,
+        assignee_id=QA_ID,
+        creation_action=action,
+        phase_target="suite:smoke",
+        phase_role="integration_qa",
+    )
+    values = {
+        "parent_status": "in_review",
+        "next_stage": 5,
+        "last_action": action,
+        "children": (*source.children, retry),
+        "consumed_smoke_retry_authorization_uuid": SMOKE_RETRY_AUTH_UUID,
+    }
+    values.update(overrides)
+    return replace(source, **values)
+
+
 class ParentDecisionTests(unittest.TestCase):
+    def test_committed_retry_smoke_pass_completes_and_nonpass_cannot_retry_again(self):
+        passed = decide_parent_action(committed_smoke_retry_snapshot())
+        blocked = decide_parent_action(
+            committed_smoke_retry_snapshot(result="blocked")
+        )
+        failed = decide_parent_action(
+            committed_smoke_retry_snapshot(result="fail")
+        )
+
+        self.assertEqual(passed.kind, "complete_parent", passed.reason)
+        self.assertEqual(blocked.kind, "block_parent")
+        self.assertIsNone(blocked.action_key)
+        self.assertEqual(failed.kind, "block_parent")
+        self.assertIsNone(failed.action_key)
+
+    def test_retry_smoke_assignment_rejects_forged_action_lineage(self):
+        baseline = committed_smoke_retry_snapshot()
+        retry = baseline.children[-1]
+        source = next(
+            item for item in baseline.children if item.issue_key == "PRO-68"
+        )
+        cases = {
+            "wrong source stage": replace(
+                retry,
+                creation_action=retry.creation_action.replace(
+                    "source-stage:3",
+                    "source-stage:2",
+                ),
+            ),
+            "wrong authorization": replace(
+                retry,
+                creation_action=retry.creation_action.replace(
+                    SMOKE_RETRY_AUTH_UUID,
+                    "00000000-0000-4000-8000-000000000099",
+                ),
+            ),
+            "wrong next stage": replace(
+                retry,
+                creation_action=retry.creation_action.replace(
+                    "next-stage:4",
+                    "next-stage:5",
+                ),
+            ),
+            "changed source evidence": replace(
+                source,
+                evidence_comment="00000000-0000-4000-8000-000000000099",
+            ),
+        }
+        for label, forged in cases.items():
+            with self.subTest(label=label):
+                children = tuple(
+                    forged
+                    if item.issue_key == forged.issue_key else item
+                    for item in baseline.children
+                )
+                snapshot = replace(baseline, children=children)
+                if forged.issue_key == retry.issue_key:
+                    snapshot = replace(
+                        snapshot,
+                        last_action=forged.creation_action,
+                    )
+                decision = decide_parent_action(snapshot)
+                self.assertEqual(decision.kind, "block_parent")
+                self.assertIsNone(decision.action_key)
+
+    def test_smoke_creation_action_parser_rejects_noncanonical_shapes(self):
+        valid = committed_smoke_retry_snapshot().last_action
+        parsed = workflow_module._parse_smoke_creation_action(valid)
+
+        self.assertEqual(
+            parsed,
+            {
+                "authorization_uuid": SMOKE_RETRY_AUTH_UUID,
+                "kind": "retry_smoke_stage",
+                "next_stage": 4,
+                "source_stage": 3,
+            },
+        )
+        for malformed in (
+            valid + ":extra",
+            valid.replace("next-stage", "stage"),
+            valid.replace("source-stage:3", "source-stage:03"),
+            valid.replace(SMOKE_RETRY_AUTH_UUID, "not-a-uuid"),
+        ):
+            with self.subTest(malformed=malformed):
+                self.assertIsNone(
+                    workflow_module._parse_smoke_creation_action(malformed)
+                )
+
+    def test_blocked_infrastructure_smoke_with_member_authorization_plans_one_retry(self):
+        decision = decide_parent_action(authorized_smoke_retry_snapshot())
+
+        self.assertEqual(decision.kind, "retry_smoke_stage", decision.reason)
+        self.assertEqual(
+            decision.action_key,
+            (
+                "2:PRO-65:retry_smoke_stage:0:backend:-:"
+                + "b" * 40
+                + ":next-stage:4:source-stage:3:authorization:"
+                + SMOKE_RETRY_AUTH_UUID
+            ),
+        )
+
+    def test_smoke_retry_rejects_invalid_authority_and_non_infrastructure_results(self):
+        baseline = authorized_smoke_retry_snapshot()
+        source = next(item for item in baseline.children if item.issue_key == "PRO-68")
+        cases = {
+            "missing authorization": replace(
+                baseline,
+                smoke_retry_authorizing_comment=None,
+            ),
+            "non-member authorization": replace(
+                baseline,
+                smoke_retry_authorizing_comment=replace(
+                    baseline.smoke_retry_authorizing_comment,
+                    author_type="agent",
+                ),
+            ),
+            "noncanonical authorization": replace(
+                baseline,
+                smoke_retry_authorizing_comment=replace(
+                    baseline.smoke_retry_authorizing_comment,
+                    content=json.dumps(
+                        json.loads(
+                            baseline.smoke_retry_authorizing_comment.content
+                        )
+                    ),
+                ),
+            ),
+            "authorization already consumed": replace(
+                baseline,
+                consumed_smoke_retry_authorization_uuid=(
+                    SMOKE_RETRY_AUTH_UUID
+                ),
+            ),
+            "parent is not blocked": replace(
+                baseline,
+                parent_status="in_review",
+            ),
+            "smoke failed": replace(
+                baseline,
+                children=tuple(
+                    replace(item, result="fail")
+                    if item.issue_key == source.issue_key else item
+                    for item in baseline.children
+                ),
+            ),
+            "smoke owns repository failure": replace(
+                baseline,
+                children=tuple(
+                    replace(item, responsible_repositories=("backend",))
+                    if item.issue_key == source.issue_key else item
+                    for item in baseline.children
+                ),
+            ),
+        }
+        for label, snapshot in cases.items():
+            with self.subTest(label=label):
+                decision = decide_parent_action(snapshot)
+                self.assertEqual(decision.kind, "block_parent")
+                self.assertIsNone(decision.action_key)
+
     def test_implementation_replacement_keeps_its_original_creation_authority(self):
         source = parent_snapshot()
         replacement_sha = "c" * 40
@@ -4823,6 +5155,16 @@ class ParentCompletionTests(unittest.TestCase):
             print_parent_result(result)
         self.assertEqual(output.getvalue(), "issue=PRO-35 status=done mutations=1\n")
 
+    def test_verified_retry_smoke_moves_parent_to_done(self):
+        runner = FakeParentCompletionRunner()
+        snapshot = committed_smoke_retry_snapshot(identifier="PRO-35")
+        snapshots = iter((snapshot, snapshot))
+
+        result = finish_parent(runner, "PRO-35", lambda: next(snapshots))
+
+        self.assertEqual(result.status, "done")
+        self.assertEqual(result.mutation_count, 1)
+
     def test_parent_completion_is_idempotent_after_done(self):
         runner = FakeParentCompletionRunner(status="done")
 
@@ -5058,6 +5400,34 @@ def stalled_workflow(**overrides):
 
 
 class RecoveryDecisionTests(unittest.TestCase):
+    def test_recovery_identity_changes_with_smoke_retry_authority(self):
+        parent = authorized_smoke_retry_snapshot()
+        snapshot = WorkflowSnapshot(
+            parent_issue_id=PARENT_ID,
+            parent_identifier=parent.identifier,
+            has_human_approval_wait=False,
+            has_malformed_state=False,
+            latest_stage_finished=True,
+            has_later_parent_run=False,
+            active_parent_has_no_executable_successor=False,
+            children=(),
+            parent=parent,
+        )
+        changed = replace(
+            snapshot,
+            parent=replace(
+                parent,
+                consumed_smoke_retry_authorization_uuid=(
+                    SMOKE_RETRY_AUTH_UUID
+                ),
+            ),
+        )
+
+        self.assertNotEqual(
+            workflow_module._recovery_authority_identity(snapshot),
+            workflow_module._recovery_authority_identity(changed),
+        )
+
     def test_recovery_never_consumes_an_in_progress_smoke_reservation(self):
         snapshot = stalled_workflow()
         snapshot = replace(
@@ -7341,6 +7711,16 @@ class FakeRepairRunner:
         if call[:2] == ("issue", "status"):
             identifier = call[2]
             status = call[3]
+            if identifier in {"PRO-65", PARENT_ID}:
+                if "--no-start" not in call:
+                    raise AssertionError(
+                        "parent status transition must not start a run"
+                    )
+                if self.parent["status"] != status:
+                    self.parent["status"] = status
+                    self.committed_mutations += 1
+                self._maybe_lose_ack("parent-status")
+                return copy.deepcopy(self.parent)
             child = next(child for child in self.children if child["identifier"] == identifier)
             if child["status"] != status:
                 child["status"] = status
@@ -7415,6 +7795,179 @@ class SmokeExecutionTests(unittest.TestCase):
         decision = decide_parent_action(snapshot)
         self.assertEqual(decision.kind, "create_smoke_stage", decision.reason)
         return runner, github, decision
+
+    def _retry_planned(self):
+        runner, github, initial_decision = self._planned()
+        initial = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=initial_decision.action_key,
+        )
+        self.assertEqual(initial.next_action, "smoke", initial.reason)
+        smoke = next(child for child in runner.children if child["stage"] == 3)
+        smoke_key = str(smoke["identifier"])
+        smoke["status"] = "done"
+        runner.runs[smoke_key] = [
+            {
+                "id": f"run-{smoke_key}-1",
+                "issue_id": smoke["id"],
+                "status": "completed",
+                "created_at": "2026-08-25T09:00:00Z",
+                "dispatched_at": "2026-08-25T09:00:01Z",
+                "started_at": "2026-08-25T09:00:02Z",
+                "completed_at": "2026-08-25T09:30:00Z",
+            }
+        ]
+        runner.metadata[smoke_key].update(
+            {
+                "eventra.phase.result": "blocked",
+                "eventra.phase.evidence_comment": SMOKE_EVIDENCE_UUID,
+                "eventra.phase.failure_repositories": "[]",
+            }
+        )
+        runner.evidence_comments[smoke_key] = [
+            {
+                "id": SMOKE_EVIDENCE_UUID,
+                "issue_id": smoke["id"],
+                "author_id": smoke["assignee_id"],
+                "author_type": "agent",
+                "content": "fresh fetch unavailable; runtime checks passed",
+            }
+        ]
+        runner.parent["status"] = "blocked"
+        runner.metadata["PRO-65"][
+            workflow_module.SMOKE_RETRY_AUTHORIZATION_KEY
+        ] = SMOKE_RETRY_AUTH_UUID
+        runner.comments = [
+            {
+                "id": SMOKE_RETRY_AUTH_UUID,
+                "author_type": "member",
+                "content": json.dumps(
+                    {
+                        "candidate_shas": {
+                            "backend": FakeRepairRunner.BACKEND_SHA
+                        },
+                        "granted_smoke_retry": 1,
+                        "source_evidence_comment_uuid": SMOKE_EVIDENCE_UUID,
+                        "source_smoke": smoke_key,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
+        ]
+        decision = decide_parent_action(
+            load_parent_snapshot(runner, github, "PRO-65")
+        )
+        self.assertEqual(decision.kind, "retry_smoke_stage", decision.reason)
+        return runner, github, decision, smoke_key
+
+    def test_retry_smoke_executor_creates_one_source_bound_child(self):
+        runner, github, decision, source_key = self._retry_planned()
+
+        result = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(result.next_action, "smoke", result.reason)
+        created = [child for child in runner.children if child["stage"] == 4]
+        self.assertEqual(len(created), 1)
+        child = created[0]
+        self.assertEqual(child["status"], "todo")
+        self.assertEqual(runner.parent["status"], "in_progress")
+        metadata = runner.metadata[str(child["identifier"])]
+        self.assertEqual(
+            metadata["eventra.phase.creation_action"],
+            decision.action_key,
+        )
+        self.assertEqual(
+            runner.metadata["PRO-65"][
+                workflow_module.SMOKE_RETRY_AUTHORIZATION_CONSUMED_KEY
+            ],
+            SMOKE_RETRY_AUTH_UUID,
+        )
+        self.assertEqual(
+            runner.metadata["PRO-65"]["eventra.workflow.next_stage"],
+            "5",
+        )
+        self.assertNotIn(
+            workflow_module.SMOKE_RESERVATION_KEY,
+            runner.metadata["PRO-65"],
+        )
+        self.assertEqual(
+            child["description"],
+            json.dumps(
+                {
+                    "action": decision.action_key,
+                    "candidate_shas": {
+                        "backend": FakeRepairRunner.BACKEND_SHA
+                    },
+                    "parent": "PRO-65",
+                    "source_evidence_comment_uuid": SMOKE_EVIDENCE_UUID,
+                    "source_smoke": source_key,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+    def test_retry_smoke_lost_acknowledgements_replay_without_duplicates(self):
+        lost_acks = (
+            "set:PRO-65:eventra.workflow.smoke_reservation",
+            "create",
+            "set-child:eventra.phase.creation_action",
+            "parent-status",
+            "status",
+            "set:PRO-65:eventra.workflow.next_stage",
+            "set:PRO-65:eventra.workflow.last_action",
+            (
+                "set:PRO-65:"
+                "eventra.workflow.smoke_retry_authorization_consumed"
+            ),
+            "delete:PRO-65:eventra.workflow.smoke_reservation",
+        )
+        for lost_ack in lost_acks:
+            with self.subTest(lost_ack=lost_ack):
+                runner, github, decision, _ = self._retry_planned()
+                runner.lost_ack_once.add(lost_ack)
+
+                first = execute_parent_smoke(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+                second = execute_parent_smoke(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+
+                self.assertIn(first.next_action, {"smoke", "block"})
+                self.assertEqual(second.next_action, "noop", second.reason)
+                self.assertEqual(second.mutation_count, 0)
+                self.assertEqual(
+                    len(
+                        [
+                            child
+                            for child in runner.children
+                            if child["stage"] == 4
+                        ]
+                    ),
+                    1,
+                )
+                self.assertEqual(runner.parent["status"], "in_progress")
+                self.assertEqual(
+                    runner.metadata["PRO-65"][
+                        workflow_module.SMOKE_RETRY_AUTHORIZATION_CONSUMED_KEY
+                    ],
+                    SMOKE_RETRY_AUTH_UUID,
+                )
 
     def test_smoke_executor_is_an_exact_action_cli(self):
         self.assertTrue(
@@ -9980,6 +10533,102 @@ class RepairExecutionTests(unittest.TestCase):
 
 
 class ParentSnapshotReadTests(unittest.TestCase):
+    def test_parent_smoke_retry_authorization_is_loaded_and_reread(self):
+        runner = FakeParentRunner()
+        content = json.dumps(
+            {
+                "candidate_shas": {"frontend": FRONTEND_SHA},
+                "granted_smoke_retry": 1,
+                "source_evidence_comment_uuid": SMOKE_EVIDENCE_UUID,
+                "source_smoke": "PRO-68",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        runner.metadata["PRO-35"].update(
+            {
+                workflow_module.SMOKE_RETRY_AUTHORIZATION_KEY:
+                    SMOKE_RETRY_AUTH_UUID,
+                workflow_module.SMOKE_RETRY_AUTHORIZATION_CONSUMED_KEY: "",
+            }
+        )
+        runner.comment_records = [
+            {
+                "id": SMOKE_RETRY_AUTH_UUID,
+                "author_type": "member",
+                "content": content,
+            }
+        ]
+
+        snapshot = load_parent_snapshot(runner, FakeGitHubRunner(), "PRO-35")
+
+        self.assertEqual(
+            snapshot.smoke_retry_authorization_comment_uuid,
+            SMOKE_RETRY_AUTH_UUID,
+        )
+        self.assertEqual(snapshot.consumed_smoke_retry_authorization_uuid, "")
+        self.assertEqual(
+            snapshot.smoke_retry_authorizing_comment,
+            AuthorizingComment(SMOKE_RETRY_AUTH_UUID, "member", content),
+        )
+        reads = [
+            call
+            for call in runner.calls
+            if call[:4] == ("issue", "comment", "list", "PRO-35")
+        ]
+        self.assertEqual(len(reads), 2)
+
+    def test_parent_smoke_retry_authorization_drift_fails_closed(self):
+        class DriftingCommentRunner(FakeParentRunner):
+            def __init__(self):
+                super().__init__()
+                self.smoke_retry_comment_reads = 0
+
+            def run(self, args, *, stdin_json=None):
+                if tuple(args)[:4] == (
+                    "issue", "comment", "list", "PRO-35"
+                ):
+                    self.smoke_retry_comment_reads += 1
+                    if self.smoke_retry_comment_reads == 2:
+                        self.comment_records = []
+                return super().run(args, stdin_json=stdin_json)
+
+        runner = DriftingCommentRunner()
+        runner.metadata["PRO-35"][
+            workflow_module.SMOKE_RETRY_AUTHORIZATION_KEY
+        ] = SMOKE_RETRY_AUTH_UUID
+        runner.comment_records = [
+            {
+                "id": SMOKE_RETRY_AUTH_UUID,
+                "author_type": "member",
+                "content": "{}",
+            }
+        ]
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "smoke retry authorization changed",
+        ):
+            load_parent_snapshot(runner, FakeGitHubRunner(), "PRO-35")
+
+    def test_malformed_smoke_retry_authorization_metadata_fails_closed(self):
+        for key in (
+            "eventra.workflow.smoke_retry_authorization_comment",
+            "eventra.workflow.smoke_retry_authorization_consumed",
+        ):
+            with self.subTest(key=key):
+                runner = FakeParentRunner()
+                runner.metadata["PRO-35"][key] = "not-a-uuid"
+                github = FakeGitHubRunner()
+
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "malformed parent workflow metadata",
+                ):
+                    load_parent_snapshot(runner, github, "PRO-35")
+
+                self.assertEqual(github.calls, [])
+
     def test_loaded_partial_repair_executor_provenance_fails_closed(self):
         digest = "d" * 64
         action = (

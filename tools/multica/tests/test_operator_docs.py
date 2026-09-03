@@ -539,6 +539,53 @@ class OperatorDocsTests(unittest.TestCase):
 
         self.assertIn("Do not create smoke children manually", lead)
 
+    def test_smoke_retry_protocol_is_member_authorized_once_and_keeps_provenance(self):
+        lead = " ".join(
+            Path("tools/multica/instructions/delivery_lead.md")
+            .read_text()
+            .split()
+        )
+        qa = " ".join(
+            Path("tools/multica/instructions/integration_qa.md")
+            .read_text()
+            .split()
+        )
+        readme = " ".join(
+            Path("tools/multica/README.md").read_text().split()
+        )
+        pilot = " ".join(
+            Path("docs/multica/pilot-issues.md").read_text().split()
+        )
+
+        for rendered in (lead, readme, pilot):
+            for fragment in (
+                "retry_smoke_stage",
+                "eventra.workflow.smoke_retry_authorization_comment",
+                "eventra.workflow.smoke_retry_authorization_consumed",
+                '"granted_smoke_retry":1',
+                '"source_smoke":"PRO-120"',
+                '"source_evidence_comment_uuid":'
+                '"01a0622e-72e3-7660-9fcd-a806c07a5c0f"',
+                "exactly one",
+                "execute-parent-smoke",
+            ):
+                with self.subTest(fragment=fragment):
+                    self.assertIn(fragment, rendered)
+
+        for fragment in (
+            "fresh fetch",
+            "FETCH_HEAD",
+            "source Smoke",
+            "unchanged candidate SHA",
+            "clean detached worktree",
+            "no deployment",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, qa)
+
+        self.assertIn("Do not create smoke children manually", lead)
+        self.assertIn("second retry", lead)
+
     def test_initial_implementation_pr_is_established_by_first_completion(self):
         lead = " ".join(
             Path("tools/multica/instructions/delivery_lead.md").read_text().split()
