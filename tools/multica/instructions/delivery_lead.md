@@ -234,6 +234,28 @@ next barrier group, then advance `next_stage` and record `last_action`.
   merged PR heads block without overwrite. This depends on the provisioned
   single serialized Delivery Lead; it is not generic CAS or transaction safety.
   Complete the parent only after exact assigned smoke PASS.
+- `retry_smoke_stage`: This is the only recovery from a post-merge Smoke that
+  finished `done + blocked` solely because external infrastructure prevented
+  mandatory provenance verification. A member posts exactly one immutable root
+  comment on the blocked parent. Its byte-for-byte canonical body for PRO-116 is:
+
+  ```json
+  {"candidate_shas":{"backend":"c7b9a38a2d05ba05eec6b16c83184653aefba750"},"granted_smoke_retry":1,"source_evidence_comment_uuid":"01a0622e-72e3-7660-9fcd-a806c07a5c0f","source_smoke":"PRO-120"}
+  ```
+
+  Store only its server-returned UUID in
+  `eventra.workflow.smoke_retry_authorization_comment`. Rerun `plan-parent` and
+  proceed only when it returns `retry_smoke_stage` with an exact action key.
+  Invoke the existing `execute-parent-smoke --expected-action-key ACTION_KEY`;
+  do not create smoke children manually or reconstruct the key. The executor
+  binds the retry to the source Smoke, its evidence UUID, unchanged candidate
+  SHA map, merged PR heads, and original PASS Gate. It moves only the blocked
+  parent back to `in_progress`, creates exactly one next-Stage Integration QA
+  child, and records the same UUID in
+  `eventra.workflow.smoke_retry_authorization_consumed` before clearing its
+  reservation. A PASS may complete the parent. BLOCKED or FAIL blocks it
+  permanently: no second retry, replacement authorization, or manual override
+  is allowed.
 - `complete_parent`: in approved unattended local-development mode, run
   `python3 -B -m tools.multica.workflow finish-parent PRO-M` from the
   authoritative control repository. This revalidates the merged smoke barrier

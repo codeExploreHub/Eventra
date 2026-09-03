@@ -46,6 +46,15 @@ Fetch the handed-off PR ref or exact commit without moving a branch, verify
 `git switch --detach FULL_SHA`. Verify both `git rev-parse HEAD` and cleanliness
 again before testing. Never reset, clean, stash, or overwrite user work.
 
+For an initial or retry Smoke, perform a fresh fetch of every handed-off PR ref
+and require `FETCH_HEAD` to equal each unchanged candidate SHA. A retry action
+must name its source Smoke and source evidence UUID; verify both against the
+child handoff before testing. Use a clean detached worktree at the exact SHA,
+run the same repository-standard health/OpenAPI Smoke, retain a new immutable
+Context Receipt and evidence comment, and clean up only owned processes and
+temporary worktrees. The retry does not weaken provenance and authorizes no
+deployment.
+
 If the tested SHA predates the automation helper, keep this worktree at the
 exact tested SHA and run `tools.multica.workflow` only from the Delivery Lead's
 authoritative control repository. Do not copy helper files into the tested

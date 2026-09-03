@@ -362,6 +362,50 @@ duplicating the child. Conflicting identity, metadata, Gate evidence, assignment
 or merged PR state blocks without overwrite. This recovery uses the same single
 serialized Delivery Lead and is not generic CAS or transaction safety.
 
+### One-time infrastructure-blocked Smoke retry
+
+The Eventra pilot exposes one explicit state-machine transition,
+`retry_smoke_stage`, rather than rewriting a failed result or accepting degraded
+provenance. It applies only when the parent is blocked, the latest canonical
+Smoke is `done + blocked` with no responsible repository, the merged PR heads
+still equal the exact merged candidate SHA map, the original Gate is an exact
+PASS set, and no retry was previously created or consumed.
+
+A member posts exactly one immutable root comment on the parent. For PRO-116,
+the byte-for-byte canonical body is:
+
+```json
+{"candidate_shas":{"backend":"c7b9a38a2d05ba05eec6b16c83184653aefba750"},"granted_smoke_retry":1,"source_evidence_comment_uuid":"01a0622e-72e3-7660-9fcd-a806c07a5c0f","source_smoke":"PRO-120"}
+```
+
+Store the server-returned comment UUID as
+`eventra.workflow.smoke_retry_authorization_comment`, rerun `plan-parent`, and
+require exactly `retry_smoke_stage`. Pass its returned action key unchanged to
+the existing executor:
+
+```text
+python3 -B -m tools.multica.workflow execute-parent-smoke PRO-116 --expected-action-key ACTION_KEY
+```
+
+The executor reserves the exact source Smoke/evidence, unchanged candidate
+SHAs, merged PRs, original PASS Gate, member authorization, prior parent status,
+Stage, and action. It creates one backlog retry child, initializes all canonical
+metadata, changes only `blocked -> in_progress` with no parent run, starts one
+Integration QA run, records
+`eventra.workflow.smoke_retry_authorization_consumed`, and clears the reservation
+last. Replaying the same key resumes or no-ops; another key, child, run, comment,
+SHA, PR head, assignment, or status fails closed.
+
+The retry must still perform a fresh PR-ref fetch and exact `FETCH_HEAD`
+verification in a clean detached worktree. PASS permits normal
+`complete_parent`; BLOCKED or FAIL leaves the parent blocked. No second retry,
+manual child, result rewrite, deployment, or production mutation is permitted.
+
+```text
+PRO-120 done+blocked -> member authorization -> retry_smoke_stage
+-> exactly one Stage 4 Smoke -> done+pass -> complete_parent -> PRO-116 done
+```
+
 For round 3 the caller supplies only an authoritative parent-scoped comment UUID.
 The helper authoritatively rereads the parent thread and accepts only
 `author_type=member` with an exact canonical body containing the current bundle

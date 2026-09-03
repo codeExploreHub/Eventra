@@ -270,6 +270,35 @@ corresponding review or QA result and returns to its owning child.
 
 ## Parent closure checklist
 
+### PRO-116 infrastructure-blocked Smoke recovery
+
+This pilot preserves PRO-120 as `done + blocked`; it never edits or reinterprets
+that result. A member may authorize exactly one `retry_smoke_stage` by posting
+this byte-for-byte canonical root comment on PRO-116:
+
+```json
+{"candidate_shas":{"backend":"c7b9a38a2d05ba05eec6b16c83184653aefba750"},"granted_smoke_retry":1,"source_evidence_comment_uuid":"01a0622e-72e3-7660-9fcd-a806c07a5c0f","source_smoke":"PRO-120"}
+```
+
+Store the returned UUID in
+`eventra.workflow.smoke_retry_authorization_comment`. Require `plan-parent` to
+return `retry_smoke_stage`, then call only
+`execute-parent-smoke --expected-action-key ACTION_KEY`. The executor records
+the same UUID in `eventra.workflow.smoke_retry_authorization_consumed` and
+creates exactly one Stage 4 Integration QA Smoke bound to the unchanged backend
+SHA, merged PR #6, source Smoke, evidence UUID, and original PASS Gate. The
+retry retains the mandatory fresh fetch, exact `FETCH_HEAD`, clean detached
+worktree, health/OpenAPI evidence, Context Receipt, and owned cleanup.
+
+```text
+PRO-120 done+blocked -> member authorization -> retry_smoke_stage
+-> exactly one Stage 4 Smoke -> done+pass -> complete_parent -> PRO-116 done
+```
+
+If Stage 4 is BLOCKED or FAIL, keep PRO-116 blocked and preserve both evidence
+records. A second retry, manual child, result rewrite, degraded provenance,
+deployment, or production mutation is forbidden.
+
 Before moving a parent from in progress to done, the Delivery Lead verifies the
 evidence template contains all routed child records, the required PR count,
 review and QA results for the final exact SHA set, required checks, merge
