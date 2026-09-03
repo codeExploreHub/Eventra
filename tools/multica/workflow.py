@@ -4220,11 +4220,7 @@ def _read_repair_prefix_authority(
         parent["id"] != parent_id
         or parent["parent_issue_id"] is not None
         or parent["stage"] is not None
-        or parent["status"] not in (
-            {"blocked", "in_progress"}
-            if reservation["mode"] == "retry"
-            else {str(reservation["previous_parent_status"])}
-        )
+        or parent["status"] not in {"in_progress", "in_review"}
         or _parent_control_detail_problem(parent, assignment_authority) is not None
         or parent_metadata["repair_reservation"] != reservation
         or detail["id"] != child["id"]
