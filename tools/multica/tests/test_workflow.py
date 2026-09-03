@@ -7711,6 +7711,16 @@ class FakeRepairRunner:
         if call[:2] == ("issue", "status"):
             identifier = call[2]
             status = call[3]
+            if identifier in {"PRO-65", PARENT_ID}:
+                if "--no-start" not in call:
+                    raise AssertionError(
+                        "parent status transition must not start a run"
+                    )
+                if self.parent["status"] != status:
+                    self.parent["status"] = status
+                    self.committed_mutations += 1
+                self._maybe_lose_ack("parent-status")
+                return copy.deepcopy(self.parent)
             child = next(child for child in self.children if child["identifier"] == identifier)
             if child["status"] != status:
                 child["status"] = status
@@ -7785,6 +7795,179 @@ class SmokeExecutionTests(unittest.TestCase):
         decision = decide_parent_action(snapshot)
         self.assertEqual(decision.kind, "create_smoke_stage", decision.reason)
         return runner, github, decision
+
+    def _retry_planned(self):
+        runner, github, initial_decision = self._planned()
+        initial = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=initial_decision.action_key,
+        )
+        self.assertEqual(initial.next_action, "smoke", initial.reason)
+        smoke = next(child for child in runner.children if child["stage"] == 3)
+        smoke_key = str(smoke["identifier"])
+        smoke["status"] = "done"
+        runner.runs[smoke_key] = [
+            {
+                "id": f"run-{smoke_key}-1",
+                "issue_id": smoke["id"],
+                "status": "completed",
+                "created_at": "2026-08-25T09:00:00Z",
+                "dispatched_at": "2026-08-25T09:00:01Z",
+                "started_at": "2026-08-25T09:00:02Z",
+                "completed_at": "2026-08-25T09:30:00Z",
+            }
+        ]
+        runner.metadata[smoke_key].update(
+            {
+                "eventra.phase.result": "blocked",
+                "eventra.phase.evidence_comment": SMOKE_EVIDENCE_UUID,
+                "eventra.phase.failure_repositories": "[]",
+            }
+        )
+        runner.evidence_comments[smoke_key] = [
+            {
+                "id": SMOKE_EVIDENCE_UUID,
+                "issue_id": smoke["id"],
+                "author_id": smoke["assignee_id"],
+                "author_type": "agent",
+                "content": "fresh fetch unavailable; runtime checks passed",
+            }
+        ]
+        runner.parent["status"] = "blocked"
+        runner.metadata["PRO-65"][
+            workflow_module.SMOKE_RETRY_AUTHORIZATION_KEY
+        ] = SMOKE_RETRY_AUTH_UUID
+        runner.comments = [
+            {
+                "id": SMOKE_RETRY_AUTH_UUID,
+                "author_type": "member",
+                "content": json.dumps(
+                    {
+                        "candidate_shas": {
+                            "backend": FakeRepairRunner.BACKEND_SHA
+                        },
+                        "granted_smoke_retry": 1,
+                        "source_evidence_comment_uuid": SMOKE_EVIDENCE_UUID,
+                        "source_smoke": smoke_key,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
+        ]
+        decision = decide_parent_action(
+            load_parent_snapshot(runner, github, "PRO-65")
+        )
+        self.assertEqual(decision.kind, "retry_smoke_stage", decision.reason)
+        return runner, github, decision, smoke_key
+
+    def test_retry_smoke_executor_creates_one_source_bound_child(self):
+        runner, github, decision, source_key = self._retry_planned()
+
+        result = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(result.next_action, "smoke", result.reason)
+        created = [child for child in runner.children if child["stage"] == 4]
+        self.assertEqual(len(created), 1)
+        child = created[0]
+        self.assertEqual(child["status"], "todo")
+        self.assertEqual(runner.parent["status"], "in_progress")
+        metadata = runner.metadata[str(child["identifier"])]
+        self.assertEqual(
+            metadata["eventra.phase.creation_action"],
+            decision.action_key,
+        )
+        self.assertEqual(
+            runner.metadata["PRO-65"][
+                workflow_module.SMOKE_RETRY_AUTHORIZATION_CONSUMED_KEY
+            ],
+            SMOKE_RETRY_AUTH_UUID,
+        )
+        self.assertEqual(
+            runner.metadata["PRO-65"]["eventra.workflow.next_stage"],
+            "5",
+        )
+        self.assertNotIn(
+            workflow_module.SMOKE_RESERVATION_KEY,
+            runner.metadata["PRO-65"],
+        )
+        self.assertEqual(
+            child["description"],
+            json.dumps(
+                {
+                    "action": decision.action_key,
+                    "candidate_shas": {
+                        "backend": FakeRepairRunner.BACKEND_SHA
+                    },
+                    "parent": "PRO-65",
+                    "source_evidence_comment_uuid": SMOKE_EVIDENCE_UUID,
+                    "source_smoke": source_key,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+    def test_retry_smoke_lost_acknowledgements_replay_without_duplicates(self):
+        lost_acks = (
+            "set:PRO-65:eventra.workflow.smoke_reservation",
+            "create",
+            "set-child:eventra.phase.creation_action",
+            "parent-status",
+            "status",
+            "set:PRO-65:eventra.workflow.next_stage",
+            "set:PRO-65:eventra.workflow.last_action",
+            (
+                "set:PRO-65:"
+                "eventra.workflow.smoke_retry_authorization_consumed"
+            ),
+            "delete:PRO-65:eventra.workflow.smoke_reservation",
+        )
+        for lost_ack in lost_acks:
+            with self.subTest(lost_ack=lost_ack):
+                runner, github, decision, _ = self._retry_planned()
+                runner.lost_ack_once.add(lost_ack)
+
+                first = execute_parent_smoke(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+                second = execute_parent_smoke(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+
+                self.assertIn(first.next_action, {"smoke", "block"})
+                self.assertEqual(second.next_action, "noop", second.reason)
+                self.assertEqual(second.mutation_count, 0)
+                self.assertEqual(
+                    len(
+                        [
+                            child
+                            for child in runner.children
+                            if child["stage"] == 4
+                        ]
+                    ),
+                    1,
+                )
+                self.assertEqual(runner.parent["status"], "in_progress")
+                self.assertEqual(
+                    runner.metadata["PRO-65"][
+                        workflow_module.SMOKE_RETRY_AUTHORIZATION_CONSUMED_KEY
+                    ],
+                    SMOKE_RETRY_AUTH_UUID,
+                )
 
     def test_smoke_executor_is_an_exact_action_cli(self):
         self.assertTrue(
