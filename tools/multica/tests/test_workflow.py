@@ -57,6 +57,8 @@ FOREIGN_SQUAD_ID = "00000000-0000-4000-8000-000000000018"
 DELIVERY_LEAD_ID = "00000000-0000-4000-8000-000000000019"
 WATCHER_ID = "00000000-0000-4000-8000-000000000020"
 COMMENT_ID = "01a00000-0000-7000-8000-000000000010"
+SMOKE_RETRY_AUTH_UUID = "00000000-0000-4000-8000-000000000071"
+SMOKE_EVIDENCE_UUID = "00000000-0000-4000-8000-000000000072"
 FRONTEND_SHA = "a" * 40
 FRONTEND_PR = "https://github.com/codeExploreHub/Eventra/pull/6"
 
@@ -9980,6 +9982,102 @@ class RepairExecutionTests(unittest.TestCase):
 
 
 class ParentSnapshotReadTests(unittest.TestCase):
+    def test_parent_smoke_retry_authorization_is_loaded_and_reread(self):
+        runner = FakeParentRunner()
+        content = json.dumps(
+            {
+                "candidate_shas": {"frontend": FRONTEND_SHA},
+                "granted_smoke_retry": 1,
+                "source_evidence_comment_uuid": SMOKE_EVIDENCE_UUID,
+                "source_smoke": "PRO-68",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        runner.metadata["PRO-35"].update(
+            {
+                workflow_module.SMOKE_RETRY_AUTHORIZATION_KEY:
+                    SMOKE_RETRY_AUTH_UUID,
+                workflow_module.SMOKE_RETRY_AUTHORIZATION_CONSUMED_KEY: "",
+            }
+        )
+        runner.comment_records = [
+            {
+                "id": SMOKE_RETRY_AUTH_UUID,
+                "author_type": "member",
+                "content": content,
+            }
+        ]
+
+        snapshot = load_parent_snapshot(runner, FakeGitHubRunner(), "PRO-35")
+
+        self.assertEqual(
+            snapshot.smoke_retry_authorization_comment_uuid,
+            SMOKE_RETRY_AUTH_UUID,
+        )
+        self.assertEqual(snapshot.consumed_smoke_retry_authorization_uuid, "")
+        self.assertEqual(
+            snapshot.smoke_retry_authorizing_comment,
+            AuthorizingComment(SMOKE_RETRY_AUTH_UUID, "member", content),
+        )
+        reads = [
+            call
+            for call in runner.calls
+            if call[:4] == ("issue", "comment", "list", "PRO-35")
+        ]
+        self.assertEqual(len(reads), 2)
+
+    def test_parent_smoke_retry_authorization_drift_fails_closed(self):
+        class DriftingCommentRunner(FakeParentRunner):
+            def __init__(self):
+                super().__init__()
+                self.smoke_retry_comment_reads = 0
+
+            def run(self, args, *, stdin_json=None):
+                if tuple(args)[:4] == (
+                    "issue", "comment", "list", "PRO-35"
+                ):
+                    self.smoke_retry_comment_reads += 1
+                    if self.smoke_retry_comment_reads == 2:
+                        self.comment_records = []
+                return super().run(args, stdin_json=stdin_json)
+
+        runner = DriftingCommentRunner()
+        runner.metadata["PRO-35"][
+            workflow_module.SMOKE_RETRY_AUTHORIZATION_KEY
+        ] = SMOKE_RETRY_AUTH_UUID
+        runner.comment_records = [
+            {
+                "id": SMOKE_RETRY_AUTH_UUID,
+                "author_type": "member",
+                "content": "{}",
+            }
+        ]
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "smoke retry authorization changed",
+        ):
+            load_parent_snapshot(runner, FakeGitHubRunner(), "PRO-35")
+
+    def test_malformed_smoke_retry_authorization_metadata_fails_closed(self):
+        for key in (
+            "eventra.workflow.smoke_retry_authorization_comment",
+            "eventra.workflow.smoke_retry_authorization_consumed",
+        ):
+            with self.subTest(key=key):
+                runner = FakeParentRunner()
+                runner.metadata["PRO-35"][key] = "not-a-uuid"
+                github = FakeGitHubRunner()
+
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "malformed parent workflow metadata",
+                ):
+                    load_parent_snapshot(runner, github, "PRO-35")
+
+                self.assertEqual(github.calls, [])
+
     def test_loaded_partial_repair_executor_provenance_fails_closed(self):
         digest = "d" * 64
         action = (

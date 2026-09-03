@@ -72,6 +72,12 @@ REPAIR_AUTHORIZATION_KEY = "eventra.workflow.repair_authorization_comment"
 REPAIR_AUTHORIZATION_CONSUMED_KEY = (
     "eventra.workflow.repair_authorization_consumed"
 )
+SMOKE_RETRY_AUTHORIZATION_KEY = (
+    "eventra.workflow.smoke_retry_authorization_comment"
+)
+SMOKE_RETRY_AUTHORIZATION_CONSUMED_KEY = (
+    "eventra.workflow.smoke_retry_authorization_consumed"
+)
 MAX_REPAIR_RESERVATION_BYTES = 16_384
 MAX_REPAIR_DESCRIPTION_BYTES = 16_384
 MAX_REPAIR_TITLE_BYTES = 255
@@ -213,6 +219,9 @@ class ParentSnapshot:
     authorization_comment_uuid: str = ""
     consumed_authorization_uuid: str = ""
     authorizing_comment: AuthorizingComment | None = None
+    smoke_retry_authorization_comment_uuid: str = ""
+    consumed_smoke_retry_authorization_uuid: str = ""
+    smoke_retry_authorizing_comment: AuthorizingComment | None = None
     repair_reservation: dict[str, object] | None = None
     smoke_reservation: dict[str, object] | None = None
     parent_id: str = ""
@@ -2463,6 +2472,14 @@ def _parent_metadata(value: dict[str, str]) -> dict[str, object]:
         REPAIR_AUTHORIZATION_CONSUMED_KEY,
         "",
     )
+    smoke_retry_authorization_comment_uuid = value.get(
+        SMOKE_RETRY_AUTHORIZATION_KEY,
+        "",
+    )
+    consumed_smoke_retry_authorization_uuid = value.get(
+        SMOKE_RETRY_AUTHORIZATION_CONSUMED_KEY,
+        "",
+    )
     reservation_text = value.get(REPAIR_RESERVATION_KEY)
     repair_reservation = (
         None
@@ -2498,6 +2515,14 @@ def _parent_metadata(value: dict[str, str]) -> dict[str, object]:
             consumed_authorization_uuid != ""
             and not _is_uuid(consumed_authorization_uuid)
         )
+        or (
+            smoke_retry_authorization_comment_uuid != ""
+            and not _is_uuid(smoke_retry_authorization_comment_uuid)
+        )
+        or (
+            consumed_smoke_retry_authorization_uuid != ""
+            and not _is_uuid(consumed_smoke_retry_authorization_uuid)
+        )
         or (repair_reservation is not None and smoke_reservation is not None)
     ):
         raise RuntimeError("malformed parent workflow metadata")
@@ -2512,6 +2537,12 @@ def _parent_metadata(value: dict[str, str]) -> dict[str, object]:
         "next_stage": int(next_stage),
         "authorization_comment_uuid": authorization_comment_uuid,
         "consumed_authorization_uuid": consumed_authorization_uuid,
+        "smoke_retry_authorization_comment_uuid": (
+            smoke_retry_authorization_comment_uuid
+        ),
+        "consumed_smoke_retry_authorization_uuid": (
+            consumed_smoke_retry_authorization_uuid
+        ),
         "repair_reservation": repair_reservation,
         "smoke_reservation": smoke_reservation,
     }
@@ -2525,6 +2556,29 @@ def _canonical_json(value: object) -> str:
         separators=(",", ":"),
         allow_nan=False,
     )
+
+
+def _validated_smoke_retry_authorization(
+    snapshot: ParentSnapshot,
+    source_smoke: PhaseSnapshot,
+) -> str | None:
+    comment = snapshot.smoke_retry_authorizing_comment
+    expected = {
+        "candidate_shas": _candidate_sha_map(snapshot),
+        "granted_smoke_retry": 1,
+        "source_evidence_comment_uuid": source_smoke.evidence_comment,
+        "source_smoke": source_smoke.issue_key,
+    }
+    if (
+        comment is None
+        or comment.comment_uuid
+        != snapshot.smoke_retry_authorization_comment_uuid
+        or comment.author_type != "member"
+        or comment.content != _canonical_json(expected)
+        or snapshot.consumed_smoke_retry_authorization_uuid
+    ):
+        return None
+    return comment.comment_uuid
 
 
 def _decode_repair_reservation(value: str) -> dict[str, object]:
@@ -3003,6 +3057,33 @@ def load_parent_snapshot(
             author_type=raw_comment["author_type"],
             content=raw_comment["content"],
         )
+    smoke_retry_authorizing_comment = None
+    smoke_retry_authorization_comment_uuid = str(
+        metadata["smoke_retry_authorization_comment_uuid"]
+    )
+    if smoke_retry_authorization_comment_uuid:
+        raw_comment = parse_authorizing_comment(
+            runner.run(
+                [
+                    "issue",
+                    "comment",
+                    "list",
+                    parent_key,
+                    "--thread",
+                    smoke_retry_authorization_comment_uuid,
+                    "--full",
+                    "--compact",
+                    "--output",
+                    "json",
+                ]
+            ),
+            smoke_retry_authorization_comment_uuid,
+        )
+        smoke_retry_authorizing_comment = AuthorizingComment(
+            comment_uuid=raw_comment["comment_uuid"],
+            author_type=raw_comment["author_type"],
+            content=raw_comment["content"],
+        )
     children = parse_issue_children(
         runner.run(["issue", "children", parent_key, "--output", "json"]),
         str(parent["id"]),
@@ -3143,6 +3224,42 @@ def load_parent_snapshot(
         if stable_authorizing_comment != authorizing_comment:
             raise RuntimeError("repair authorization changed during recovery read")
 
+    if smoke_retry_authorization_comment_uuid:
+        try:
+            stable_raw_comment = parse_authorizing_comment(
+                runner.run(
+                    [
+                        "issue",
+                        "comment",
+                        "list",
+                        parent_key,
+                        "--thread",
+                        smoke_retry_authorization_comment_uuid,
+                        "--full",
+                        "--compact",
+                        "--output",
+                        "json",
+                    ]
+                ),
+                smoke_retry_authorization_comment_uuid,
+            )
+        except RuntimeError:
+            raise RuntimeError(
+                "smoke retry authorization changed during recovery read"
+            ) from None
+        stable_smoke_retry_authorizing_comment = AuthorizingComment(
+            comment_uuid=stable_raw_comment["comment_uuid"],
+            author_type=stable_raw_comment["author_type"],
+            content=stable_raw_comment["content"],
+        )
+        if (
+            stable_smoke_retry_authorizing_comment
+            != smoke_retry_authorizing_comment
+        ):
+            raise RuntimeError(
+                "smoke retry authorization changed during recovery read"
+            )
+
     current_stage = int(metadata["next_stage"]) - 1
     current_kinds = {
         item.kind for item in phases if item.stage == current_stage
@@ -3228,6 +3345,13 @@ def load_parent_snapshot(
             metadata["consumed_authorization_uuid"]
         ),
         authorizing_comment=authorizing_comment,
+        smoke_retry_authorization_comment_uuid=(
+            smoke_retry_authorization_comment_uuid
+        ),
+        consumed_smoke_retry_authorization_uuid=str(
+            metadata["consumed_smoke_retry_authorization_uuid"]
+        ),
+        smoke_retry_authorizing_comment=smoke_retry_authorizing_comment,
         repair_reservation=metadata["repair_reservation"],
         smoke_reservation=metadata["smoke_reservation"],
         parent_id=str(parent["id"]),
