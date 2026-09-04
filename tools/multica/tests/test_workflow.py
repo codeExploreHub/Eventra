@@ -2847,6 +2847,10 @@ class RefreshWorkflowTests(unittest.TestCase):
         self.assertIn("refresh_state", ParentSnapshot.__dataclass_fields__, "workflow refresh guard not implemented")
 
     def parent(self, data):
+        data = copy.deepcopy(data)
+        data["parent"]["metadata"] = copy.deepcopy(data["metadata"])
+        for child in data["children"]:
+            child["detail"]["metadata"] = copy.deepcopy(child["metadata"])
         meta, detail, assignment = data["metadata"], data["parent"], data["assignment"]
         return ParentSnapshot(identifier=detail["identifier"], classification=meta["eventra.workflow.classification"],
             attempt=int(meta["eventra.workflow.attempt"]), last_action=meta["eventra.workflow.last_action"],
@@ -2887,6 +2891,12 @@ class RefreshWorkflowTests(unittest.TestCase):
     def test_paused_intent_does_not_fall_through_to_old_gate(self):
         _, data = self.fixture(state="intent")
         self.assertEqual(decide_parent_action(self.parent(data)).kind, "noop")
+
+    def test_complete_bound_prefix_routes_only_to_refresh_initialization(self):
+        request, data = self.fixture(state="admitted")
+        result = decide_parent_action(self.parent(data))
+        self.assertEqual(result.kind, "create_refresh_stage")
+        self.assertIn(request.digest, result.action_key)
 
     def test_registered_target_requires_publication_not_old_gate(self):
         _, data = self.fixture()

@@ -15,34 +15,53 @@ def refresh_snapshot_fixture(*, state="candidate_registered", adopted=False):
     from tools.multica.tests.test_refresh_executor import ReadBoundary
     from tools.multica.tests.test_issue_contracts import issue_detail
     boundary = ReadBoundary("e" * 40, "git version 2.50.1")
-    request = boundary.request
     comment = lambda raw, issue: {"issue_id": issue, "comment_uuid": raw["id"], "author_id": raw["author_id"],
                                   "author_type": raw["author_type"], "revision": raw["revision"], "content": raw["content"]}
-    action = "2:PRO-900:create_refresh_stage:0:frontend:" + "b" * 40 + ":next-stage:2:refresh:1:" + request.digest
-    envelope = {"payload": request.payload(), "digest": request.digest, "staging_ref": request.staging_ref}
+    def sync_echoes(data):
+        data["parent"]["metadata"] = copy.deepcopy(data["metadata"])
+        for child in data["children"]:
+            child["detail"]["metadata"] = copy.deepcopy(child["metadata"])
+    def finish(request, data):
+        sync_echoes(data)
+        return request, data
     data = {"parent": copy.deepcopy(boundary.parent), "metadata": copy.deepcopy(boundary.metadata),
             "children": [{"detail": copy.deepcopy(boundary.child), "metadata": copy.deepcopy(boundary.child_metadata),
                           "evidence": comment(boundary.evidence, uid(3))}], "runs": [],
-            "comments": [comment(boundary.grant, uid(2))],
-            "pr": {**request.payload()["pr"], "head_sha": "b" * 40, "state": "open", "merged": False},
-            "prerequisite": {**request.payload()["prerequisite"], "merged": True, "ancestor_sha": "d" * 40},
-            "assignment": {**request.payload()["assignment"], "workspace_id": uid(1), "roles": boundary.role_ids,
+            "comments": [], "comment_manifest": [],
+            "pr": {**boundary.payload["pr"], "head_sha": "b" * 40, "state": "open", "merged": False},
+            "prerequisite": {**boundary.payload["prerequisite"], "merged": True, "ancestor_sha": "d" * 40},
+            "assignment": {**boundary.payload["assignment"], "workspace_id": uid(1), "roles": boundary.role_ids,
                            "projects": {"frontend": uid(5), "backend": uid(30)},
                            "members": sorted([{k: value[k] for k in ("member_id", "member_type", "role")}
                                               for value in boundary.members], key=lambda item: (item["role"], item["member_id"]))},
             "tool": {"sha": "e" * 40, "git_version": "git version 2.50.1"}}
+    sync_echoes(data)
+    request = c.freeze_refresh_request(c.RefreshSnapshot(c.canonical_json(data)))
+    action = "2:PRO-900:create_refresh_stage:0:frontend:" + "b" * 40 + ":next-stage:2:refresh:1:" + request.digest
+    envelope = {"payload": request.payload(), "digest": request.digest, "staging_ref": request.staging_ref}
     if state == "entry":
-        return request, data
+        return finish(request, data)
+    request_record = {"id": uid(12), "issue_id": uid(2), "author_type": "agent", "author_id": uid(7),
+                      "revision": 1, "type": "comment", "created_at": "2026-09-04T01:01:00Z",
+                      "content": block("request", envelope)}
+    grant_record = {"id": uid(10), "issue_id": uid(2), "author_type": "member", "author_id": uid(11),
+                    "revision": 1, "type": "comment", "created_at": "2026-09-04T01:02:00Z",
+                    "content": block("grant", {"schema_version": 1, "request_digest": request.digest,
+                                                 "granted_refresh": 1})}
     data["metadata"].update({"eventra.refresh.version": "1", "eventra.refresh.request": encode(envelope),
                               "eventra.refresh.request_digest": request.digest, "eventra.refresh.merge_permission": "hold",
                               "eventra.refresh.request_comment": uid(12), "eventra.refresh.authorization_comment": uid(10)})
-    data["comments"].append({"issue_id": uid(2), "comment_uuid": uid(12), "author_type": "agent", "author_id": uid(7),
-                             "revision": 1, "content": block("request", envelope)})
-    data["parent"]["revision"] = 8
+    data["comments"] = [comment(request_record, uid(2)), comment(grant_record, uid(2))]
+    data["comment_manifest"] = c.comment_manifest([request_record, grant_record], uid(2))
+    data["parent"]["revision"] = request.payload()["parent"]["revision"] + 8
     if state == "intent":
         del data["metadata"]["eventra.refresh.authorization_comment"]
-        data["comments"] = data["comments"][1:]
-        return request, data
+        data["comments"] = data["comments"][:1]
+        data["comment_manifest"] = c.comment_manifest([request_record], uid(2))
+        data["parent"]["revision"] -= 2
+        return finish(request, data)
+    if state == "admitted":
+        return finish(request, data)
     prepared_block = prepared_payload(request)
     prepared_comment = {"issue_id": uid(9), "comment_uuid": uid(13), "author_id": uid(8), "author_type": "agent",
                         "revision": 1, "content": block("prepared", prepared_block)}
@@ -81,7 +100,7 @@ def refresh_snapshot_fixture(*, state="candidate_registered", adopted=False):
                                                                                      if k not in {"metadata", "updated_at", "last_activity_at"}},
                                                                            "metadata": data["metadata"]}).encode()).hexdigest()}
         data["metadata"]["eventra.refresh.reservation"] = encode(reservation)
-    return request, data
+    return finish(request, data)
 
 
 class RefreshDecisionTests(unittest.TestCase):
@@ -95,6 +114,12 @@ class RefreshDecisionTests(unittest.TestCase):
 
     def test_entry_has_deterministic_refresh_identity(self):
         request, data = refresh_snapshot_fixture(state="entry")
+        result = self.decision(request, data)
+        self.assertEqual(result.kind, "wait")
+        self.assertIsNone(result.action_key)
+
+    def test_complete_bound_prefix_has_deterministic_refresh_identity(self):
+        request, data = refresh_snapshot_fixture(state="admitted")
         result = self.decision(request, data)
         self.assertEqual(result.kind, "create_refresh_stage")
         self.assertEqual(result.action_key, "2:PRO-900:create_refresh_stage:0:frontend:" + "b" * 40

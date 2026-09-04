@@ -60,6 +60,15 @@ class PreparedCandidate:
     staging_ref: str
 
 
+@dataclass(frozen=True)
+class InitialRefreshProgress:
+    request: RefreshRequest
+    metadata_writes: int
+    comment_writes: int
+    request_comment: RefreshComment | None
+    grant_comment: RefreshComment | None
+
+
 def _require(condition: bool, reason: str = "invalid refresh contract") -> None:
     if not condition:
         raise ValueError(reason)
@@ -422,7 +431,7 @@ class RefreshSnapshot:
 
     def state(self) -> dict[str, Any]:
         return _object(_load_json(self.canonical_state, 4_194_304),
-                       "parent metadata children runs comments pr prerequisite assignment tool")
+                       "parent metadata children runs comments comment_manifest pr prerequisite assignment tool")
 
 
 _ISSUE_DETAIL_FIELDS = frozenset({
@@ -480,9 +489,63 @@ def _snapshot(snapshot: RefreshSnapshot) -> dict[str, Any]:
     _require(canonical_json(state) == snapshot.canonical_state, "noncanonical refresh authority")
     for key in ("parent", "metadata", "pr", "prerequisite", "assignment", "tool"):
         _require(type(state[key]) is dict, "invalid refresh authority")
-    for key in ("children", "runs", "comments"):
+    for key in ("children", "runs", "comments", "comment_manifest"):
         _require(type(state[key]) is list, "invalid refresh authority")
     _require(all(type(k) is str and type(v) is str for k, v in state["metadata"].items()))
+    _require(state["parent"].get("metadata") == state["metadata"],
+             "parent metadata echo conflict")
+    for child in state["children"]:
+        _require(type(child) is dict and type(child.get("detail")) is dict
+                 and child["detail"].get("metadata") == child.get("metadata"),
+                 "child metadata echo conflict")
+    manifest_fields = {"issue_id", "comment_uuid", "author_id", "author_type", "type",
+                       "revision", "parent_id", "created_at", "content_digest"}
+    parent_id, seen = state["parent"].get("id"), set()
+    normalized = {}
+    for raw in state["comments"]:
+        try:
+            comment = RefreshComment(**raw)
+        except TypeError:
+            raise ValueError("invalid refresh comment authority") from None
+        _comment(comment, parent_id, comment.author_type)
+        _require(comment.comment_uuid not in normalized, "duplicate refresh comment authority")
+        normalized[comment.comment_uuid] = comment
+    for item in state["comment_manifest"]:
+        _require(type(item) is dict and set(item) == manifest_fields,
+                 "invalid refresh comment manifest")
+        _uuid(item["issue_id"]); _uuid(item["comment_uuid"]); _uuid(item["author_id"])
+        _require(item["issue_id"] == parent_id and item["author_type"] in {"member", "agent"}
+                 and item["type"] == "comment", "invalid refresh comment manifest identity")
+        _integer(item["revision"])
+        if item["parent_id"] is not None:
+            _uuid(item["parent_id"])
+        _require(type(item["created_at"]) is str, "invalid refresh comment manifest time")
+        try:
+            created = datetime.fromisoformat(item["created_at"].replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError("invalid refresh comment manifest time") from None
+        _require(created.tzinfo is not None, "invalid refresh comment manifest time")
+        _match(item["content_digest"], _DIGEST)
+        _require(item["comment_uuid"] not in seen, "duplicate refresh comment manifest")
+        seen.add(item["comment_uuid"])
+        comment = normalized.get(item["comment_uuid"])
+        _require(comment is not None and item["author_id"] == comment.author_id
+                 and item["author_type"] == comment.author_type and item["revision"] == comment.revision
+                 and item["content_digest"] == hashlib.sha256(comment.content.encode("utf-8")).hexdigest(),
+                 "refresh comment manifest mismatch")
+    _require(seen == set(normalized), "refresh comment manifest mismatch")
+    _require(state["comment_manifest"] == sorted(state["comment_manifest"],
+                                                  key=lambda item: item["comment_uuid"]),
+             "noncanonical refresh comment manifest")
+    parents = {item["comment_uuid"]: item["parent_id"] for item in state["comment_manifest"]}
+    for item in state["comment_manifest"]:
+        _require(item["parent_id"] is None or item["parent_id"] in seen,
+                 "incomplete refresh comment manifest thread")
+        lineage, current = set(), item["comment_uuid"]
+        while current is not None:
+            _require(current not in lineage, "cyclic refresh comment manifest thread")
+            lineage.add(current)
+            current = parents[current]
     return state
 
 
@@ -565,11 +628,8 @@ def _shared_authority(payload: dict, state: dict) -> None:
     _source_authority(payload, state)
 
 
-def admit_refresh(request: RefreshRequest, snapshot: RefreshSnapshot, grant: RefreshComment) -> None:
-    """First entry only. Resumption must validate an exact durable projection separately."""
-    payload, state = _request(request), _snapshot(snapshot)
+def _entry_authority(payload: dict, state: dict) -> None:
     _shared_authority(payload, state)
-    _grant_in_state(request, state, grant)
     parent, expected = state["parent"], payload["parent"]
     _require(type(parent.get("revision")) is int and parent["revision"] == expected["revision"]
              and parent.get("status") == expected["status"], "frozen parent revision or status changed")
@@ -589,6 +649,154 @@ def admit_refresh(request: RefreshRequest, snapshot: RefreshSnapshot, grant: Ref
     _require(len(active) <= 1 and all(run.get("issue_id") == parent["id"]
              and run.get("agent_id") == payload["assignment"]["lead_id"] for run in active),
              "active child or nonunique Lead writer")
+
+
+def freeze_refresh_request(snapshot: RefreshSnapshot) -> RefreshRequest:
+    """Build request-v1 only from one canonical, trusted, pre-registration snapshot."""
+    state = _snapshot(snapshot)
+    authority = authority_digest(snapshot)
+    source = _object(state["children"][0], "detail metadata evidence")
+    detail, source_metadata, evidence = source["detail"], source["metadata"], source["evidence"]
+    _require(type(evidence) is dict, "missing source evidence")
+    parent, metadata, assignment = state["parent"], state["metadata"], state["assignment"]
+    required_metadata = {"eventra.workflow.attempt", "eventra.workflow.next_stage",
+                         "eventra.workflow.merge_state", "eventra.workflow.last_action"}
+    _require(required_metadata <= set(metadata), "refresh entry metadata mismatch")
+    payload = {
+        "schema_version": 1,
+        "workspace_id": parent["workspace_id"],
+        "parent": {"id": parent["id"], "identifier": parent["identifier"],
+                   "revision": parent["revision"], "stage": 1,
+                   "attempt": int(metadata["eventra.workflow.attempt"]),
+                   "next_stage": int(metadata["eventra.workflow.next_stage"]),
+                   "status": parent["status"], "merge_state": metadata["eventra.workflow.merge_state"],
+                   "last_action": metadata["eventra.workflow.last_action"]},
+        "source": {"child_id": detail["id"], "child_identifier": detail["identifier"],
+                   "sha": source_metadata["eventra.phase.sha.frontend"],
+                   "evidence_uuid": evidence["comment_uuid"], "evidence_revision": evidence["revision"],
+                   "evidence_digest": hashlib.sha256(evidence["content"].encode("utf-8")).hexdigest()},
+        "pr": {key: state["pr"][key] for key in ("url", "repository", "head_ref", "base_ref")},
+        "prerequisite": {key: state["prerequisite"][key] for key in ("pr_url", "merge_sha", "base_sha")},
+        "assignment": {key: assignment[key] for key in ("project_id", "squad_id", "lead_id", "engineer_id")},
+        "baseline": {"authority_digest": authority,
+                     "comments_digest": hashlib.sha256(canonical_json(state["comment_manifest"]).encode("utf-8")).hexdigest()},
+        "refresh_stage": 2, "refresh_generation": 1,
+        "staging_ref_prefix": STAGING_PREFIX, "tree_transform": "clean-two-parent-merge-v1",
+        "merge_permission": "hold", "control_tool_sha": state["tool"]["sha"],
+        "git_version": state["tool"]["git_version"],
+    }
+    request = build_request(payload)
+    _entry_authority(payload, state)
+    validate_metadata_budget(metadata, request=request)
+    return request
+
+
+def validate_initial_refresh_progress(request: RefreshRequest,
+                                      snapshot: RefreshSnapshot) -> InitialRefreshProgress:
+    """Prove the exact pre-reservation prefix against the request's frozen baselines."""
+    payload, state = _request(request), _snapshot(snapshot)
+    metadata = state["metadata"]
+    envelope = canonical_json({"payload": payload, "digest": request.digest,
+                               "staging_ref": request.staging_ref})
+    prefix = [
+        (REFRESH_PREFIX + "request", envelope),
+        (REFRESH_PREFIX + "version", "1"),
+        (REFRESH_PREFIX + "merge_permission", "hold"),
+        (REFRESH_PREFIX + "request_digest", request.digest),
+        (REFRESH_PREFIX + "request_comment", None),
+        (REFRESH_PREFIX + "authorization_comment", None),
+    ]
+    refresh_keys = {key for key in metadata if key.startswith(REFRESH_PREFIX)}
+    _require(refresh_keys <= {key for key, _ in prefix}, "unknown initial refresh metadata")
+    metadata_writes, missing = 0, False
+    for key, expected in prefix:
+        if key not in metadata:
+            missing = True
+            continue
+        _require(not missing, "initial refresh metadata is not an exact prefix")
+        if expected is None:
+            _uuid(metadata[key])
+        else:
+            _require(metadata[key] == expected, "initial refresh metadata value mismatch")
+        metadata_writes += 1
+
+    manifest = state["comment_manifest"]
+    comments = {item["comment_uuid"]: RefreshComment(**item) for item in state["comments"]}
+    manifest_by_id = {item["comment_uuid"]: item for item in manifest}
+    request_candidates, grant_candidates = [], []
+    for comment_id, comment in comments.items():
+        identity = manifest_by_id[comment_id]
+        if comment.revision != 1 or identity["parent_id"] is not None:
+            continue
+        try:
+            parsed = parse_request(_block(comment.content, "request", only=True))
+            if (parsed == request and (comment.author_type == "member" or
+                    (comment.author_type == "agent" and
+                     comment.author_id == payload["assignment"]["lead_id"]))):
+                request_candidates.append(comment)
+        except (ValueError, TypeError):
+            pass
+        try:
+            validate_grant(comment, request)
+            grant_candidates.append(comment)
+        except (ValueError, TypeError):
+            pass
+
+    baseline_digest = payload["baseline"]["comments_digest"]
+    possibilities: list[tuple[int, RefreshComment | None, RefreshComment | None]] = []
+    def remaining_digest(removed: set[str]) -> str:
+        remaining = [item for item in manifest if item["comment_uuid"] not in removed]
+        return hashlib.sha256(canonical_json(remaining).encode("utf-8")).hexdigest()
+    if remaining_digest(set()) == baseline_digest:
+        possibilities.append((0, None, None))
+    for request_comment in request_candidates:
+        if remaining_digest({request_comment.comment_uuid}) == baseline_digest:
+            possibilities.append((1, request_comment, None))
+        for grant_comment in grant_candidates:
+            if grant_comment.comment_uuid == request_comment.comment_uuid:
+                continue
+            if remaining_digest({request_comment.comment_uuid, grant_comment.comment_uuid}) == baseline_digest:
+                request_time = datetime.fromisoformat(
+                    manifest_by_id[request_comment.comment_uuid]["created_at"].replace("Z", "+00:00"))
+                grant_time = datetime.fromisoformat(
+                    manifest_by_id[grant_comment.comment_uuid]["created_at"].replace("Z", "+00:00"))
+                _require(request_time <= grant_time, "grant predates refresh request")
+                possibilities.append((2, request_comment, grant_comment))
+    _require(len(possibilities) == 1, "initial refresh comments do not match frozen baseline")
+    comment_writes, request_comment, grant_comment = possibilities[0]
+    _require(metadata_writes >= 4 or comment_writes == 0,
+             "refresh comments precede complete pause metadata")
+    if metadata_writes >= 5:
+        _require(request_comment is not None
+                 and metadata[prefix[4][0]] == request_comment.comment_uuid,
+                 "request comment binding mismatch")
+    if metadata_writes >= 6:
+        _require(grant_comment is not None
+                 and metadata[prefix[5][0]] == grant_comment.comment_uuid,
+                 "grant comment binding mismatch")
+
+    frozen = _load_json(canonical_json(state), 4_194_304)
+    for key, _ in prefix[:metadata_writes]:
+        del frozen["metadata"][key]
+    frozen["parent"]["revision"] = payload["parent"]["revision"]
+    frozen["parent"]["metadata"] = frozen["metadata"]
+    frozen_snapshot = RefreshSnapshot(canonical_json(frozen))
+    _require(authority_digest(frozen_snapshot) == payload["baseline"]["authority_digest"],
+             "frozen refresh authority changed")
+    _entry_authority(payload, frozen_snapshot.state())
+    _require(state["parent"].get("revision") == payload["parent"]["revision"]
+             + metadata_writes + comment_writes,
+             "initial refresh revision is not explained by exact writes")
+    validate_metadata_budget(metadata, request=request)
+    return InitialRefreshProgress(request, metadata_writes, comment_writes,
+                                  request_comment, grant_comment)
+
+
+def admit_refresh(request: RefreshRequest, snapshot: RefreshSnapshot, grant: RefreshComment) -> None:
+    """Admit only the complete pre-reservation prefix and its exact member grant."""
+    progress = validate_initial_refresh_progress(request, snapshot)
+    _require(progress.metadata_writes == 6 and progress.comment_writes == 2
+             and progress.grant_comment == grant, "incomplete refresh admission prefix")
 
 
 REFRESH_PREFIX = "eventra.refresh."
@@ -725,26 +933,28 @@ def _receipt_match(feature: dict, request: RefreshRequest, prepared: PreparedCan
 def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> RefreshDecision:
     payload, state = _request(request), _snapshot(snapshot)
     _shared_authority(payload, state)
+    initial = None
+    if (len(state["children"]) == 1 and state["parent"].get("status") == "blocked"
+            and not any(key in state["metadata"] for key in
+                        (REFRESH_PREFIX + "reservation", REFRESH_PREFIX + "consumed",
+                         REFRESH_PREFIX + "adoption"))):
+        initial = validate_initial_refresh_progress(request, snapshot)
+        if initial.metadata_writes < 4:
+            return RefreshDecision("wait", None, "refresh request awaits explicit pause registration")
     feature = refresh_metadata(state["metadata"])
     key = refresh_action(request)
     if feature is None:
-        matching = []
-        for raw in state["comments"]:
-            try:
-                grant = RefreshComment(**raw)
-                validate_grant(grant, request)
-                matching.append(grant)
-            except (TypeError, ValueError):
-                continue
-        _require(len(matching) == 1, "exact member grant required")
-        admit_refresh(request, snapshot, matching[0])
-        return RefreshDecision("create_refresh_stage", key, "exact refresh request admitted")
+        _require(initial is not None and initial.metadata_writes == 0
+                 and initial.comment_writes == 0, "invalid unstaged refresh request")
+        return RefreshDecision("wait", None, "refresh request awaits explicit pause registration")
     _require(feature["request_digest"] == request.digest, "refresh request changed")
     metadata = state["metadata"]
     _require(metadata.get("eventra.workflow.version") == "2"
              and metadata.get("eventra.workflow.classification") == "frontend-only"
              and "eventra.workflow.backend_sha" not in metadata, "invalid refresh scope")
     if "authorization_comment" not in feature:
+        _require(initial is not None and initial.metadata_writes in {4, 5}
+                 and initial.comment_writes in {0, 1, 2}, "invalid paused refresh prefix")
         _require(not {"reservation", "consumed", "adoption"} & set(feature)
                  and len(state["children"]) == 1 and metadata.get("eventra.workflow.attempt") == "0"
                  and metadata.get("eventra.workflow.next_stage") == "2"
@@ -754,6 +964,11 @@ def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> Refresh
                  and state["pr"]["head_sha"] == payload["source"]["sha"]
                  and state["parent"]["status"] == "blocked", "invalid paused refresh intent")
         return RefreshDecision("wait", None, "refresh intent awaits exact member authorization")
+    if initial is not None:
+        _require(initial.metadata_writes == 6 and initial.comment_writes == 2
+                 and initial.grant_comment is not None, "incomplete refresh admission prefix")
+        admit_refresh(request, snapshot, initial.grant_comment)
+        return RefreshDecision("create_refresh_stage", key, "exact refresh request admitted")
     _request_comment(request, state, feature)
     grant = [item for item in state["comments"] if item.get("comment_uuid") == feature["authorization_comment"]]
     _require(len(grant) == 1, "missing refresh grant")

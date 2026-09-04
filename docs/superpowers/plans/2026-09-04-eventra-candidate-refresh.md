@@ -313,18 +313,20 @@ self.assertNotIn("content", manifest[0])
 
 ### Task 4B: 可信读取与评论 revision 前缀证明
 
+**执行状态（2026-09-05）：本地实现与全量回归完成。** 可信快照现携带完整父评论 manifest 并强制 detail/metadata echo 一致；freezer 从同一双读快照生成 request 两份基线。初始化验证只接受固定六笔 KV 与两条评论的合法前缀，以 `R0 + M + K` 和双摘要逆向还原证明当前 revision。完整绑定前只等待，完整绑定后才路由 refresh 初始化；普通 v2 全量回归未变。证据见 `2026-09-05-eventra-candidate-refresh-batch-3b.md`。Task 5 写接口仍未实现，不存在 live 写入。
+
 **Files:** Modify `refresh_executor.py`, `candidate_refresh.py`, `workflow.py`, `tests/test_refresh_executor.py`, `tests/test_candidate_refresh.py`, `tests/test_workflow.py`。
 
 **Interfaces:** `freeze_refresh_request(snapshot) -> RefreshRequest`；
 `InitialRefreshProgress(request, metadata_writes, comment_writes, request_comment, grant_comment)`；
 `validate_initial_refresh_progress(request, snapshot) -> InitialRefreshProgress`。
 
-- [ ] 严格 read fake 模拟官方副作用：新评论与 changed KV 各将 parent revision +1；相同 KV 重放为 no-op。注入同 revision 差额但不同正文/parent 字段，必须零写入拒绝。
-- [ ] 首个 RED 从 R0=7 执行四笔暂停 KV、request、grant、两个 UUID 绑定，验证 progress 为 M=6/K=2/current revision=15；不同内容但 revision 同为 15 拒绝。
-- [ ] 快照保存完整 comment manifest 与 detail echo 校验；`freeze_refresh_request` 只接受 blocked、无 feature/reservation、唯一源和合法单 Lead authority，并由双读结果生成两摘要。
-- [ ] `validate_initial_refresh_progress` 只接受固定 KV 前缀与 K=0/1/2；grant 无 request、评论出现在未完整暂停前缀、额外父评论、编辑/删除、旧评论充当新增均拒绝。
-- [ ] 重构首次 admission 使用 progress 证明，不保留 `revision >=`、固定 `+2` 或 caller 覆盖 revision 的旁路；旧普通 v2 行为不变。Run candidate/executor/workflow GREEN。
-- [ ] Commit：`feat(multica): prove refresh revision changes from exact writes`。
+- [x] 严格 read fake 模拟官方副作用：新评论与 changed KV 各将 parent revision +1；相同 KV 重放为 no-op。注入同 revision 差额但不同正文/parent 字段，必须零写入拒绝。
+- [x] 首个 RED 从 R0=7 执行四笔暂停 KV、request、grant、两个 UUID 绑定，验证 progress 为 M=6/K=2/current revision=15；不同内容但 revision 同为 15 拒绝。
+- [x] 快照保存完整 comment manifest 与 detail echo 校验；`freeze_refresh_request` 只接受 blocked、无 feature/reservation、唯一源和合法单 Lead authority，并由双读结果生成两摘要。
+- [x] `validate_initial_refresh_progress` 只接受固定 KV 前缀与 K=0/1/2；grant 无 request、评论出现在未完整暂停前缀、额外父评论、编辑/删除、旧评论充当新增均拒绝。
+- [x] 重构首次 admission 使用 progress 证明，不保留 `revision >=`、固定 `+2` 或 caller 覆盖 revision 的旁路；旧普通 v2 行为不变。Run candidate/executor/workflow GREEN。
+- [x] Commit：`feat(multica): prove refresh revision changes from exact writes`。
 
 完成 4A/4B 后才执行 Task 5。Task 5 每个 checkpoint 复用同一投影算法；任何写入前缀无法唯一逆向还原时停止。Task 8 仍需独立验证 pro-1 部署 mutation contract；本地 CLI 版本不构成启用许可。
 

@@ -83,7 +83,9 @@ class ReadBoundary:
             raise AssertionError("missing JSON boundary")
         args = args[:-2]
         if args[:2] == ["issue", "get"]:
-            value = {"PRO-900": self.parent, "PRO-901": self.child}[args[2]]
+            value = copy.deepcopy({"PRO-900": self.parent, "PRO-901": self.child}[args[2]])
+            value["metadata"] = copy.deepcopy({"PRO-900": self.metadata,
+                                               "PRO-901": self.child_metadata}[args[2]])
         elif args[:3] == ["issue", "metadata", "list"]:
             value = {"PRO-900": self.metadata, "PRO-901": self.child_metadata}[args[3]]
         elif args == ["issue", "children", "PRO-900"]:
@@ -158,22 +160,190 @@ class SnapshotTests(unittest.TestCase):
         self.scope = self.module.RefreshScope("pro-1", uid(1), sha)
         self.api = self.module.RefreshAPI(self.runner, self.github, self.root, scope=self.scope,
                                          prerequisite_pr=self.runner.payload["prerequisite"]["pr_url"])
+        self.baseline_snapshot = self.snapshot()
+        self.request = contracts.freeze_refresh_request(self.baseline_snapshot)
 
     def snapshot(self):
         return self.api.snapshot("PRO-900")
 
     def admit(self):
-        state = self.snapshot()
-        grant = self.api.comment("PRO-900", uid(10))
-        contracts.admit_refresh(self.runner.request, state, grant)
+        request, state, _, grant = self.progress()
+        contracts.admit_refresh(request, state, grant)
         return state
+
+    def progress(self, *, metadata_writes=6, comment_writes=2):
+        request = self.request
+        state = self.snapshot().state()
+        envelope = {"payload": request.payload(), "digest": request.digest,
+                    "staging_ref": request.staging_ref}
+        request_record = comment_record(12, block("request", envelope), author=7, issue=uid(2))
+        grant_record = comment_record(13, block("grant", {"schema_version": 1,
+                                      "request_digest": request.digest, "granted_refresh": 1}),
+                                      author=11, issue=uid(2))
+        grant_record["author_type"] = "member"
+        extras = [request_record, grant_record][:comment_writes]
+        prefix = [
+            ("eventra.refresh.request", contracts.canonical_json(envelope)),
+            ("eventra.refresh.version", "1"),
+            ("eventra.refresh.merge_permission", "hold"),
+            ("eventra.refresh.request_digest", request.digest),
+            ("eventra.refresh.request_comment", uid(12)),
+            ("eventra.refresh.authorization_comment", uid(13)),
+        ]
+        def set_metadata(key, value):
+            if state["metadata"].get(key) != value:
+                state["metadata"][key] = value
+                state["parent"]["revision"] += 1
+        for key, value in prefix[:min(metadata_writes, 4)]:
+            set_metadata(key, value)
+        for record in extras:
+            state["comments"].append(asdict(contracts.RefreshComment(
+                uid(2), record["id"], record["author_id"], record["author_type"],
+                record["revision"], record["content"])))
+            state["parent"]["revision"] += 1
+        for key, value in prefix[4:metadata_writes]:
+            set_metadata(key, value)
+        state["comment_manifest"] = contracts.comment_manifest(
+            [*self.runner.comments["PRO-900"], *extras], uid(2))
+        state["parent"]["metadata"] = copy.deepcopy(state["metadata"])
+        snapshot = contracts.RefreshSnapshot(contracts.canonical_json(state))
+        return request, snapshot, contracts.RefreshComment(uid(2), uid(12), uid(7), "agent", 1,
+                                                           request_record["content"]), contracts.RefreshComment(
+            uid(2), uid(13), uid(11), "member", 1, grant_record["content"])
 
     def test_complete_stable_reads_admit_without_writes(self):
         state = self.admit().state()
-        self.assertEqual(state["parent"]["revision"], 7)
+        self.assertEqual(state["parent"]["revision"], 15)
         self.assertEqual(state["children"][0]["evidence"]["content"], self.runner.evidence["content"])
         self.assertEqual(self.runner.writes + self.github.writes, [])
         self.assertGreaterEqual(sum(call[:3] == ("issue", "get", "PRO-900") for call in self.runner.calls), 2)
+
+    def test_snapshot_carries_complete_parent_comment_manifest(self):
+        state = self.snapshot().state()
+        expected = contracts.comment_manifest(self.runner.comments["PRO-900"], uid(2))
+        self.assertEqual(state["comment_manifest"], expected)
+        self.assertNotIn("content", state["comment_manifest"][0])
+
+    def test_trusted_freezer_derives_both_baselines_from_one_snapshot(self):
+        snapshot = self.snapshot()
+        request = contracts.freeze_refresh_request(snapshot)
+        payload, state = request.payload(), snapshot.state()
+        self.assertEqual(payload["baseline"]["authority_digest"], contracts.authority_digest(snapshot))
+        self.assertEqual(payload["baseline"]["comments_digest"], hashlib.sha256(
+            contracts.canonical_json(state["comment_manifest"]).encode()).hexdigest())
+        self.assertEqual(payload["parent"]["revision"], 7)
+        self.assertEqual(payload["source"]["evidence_uuid"], uid(4))
+        self.assertEqual(payload["assignment"], {key: state["assignment"][key] for key in
+                                                  ("project_id", "squad_id", "lead_id", "engineer_id")})
+
+    def test_initial_progress_proves_exact_metadata_and_comment_writes(self):
+        request, snapshot, request_comment, grant = self.progress()
+        progress = contracts.validate_initial_refresh_progress(request, snapshot)
+        self.assertEqual((progress.metadata_writes, progress.comment_writes), (6, 2))
+        self.assertEqual(progress.request_comment, request_comment)
+        self.assertEqual(progress.grant_comment, grant)
+        self.assertEqual(snapshot.state()["parent"]["revision"], 15)
+        contracts.admit_refresh(request, snapshot, grant)
+
+    def test_initial_progress_same_value_metadata_replay_is_revision_noop(self):
+        request, snapshot, _, _ = self.progress()
+        state = snapshot.state()
+        before = state["parent"]["revision"]
+        def replay_same_value(key, value):
+            if state["metadata"].get(key) != value:
+                state["metadata"][key] = value
+                state["parent"]["revision"] += 1
+        replay_same_value("eventra.refresh.request_digest", request.digest)
+        state["parent"]["metadata"] = copy.deepcopy(state["metadata"])
+        self.assertEqual(state["parent"]["revision"], before)
+        self.assertEqual(contracts.validate_initial_refresh_progress(
+            request, contracts.RefreshSnapshot(contracts.canonical_json(state))).metadata_writes, 6)
+
+    def test_every_legal_initial_prefix_is_recoverable(self):
+        legal = ((0, 0), (1, 0), (2, 0), (3, 0), (4, 0),
+                 (4, 1), (4, 2), (5, 1), (5, 2), (6, 2))
+        for metadata_writes, comment_writes in legal:
+            request, snapshot, _, _ = self.progress(
+                metadata_writes=metadata_writes, comment_writes=comment_writes)
+            with self.subTest(metadata_writes=metadata_writes, comment_writes=comment_writes):
+                progress = contracts.validate_initial_refresh_progress(request, snapshot)
+                self.assertEqual((progress.metadata_writes, progress.comment_writes),
+                                 (metadata_writes, comment_writes))
+
+    def test_illegal_initial_prefix_combinations_are_rejected(self):
+        for metadata_writes, comment_writes in ((3, 1), (5, 0), (6, 1)):
+            request, snapshot, _, _ = self.progress(
+                metadata_writes=metadata_writes, comment_writes=comment_writes)
+            with self.subTest(metadata_writes=metadata_writes, comment_writes=comment_writes), \
+                    self.assertRaises(ValueError):
+                contracts.validate_initial_refresh_progress(request, snapshot)
+
+    def test_initial_progress_rejects_extra_deleted_or_rebound_comments(self):
+        request, snapshot, _, _ = self.progress()
+        variants = []
+        extra = snapshot.state()
+        record = comment_record(90, "unrelated progress", author=7, issue=uid(2))
+        extra["comments"].append(asdict(contracts.RefreshComment(
+            uid(2), record["id"], record["author_id"], record["author_type"], 1, record["content"])))
+        extra["comment_manifest"] = contracts.comment_manifest(
+            [*self.runner.comments["PRO-900"],
+             comment_record(12, next(item["content"] for item in extra["comments"] if item["comment_uuid"] == uid(12)),
+                            author=7, issue=uid(2)),
+             dict(comment_record(13, next(item["content"] for item in extra["comments"] if item["comment_uuid"] == uid(13)),
+                                 author=11, issue=uid(2)), author_type="member"), record], uid(2))
+        extra["parent"]["revision"] += 1
+        variants.append(extra)
+        deleted = snapshot.state()
+        deleted["comments"] = [item for item in deleted["comments"] if item["comment_uuid"] != uid(10)]
+        deleted["comment_manifest"] = [item for item in deleted["comment_manifest"] if item["comment_uuid"] != uid(10)]
+        variants.append(deleted)
+        edited = snapshot.state()
+        old = next(item for item in edited["comments"] if item["comment_uuid"] == uid(10))
+        old["content"] += " edited baseline"
+        old_manifest = next(item for item in edited["comment_manifest"] if item["comment_uuid"] == uid(10))
+        old_manifest["content_digest"] = hashlib.sha256(old["content"].encode()).hexdigest()
+        variants.append(edited)
+        rebound = snapshot.state()
+        rebound["metadata"]["eventra.refresh.request_comment"] = uid(13)
+        rebound["parent"]["metadata"] = copy.deepcopy(rebound["metadata"])
+        variants.append(rebound)
+        for index, state in enumerate(variants):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                contracts.validate_initial_refresh_progress(
+                    request, contracts.RefreshSnapshot(contracts.canonical_json(state)))
+
+    def test_initial_progress_rejects_equal_revision_with_different_authority(self):
+        request, snapshot, _, _ = self.progress()
+        for mutation in ("parent", "comment"):
+            state = snapshot.state()
+            if mutation == "parent":
+                state["parent"]["title"] = "changed without a new revision"
+            else:
+                target = next(item for item in state["comments"] if item["comment_uuid"] == uid(12))
+                target["content"] += " edited"
+                manifest = next(item for item in state["comment_manifest"] if item["comment_uuid"] == uid(12))
+                manifest["content_digest"] = hashlib.sha256(target["content"].encode()).hexdigest()
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                contracts.validate_initial_refresh_progress(
+                    request, contracts.RefreshSnapshot(contracts.canonical_json(state)))
+
+    def test_initial_progress_rejects_prefix_gaps_and_grant_without_request(self):
+        request, snapshot, _, _ = self.progress(metadata_writes=1, comment_writes=0)
+        state = snapshot.state()
+        value = state["metadata"].pop("eventra.refresh.request")
+        state["metadata"]["eventra.refresh.version"] = "1"
+        state["parent"]["metadata"] = copy.deepcopy(state["metadata"])
+        with self.assertRaises(ValueError):
+            contracts.validate_initial_refresh_progress(
+                request, contracts.RefreshSnapshot(contracts.canonical_json(state)))
+        request, snapshot, _, _ = self.progress(metadata_writes=4, comment_writes=2)
+        state = snapshot.state()
+        state["comments"] = [item for item in state["comments"] if item["comment_uuid"] != uid(12)]
+        state["comment_manifest"] = [item for item in state["comment_manifest"] if item["comment_uuid"] != uid(12)]
+        state["parent"]["revision"] -= 1
+        with self.assertRaises(ValueError):
+            contracts.validate_initial_refresh_progress(
+                request, contracts.RefreshSnapshot(contracts.canonical_json(state)))
 
     def test_no_api_revision_is_not_assumed_immutable(self):
         record = dict(self.runner.grant)
@@ -194,12 +364,11 @@ class SnapshotTests(unittest.TestCase):
                 self.api.parse_scoped_comment(records, uid(10), uid(2))
 
     def test_grant_must_be_exactly_the_comment_in_snapshot(self):
-        state = self.snapshot()
-        grant = self.api.comment("PRO-900", uid(10))
+        request, state, _, grant = self.progress()
         for field, value in (("content", grant.content + "\n"), ("revision", 2), ("issue_id", uid(3)),
                              ("author_type", "agent"), ("author_id", uid(90)), ("comment_uuid", uid(90))):
             with self.subTest(field=field), self.assertRaises(ValueError):
-                contracts.admit_refresh(self.runner.request, state, contracts.RefreshComment(**(asdict(grant) | {field: value})))
+                contracts.admit_refresh(request, state, contracts.RefreshComment(**(asdict(grant) | {field: value})))
 
     def test_ambiguous_matching_grants_are_rejected(self):
         self.runner.comments["PRO-900"].append(dict(self.runner.grant, id=uid(90)))
@@ -287,11 +456,37 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "changed"):
             self.snapshot()
 
+    def test_same_revision_content_or_parent_field_change_between_reads_blocks_freeze(self):
+        original_title = self.runner.parent["title"]
+        original_content = self.runner.comments["PRO-900"][0]["content"]
+        comment_reads = 0
+        def change_comment(args):
+            nonlocal comment_reads
+            if args[:4] == ["issue", "comment", "list", "PRO-900"]:
+                comment_reads += 1
+                if comment_reads == 2:
+                    self.runner.comments["PRO-900"][0]["content"] += " same-revision edit"
+        self.runner.mutate_on_read = change_comment
+        with self.assertRaisesRegex(RuntimeError, "changed"):
+            self.snapshot()
+        self.runner.comments["PRO-900"][0]["content"] = original_content
+        parent_reads = 0
+        def change_parent(args):
+            nonlocal parent_reads
+            if args[:3] == ["issue", "get", "PRO-900"]:
+                parent_reads += 1
+                if parent_reads == 2:
+                    self.runner.parent["title"] = original_title + " same-revision edit"
+        self.runner.mutate_on_read = change_parent
+        with self.assertRaisesRegex(RuntimeError, "changed"):
+            self.snapshot()
+
     def test_control_identity_is_read_from_checkout_not_request(self):
-        payload = self.runner.request.payload()
+        payload = self.request.payload()
         payload["control_tool_sha"] = "f" * 40
         with self.assertRaises(ValueError):
-            contracts.admit_refresh(contracts.build_request(payload), self.snapshot(), self.api.comment("PRO-900", uid(10)))
+            _, state, _, grant = self.progress()
+            contracts.admit_refresh(contracts.build_request(payload), state, grant)
 
     def test_unconfigured_scope_and_unapproved_checkout_fail_before_network(self):
         for scope in (None, self.module.RefreshScope("pro-1", uid(1), "f" * 40)):

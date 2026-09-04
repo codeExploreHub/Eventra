@@ -125,7 +125,11 @@ class RefreshAPI:
     def _all_comments(self, identifier, issue_id):
         # CLI default + --full returns all complete threads. Do not use --recent,
         # --tail, --summary or --roots-only; their cursors live on stderr.
-        return self._comments(self._read(["issue", "comment", "list", identifier, "--full", "--compact"]), issue_id)
+        return self._all_comment_state(identifier, issue_id)[1]
+
+    def _all_comment_state(self, identifier, issue_id):
+        records = self._read(["issue", "comment", "list", identifier, "--full", "--compact"])
+        return records, self._comments(records, issue_id)
 
     def comment(self, issue, comment_uuid):
         before = self._detail(issue)
@@ -190,6 +194,7 @@ class RefreshAPI:
         parent = self._detail(parent_key)
         _need(parent["parent_issue_id"] is None, "not a parent issue")
         metadata = parse_issue_metadata(self._read(["issue", "metadata", "list", parent_key]))
+        _need(parent.get("metadata") == metadata, "parent metadata echo conflict")
         assignment = self._assignment()
         listed = parse_issue_children(self._read(["issue", "children", parent_key]), parent["id"])
         children, runs = [], self._runs(parent_key, parent["id"])
@@ -198,6 +203,7 @@ class RefreshAPI:
             detail = self._detail(item["identifier"])
             _need(all(detail[k] == v for k, v in item.items()), "child detail differs from parent relation")
             child_metadata = parse_issue_metadata(self._read(["issue", "metadata", "list", item["identifier"]]))
+            _need(detail.get("metadata") == child_metadata, "child metadata echo conflict")
             comments = self._all_comments(item["identifier"], item["id"])
             evidence_uuid = child_metadata.get("eventra.phase.evidence_comment")
             evidence = [asdict(comment) for comment in comments if comment.comment_uuid == evidence_uuid]
@@ -225,8 +231,10 @@ class RefreshAPI:
         _need(type(compare) is dict and compare.get("status") in {"ahead", "identical"}
               and type(compare.get("merge_base_commit")) is dict
               and compare["merge_base_commit"].get("sha") == merge, "prerequisite is not a base ancestor")
+        parent_records, parent_comments = self._all_comment_state(parent_key, parent["id"])
         return {"parent": parent, "metadata": metadata, "children": children, "runs": runs,
-                "comments": [asdict(comment) for comment in self._all_comments(parent_key, parent["id"])],
+                "comments": [asdict(comment) for comment in parent_comments],
+                "comment_manifest": c.comment_manifest(parent_records, parent["id"]),
                 "pr": {"url": url, "repository": "codeExploreHub/Eventra", "head_ref": pr["head"]["ref"],
                        "base_ref": base_ref, "head_sha": pr["head"]["sha"], "state": pr["state"], "merged": pr["merged"]},
                 "prerequisite": {"pr_url": prerequisite_url, "merge_sha": merge, "base_sha": base_sha,
