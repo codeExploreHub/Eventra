@@ -4,12 +4,15 @@ import copy
 import hashlib
 import io
 import json
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
 import tools.multica.workflow as workflow_module
+from tools.multica.runtime_guard import file_single_flight
 from tools.multica.workflow import (
     AuthorizingComment,
     ChildRunSnapshot,
@@ -131,6 +134,7 @@ def raw_issue(**overrides):
         "assignee_type": "agent",
         "project_id": PROJECT_ID,
         "updated_at": "2026-08-25T08:50:06Z",
+        "revision": 1,
         "title": "Existing issue",
         "description": "Existing issue description",
     }
@@ -7388,6 +7392,11 @@ class FakeRepairRunner:
         self.corrupt_created_title = False
         self.suppress_status_run = False
         self.create_two_active_runs = False
+        self.advance_run_during_authority_read = False
+        self.run_reads_before_progress = None
+        self.source_drift_after_child_metadata_write = None
+        self.authorization_revision_drift_after_child_metadata_write = None
+        self.parent_revision_drift_after_child_metadata_write = None
         self._add_done_child(1, "implementation", 0, result="pass", pr=True)
         if attempt >= 1:
             self._add_done_child(3, "repair", 1, result="pass", pr=True)
@@ -7500,6 +7509,7 @@ class FakeRepairRunner:
             {
                 "id": self.AUTH_UUID,
                 "author_type": author_type,
+                "revision": 1,
                 "content": json.dumps(
                     {
                         "bundle_digest": bundle_digest,
@@ -7674,8 +7684,40 @@ class FakeRepairRunner:
             if self.metadata[identifier].get(key) != value:
                 self.metadata[identifier][key] = value
                 self.committed_mutations += 1
+                if identifier == "PRO-65":
+                    self.parent["revision"] += 1
             if identifier != "PRO-65":
                 self.child_metadata_writes += 1
+                if (
+                    self.source_drift_after_child_metadata_write
+                    == self.child_metadata_writes
+                ):
+                    self.source_drift_after_child_metadata_write = None
+                    source = next(
+                        item
+                        for item in self.children
+                        if item["stage"] == 2
+                        and self.metadata[item["identifier"]][
+                            "eventra.phase.kind"
+                        ]
+                        == "review"
+                    )
+                    source["revision"] += 1
+                    self.metadata[source["identifier"]][
+                        "eventra.phase.sha.backend"
+                    ] = "c" * 40
+                if (
+                    self.authorization_revision_drift_after_child_metadata_write
+                    == self.child_metadata_writes
+                ):
+                    self.authorization_revision_drift_after_child_metadata_write = None
+                    self.comments[0]["revision"] += 1
+                if (
+                    self.parent_revision_drift_after_child_metadata_write
+                    == self.child_metadata_writes
+                ):
+                    self.parent_revision_drift_after_child_metadata_write = None
+                    self.parent["revision"] += 1
                 if (
                     self.authority_drift_after_child_metadata_write
                     == self.child_metadata_writes
@@ -7703,6 +7745,8 @@ class FakeRepairRunner:
             if key in self.metadata[identifier]:
                 self.metadata[identifier].pop(key)
                 self.committed_mutations += 1
+                if identifier == "PRO-65":
+                    self.parent["revision"] += 1
             if key == self.authority_drift_after_parent_delete_key:
                 self.authority_drift_after_parent_delete_key = None
                 self._apply_authority_drift("members")
@@ -7719,6 +7763,7 @@ class FakeRepairRunner:
                 if self.parent["status"] != status:
                     self.parent["status"] = status
                     self.committed_mutations += 1
+                    self.parent["revision"] += 1
                 self._maybe_lose_ack("parent-status")
                 return copy.deepcopy(self.parent)
             child = next(child for child in self.children if child["identifier"] == identifier)
@@ -7748,6 +7793,8 @@ class FakeRepairRunner:
                         duplicate_run = copy.deepcopy(runs[-1])
                         duplicate_run["id"] += "-duplicate"
                         runs.append(duplicate_run)
+                if self.advance_run_during_authority_read:
+                    self.run_reads_before_progress = 1
             if self.authority_drift_after_status is not None:
                 kind = self.authority_drift_after_status
                 self.authority_drift_after_status = None
@@ -7755,7 +7802,17 @@ class FakeRepairRunner:
             self._maybe_lose_ack("status")
             return copy.deepcopy(child)
         if call[:2] == ("issue", "runs"):
-            return copy.deepcopy(self.runs.get(call[2], []))
+            records = copy.deepcopy(self.runs.get(call[2], []))
+            if self.run_reads_before_progress is not None:
+                if self.run_reads_before_progress == 0:
+                    for item in self.runs.get(call[2], []):
+                        if item["status"] == "queued":
+                            item["status"] = "running"
+                            item["started_at"] = "2026-08-25T09:00:02Z"
+                    self.run_reads_before_progress = None
+                else:
+                    self.run_reads_before_progress -= 1
+            return records
         raise AssertionError(f"unsupported argv: {call!r}")
 
 
@@ -7843,6 +7900,7 @@ class SmokeExecutionTests(unittest.TestCase):
             {
                 "id": SMOKE_RETRY_AUTH_UUID,
                 "author_type": "member",
+                "revision": 1,
                 "content": json.dumps(
                     {
                         "candidate_shas": {
@@ -7914,6 +7972,223 @@ class SmokeExecutionTests(unittest.TestCase):
                 separators=(",", ":"),
             ),
         )
+
+    def test_same_action_contender_is_a_stable_non_writing_noop(self):
+        runner, github, decision = self._planned()
+        runner.calls.clear()
+        github.calls.clear()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with file_single_flight("PRO-65", decision.action_key, root=root):
+                result = execute_parent_smoke(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                    single_flight_root=root,
+                )
+
+        self.assertEqual(result.next_action, "noop")
+        self.assertEqual(result.mutation_count, 0)
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(github.calls, [])
+
+    def test_different_action_contender_fails_closed_without_writing(self):
+        runner, github, decision = self._planned()
+        runner.calls.clear()
+        github.calls.clear()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with file_single_flight("PRO-65", "different-action", root=root):
+                result = execute_parent_smoke(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                    single_flight_root=root,
+                )
+
+        self.assertEqual(result.next_action, "block")
+        self.assertEqual(result.mutation_count, 0)
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(github.calls, [])
+
+    def test_expected_todo_to_in_progress_and_run_start_converges(self):
+        runner, github, decision = self._planned()
+        runner.advance_run_during_authority_read = True
+
+        result = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(result.next_action, "smoke", result.reason)
+        child = next(item for item in runner.children if item["stage"] == 3)
+        self.assertEqual(runner.runs[child["identifier"]][0]["status"], "running")
+        self.assertEqual(len(runner.runs[child["identifier"]]), 1)
+
+    def test_recovery_normalizes_queued_to_running_progress_between_reads(self):
+        runner, github, decision = self._planned()
+        runner.hard_interrupt_after_child_metadata_writes = 8
+        with self.assertRaises(KeyboardInterrupt):
+            execute_parent_smoke(
+                runner,
+                github,
+                "PRO-65",
+                expected_action_key=decision.action_key,
+            )
+        child = next(item for item in runner.children if item["stage"] == 3)
+        child["status"] = "todo"
+        runner.runs[child["identifier"]] = [
+            {
+                "id": f"run-{child['identifier']}-1",
+                "issue_id": child["id"],
+                "status": "queued",
+                "created_at": "2026-08-25T09:00:00Z",
+                "dispatched_at": None,
+                "started_at": None,
+                "completed_at": None,
+            }
+        ]
+        runner.hard_interrupt_after_child_metadata_writes = None
+        runner.run_reads_before_progress = 0
+
+        result = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(result.next_action, "smoke", result.reason)
+        self.assertEqual(runner.runs[child["identifier"]][0]["status"], "running")
+        self.assertNotIn(
+            workflow_module.SMOKE_RESERVATION_KEY,
+            runner.metadata["PRO-65"],
+        )
+
+    def test_retry_and_recovery_external_reads_are_cut_by_at_least_half(self):
+        baselines = {"retry": 1293, "recovery": 898}
+
+        runner, github, decision, _ = self._retry_planned()
+        runner.calls.clear()
+        github.calls.clear()
+        retry = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+        retry_reads = (
+            len(runner.calls) - len(runner.mutation_calls) + len(github.calls)
+        )
+
+        recovery_runner, recovery_github, recovery_decision = self._planned()
+        recovery_runner.hard_interrupt_after_create = True
+        with self.assertRaises(KeyboardInterrupt):
+            execute_parent_smoke(
+                recovery_runner,
+                recovery_github,
+                "PRO-65",
+                expected_action_key=recovery_decision.action_key,
+            )
+        recovery_runner.hard_interrupt_after_create = False
+        recovery_runner.calls.clear()
+        recovery_github.calls.clear()
+        recovery = execute_parent_smoke(
+            recovery_runner,
+            recovery_github,
+            "PRO-65",
+            expected_action_key=recovery_decision.action_key,
+        )
+        recovery_reads = (
+            len(recovery_runner.calls)
+            - len(recovery_runner.mutation_calls)
+            + len(recovery_github.calls)
+        )
+
+        self.assertEqual(retry.next_action, "smoke", retry.reason)
+        self.assertEqual(recovery.next_action, "smoke", recovery.reason)
+        self.assertLessEqual(retry_reads, baselines["retry"] // 2)
+        self.assertLessEqual(recovery_reads, baselines["recovery"] // 2)
+
+    def test_two_active_smoke_runs_fail_closed_and_keep_reservation(self):
+        runner, github, decision = self._planned()
+        runner.create_two_active_runs = True
+
+        result = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(result.next_action, "block")
+        self.assertIn(workflow_module.SMOKE_RESERVATION_KEY, runner.metadata["PRO-65"])
+        child = next(item for item in runner.children if item["stage"] == 3)
+        self.assertEqual(len(runner.runs[child["identifier"]]), 2)
+
+    def test_source_gate_revision_drift_stops_before_smoke_run_start(self):
+        runner, github, decision = self._planned()
+        runner.source_drift_after_child_metadata_write = 1
+
+        result = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(result.next_action, "block")
+        self.assertFalse(
+            any(call[:2] == ("issue", "status") for call in runner.mutation_calls)
+        )
+        self.assertIn(
+            workflow_module.SMOKE_RESERVATION_KEY,
+            runner.metadata["PRO-65"],
+        )
+
+    def test_parent_revision_drift_stops_before_smoke_run_start(self):
+        runner, github, decision = self._planned()
+        runner.parent_revision_drift_after_child_metadata_write = 1
+
+        result = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(result.next_action, "block")
+        self.assertFalse(
+            any(call[:2] == ("issue", "status") for call in runner.mutation_calls)
+        )
+
+    def test_retry_authorization_revision_drift_stops_before_smoke_run_start(self):
+        runner, github, decision, _source_key = self._retry_planned()
+        runner.authorization_revision_drift_after_child_metadata_write = (
+            runner.child_metadata_writes + 1
+        )
+
+        result = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(result.next_action, "block")
+        self.assertEqual(runner.parent["status"], "blocked")
+        self.assertIn(
+            workflow_module.SMOKE_RESERVATION_KEY,
+            runner.metadata["PRO-65"],
+        )
+
+    def test_parser_exposes_read_only_tls_diagnostic(self):
+        args = build_workflow_parser().parse_args(["diagnose-tls"])
+        self.assertEqual(args.command, "diagnose-tls")
 
     def test_retry_smoke_lost_acknowledgements_replay_without_duplicates(self):
         lost_acks = (

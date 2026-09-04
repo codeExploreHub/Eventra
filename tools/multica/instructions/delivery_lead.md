@@ -231,8 +231,19 @@ next barrier group, then advance `next_stage` and record `last_action`.
   the complete effect is verified. Exact retry resumes a missing create,
   canonical metadata prefix, promotion, or lost acknowledgement without a
   duplicate; conflicting children, metadata, assignments, Gate evidence, or
-  merged PR heads block without overwrite. This depends on the provisioned
-  single serialized Delivery Lead; it is not generic CAS or transaction safety.
+  merged PR heads block without overwrite. A shared-Git-common-dir kernel lease
+  makes this executor single-flight across local processes and linked worktrees:
+  the same parent/action contender returns a non-writing `noop`, a different
+  action blocks, and a process interruption leaves an explicit stale record that
+  the next owner replaces. Multica reservation state remains the durable
+  lost-acknowledgement authority. Expensive source evidence and merged-PR reads
+  are cached only in a revision-fenced envelope bound to parent/action, exact
+  source-Issue revisions, evidence identities, exact retry-comment revision and
+  content, candidate SHAs, PRs, and assignment authority. Full authority is
+  reread immediately before and after promotion; mutable parent/child/run and
+  assignment checks still surround every write.
+  Expected child `todo -> in_progress` and active-run startup are allowed, while
+  duplicate active runs fail closed.
   Complete the parent only after exact assigned smoke PASS.
 - `retry_smoke_stage`: This is the only recovery from a post-merge Smoke that
   finished `done + blocked` solely because external infrastructure prevented
@@ -263,6 +274,13 @@ next barrier group, then advance `next_stage` and record `last_action`.
   `in_review` for routine human acceptance.
 - `block_parent`: record facts and stop. A partial cross-repository merge is
   never reverted or continued automatically.
+
+If a Multica read fails ambiguously, run the read-only
+`python3 -B -m tools.multica.workflow diagnose-tls --timeout 15` check before
+changing authentication. `tls_handshake` is not proof of invalid credentials.
+For the documented Multica 0.4.38 / Go 1.26 local-proxy ML-KEM case, the only
+workaround is process-scoped: prefix the affected command with
+`GODEBUG=tlsmlkem=0`. Never persist it or change global proxy configuration.
 
 Automatic merge and local smoke do not authorize production; production deployment is always human-triggered.
 

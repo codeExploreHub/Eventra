@@ -55,6 +55,14 @@ Context Receipt and evidence comment, and clean up only owned processes and
 temporary worktrees. The retry does not weaken provenance and authorizes no
 deployment.
 
+If Multica access fails before that work begins, run the control repository's
+read-only `python3 -B -m tools.multica.workflow diagnose-tls --timeout 15`
+check. Report its classification, never raw output or credentials. A
+`tls_handshake` result is distinct from HTTP authentication failure. In the
+known Multica 0.4.38 / Go 1.26 local-proxy ML-KEM case, retry only the affected
+process with `GODEBUG=tlsmlkem=0`; do not edit a shell profile, system proxy, or
+persistent configuration.
+
 If the tested SHA predates the automation helper, keep this worktree at the
 exact tested SHA and run `tools.multica.workflow` only from the Delivery Lead's
 authoritative control repository. Do not copy helper files into the tested
