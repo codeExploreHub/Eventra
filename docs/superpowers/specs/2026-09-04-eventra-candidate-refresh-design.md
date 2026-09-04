@@ -4,6 +4,11 @@
 
 状态：书面设计已获用户确认（“符合”）；进入实现计划，尚未实现或启用。
 
+2026-09-04 补充：Task 1–4 已有本地实现。Task 5 预检发现评论创建推进父 revision，
+用户已同意补充冻结 authority / 评论基线的方向；书面补充见
+`2026-09-04-eventra-candidate-refresh-authority-design.md`（待审阅）。写入实现尚未继续，
+未获准启用 live。下文保留原设计及当时状态，执行状态以计划记录为准。
+
 范围：Eventra 本地试点，不修改通用 `multica-multi-repo-delivery`。
 
 ## 1. 问题与已知事实

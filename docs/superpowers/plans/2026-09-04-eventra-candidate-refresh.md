@@ -281,6 +281,8 @@ def test_unadopted_refresh_cannot_open_gate(self):
 
 ## Task 5: 建立并恢复唯一刷新阶段
 
+**执行状态（2026-09-04）：协议修订方向已获用户同意，书面补充待审阅。** 官方 v0.4.38 的评论创建也推进父 Issue revision；现有请求缺少冻结 authority/评论基线，无法证明请求与 grant 发布后的合法推进。不得用固定 `+2` 或 `revision >= old` 放宽。此前 584 项回归通过，但不覆盖真实评论创建副作用；Task 5/6 尚未实现。证据见 `2026-09-04-eventra-candidate-refresh-batch-3-preflight.md`，修订见 `../specs/2026-09-04-eventra-candidate-refresh-authority-design.md`。该书面补充获准后先补 Task 3/4 的基线契约与真实副作用测试，再执行下列初始化步骤；原步骤不能绕过新增基线与部署契约要求。
+
 **Files:** Modify `refresh_executor.py`, `candidate_refresh.py`, `workflow.py`, `tests/test_refresh_executor.py`。
 
 **Interfaces:** `RefreshExecutionResult(action_key: str, status: str, mutation_count: int, child_identifier: str)`；
