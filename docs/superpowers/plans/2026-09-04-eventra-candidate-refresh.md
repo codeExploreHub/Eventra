@@ -72,6 +72,8 @@ python3 -B -m tools.multica.knowledge verify --frontend-root . --backend-root /U
 
 ## Task 1: 固定请求、摘要和证据协议
 
+**执行状态（2026-09-04）：本地实现与回归完成。** 提交 `ebb0ac63e7b7bc15cc8a4f67164b34d57321c14c`；16 项协议测试先因缺接口 RED，再 GREEN。下列条目保留原计划；实测执行细节见同目录 `2026-09-04-eventra-candidate-refresh-batch-1.md`。
+
 **Files:** Create `candidate_refresh.py`, `tests/test_candidate_refresh.py`。
 
 **Interfaces:** 均在 `tools.multica.candidate_refresh` 中定义：
@@ -178,6 +180,8 @@ request = RefreshRequest(encoded, digest,
 - [ ] Commit 明确的两个文件：`feat(multica): define candidate refresh contracts`。
 
 ## Task 2: 真实 Git 合并对象与发布边界
+
+**执行状态（2026-09-04）：本地实现与回归完成。** 提交 `3f7d571a14af1e225593c04335100bba2a2e86fa`；16 项真实 Git 测试先因缺接口 RED，再 GREEN。尚未接入 live 执行入口；Task 3–9 待完成。
 
 **Files:** Create `refresh_git.py`, `tests/test_refresh_git.py`。
 
