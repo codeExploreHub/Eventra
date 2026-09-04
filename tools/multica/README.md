@@ -209,6 +209,9 @@ Attach the canonical JSON output as the Context Receipt and verify material
 claims against current code, tests, or an authoritative contract. Rerun with
 one `--verified-id KNOWLEDGE_ID` per checked entry and `--conflict TEXT` for
 each stale or contradictory claim; current code and exact-SHA evidence win.
+`verified_ids` contains only those explicit checks. A historical
+`last_verified_sha` match, whether in the same repository or another one,
+never marks a claim verified for the current task.
 If a novel,
 verified, reusable, public-repository-safe fact emerges, place its JSON in a
 temporary untracked file and render the only accepted evidence format:
@@ -615,6 +618,23 @@ allowlist, runs `check-change`, opens one source-linked PR, records the canonica
 `eventra.knowledge.pr` state, and stops at `pr_open` for human review. A human
 may reject or merge; the Curator never does either. `verified` is recorded only
 after a read-only PR observation and exact merged-SHA index verification.
+
+Merged-SHA verification reads raw blobs from the target repository's immutable
+Git commit tree (with replace objects disabled), not its working directory,
+staging area, export filters, or the other repository. The requested commit
+must be available locally; HEAD need not still point to it. Only regular files
+inside that repository's canonical knowledge directories are accepted. Missing
+or invalid indexes, symlinks, ambiguous candidate matches, and unavailable
+commits fail closed. This content check does not replace GitHub merge-status
+observation or human review.
+
+The `bootstrap_design` exception is frozen to the 12 original seed entries:
+full canonical entry fingerprints bind identity, content digest, scope, paths,
+provenance, and verification metadata in control code. Original historical
+seeds remain readable; new entries or updates (including verification metadata
+updates) must migrate to `delivery_evidence`. Do not extend the seed allowlist
+as part of documentation-only curation. YAML formatting changes that preserve
+the parsed entry are harmless. Canonical knowledge still requires human review.
 
 ### Pause, rollback, and continuity
 

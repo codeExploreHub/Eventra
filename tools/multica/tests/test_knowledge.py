@@ -4,6 +4,7 @@ from dataclasses import replace
 import hashlib
 import io
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -56,9 +57,11 @@ def entry(path: Path, **overrides):
         "status": "active",
         "replacement_id": None,
         "provenance": {
-            "kind": "bootstrap_design",
-            "design_path": "docs/superpowers/specs/2026-08-31-eventra-repository-knowledge-loop-design.md",
-            "design_commit": DESIGN_SHA,
+            "kind": "delivery_evidence",
+            "source_issue": "PRO-100",
+            "source_comment_uuid": "00000000-0000-4000-8000-000000000100",
+            "source_candidate_shas": {"frontend": SHA},
+            "source_candidate_digest": "d" * 64,
         },
         "last_verified_sha": SHA,
         "last_verified_date": "2026-08-31",
@@ -97,8 +100,8 @@ class KnowledgeIndexTests(unittest.TestCase):
     def test_loads_valid_index_and_freezes_provenance(self):
         loaded = load_index(self.write_index([entry(self.doc.relative_to(self.root))]), self.root)
         self.assertEqual(loaded[0].knowledge_id, "frontend-testing")
-        self.assertEqual(loaded[0].provenance_kind, "bootstrap_design")
-        self.assertEqual(loaded[0].design_commit, DESIGN_SHA)
+        self.assertEqual(loaded[0].provenance_kind, "delivery_evidence")
+        self.assertEqual(loaded[0].source_issue, "PRO-100")
 
     def test_rejects_duplicate_yaml_keys_without_echoing_values(self):
         index_path = self.root / "docs" / "agent-knowledge" / "index.yaml"
@@ -232,6 +235,15 @@ class KnowledgeIndexTests(unittest.TestCase):
         payload = json.loads(receipt)
         self.assertEqual(payload["verified_ids"], ["frontend-testing"])
         self.assertEqual(payload["conflicts"], ["frontend-testing: command changed; current code wins"])
+
+    def test_matching_historical_sha_never_implies_task_verification(self):
+        entries = load_index(self.write_index([entry(self.doc.relative_to(self.root))]), self.root)
+        for shas in ({"frontend": SHA}, {"frontend": "f" * 40, "backend": SHA}):
+            with self.subTest(shas=shas):
+                payload = json.loads(build_context_receipt(
+                    "PRO-100", "frontend", "qa", shas, entries, ("app/page.tsx",),
+                ))
+                self.assertEqual(payload["verified_ids"], [])
 
     def test_receipt_rejects_verification_for_unselected_entry(self):
         entries = load_index(self.write_index([entry(self.doc.relative_to(self.root))]), self.root)
@@ -1490,58 +1502,149 @@ class KnowledgePullRequestStateTests(unittest.TestCase):
             reconcile_knowledge_pr(github, state, merged_verifier=lambda *_: True)
         self.assertTrue(all(call[:2] == ("pr", "view") for call in github.calls))
 
-    def test_exact_merged_sha_requires_verified_index_candidate_digest(self):
-        entries = load_index(
-            Path("docs/agent-knowledge/index.yaml"), Path.cwd(), "frontend"
-        )
-        matching = replace(
-            entries[0],
-            source_candidate_digest=self.digest,
-            last_verified_sha="b" * 40,
-        )
-        completed = mock.Mock(returncode=0, stdout="b" * 40 + "\n")
-        with (
-            mock.patch(
-                "tools.multica.knowledge.subprocess.run",
-                return_value=completed,
-            ) as run,
-            mock.patch(
-                "tools.multica.knowledge.verify_indexes",
-                return_value=(matching,),
-            ),
+class BootstrapKnowledgeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        source = Path(__file__).resolve().parents[3]
+        raw = yaml.safe_load((source / "docs/agent-knowledge/index.yaml").read_text())
+        self.seed = next(item for item in raw["entries"] if item["knowledge_id"] == "frontend-testing-guide")
+        self.doc = self.root / self.seed["relative_path"]
+        self.doc.parent.mkdir(parents=True)
+        self.doc.write_bytes((source / self.seed["relative_path"]).read_bytes())
+        self.index = self.doc.parent / "index.yaml"
+
+    def load(self, item):
+        self.index.write_text(yaml.safe_dump({"schema_version": 1, "entries": [item]}))
+        return load_index(self.index, self.root, "frontend")
+
+    def test_original_seed_remains_valid(self):
+        self.assertEqual(self.load(self.seed)[0].knowledge_id, "frontend-testing-guide")
+
+    def test_new_bootstrap_identity_or_semantics_is_rejected(self):
+        for changes in (
+            {"knowledge_id": "post-rollout-operational-claim"},
+            {"title": "Different claim"},
+            {"repository_paths": ["secrets/**"]},
+            {"scope": "backend", "repositories": ["backend"]},
+            {"last_verified_sha": "f" * 40},
         ):
-            self.assertTrue(
-                verify_merged_knowledge(
-                    "frontend",
-                    "b" * 40,
-                    self.digest,
-                    frontend_root=Path.cwd(),
-                    backend_root=Path.cwd(),
-                )
-            )
-        self.assertEqual(
-            run.call_args.args[0][0:3],
-            ["git", "-C", str(Path.cwd().resolve())],
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(ValueError, "invalid knowledge index"):
+                    self.load(dict(self.seed, **changes))
+
+    def test_updated_bootstrap_content_requires_delivery_evidence(self):
+        self.doc.write_text("# New operational claim\n")
+        updated = dict(self.seed, content_digest=digest(self.doc))
+        with self.assertRaisesRegex(ValueError, "invalid knowledge index"):
+            self.load(updated)
+        updated["provenance"] = entry(Path("unused"))["provenance"]
+        self.assertEqual(self.load(updated)[0].provenance_kind, "delivery_evidence")
+
+
+class MergedKnowledgeCommitTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.frontend = Path(self.temp.name) / "frontend"
+        self.backend = Path(self.temp.name) / "backend"
+        self.candidate = "d" * 64
+        for owner, root in (("frontend", self.frontend), ("backend", self.backend)):
+            root.mkdir()
+            self.git(root, "init", "-q")
+            self.write_knowledge(root, owner, self.candidate)
+            if owner == "frontend":
+                shared = root / "docs/delivery-knowledge"
+                shared.mkdir(parents=True)
+                (shared / "index.yaml").write_text("schema_version: 1\nentries: []\n")
+            self.commit(root)
+
+    def git(self, root, *args):
+        return subprocess.run(
+            ["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false",
+             "-c", "user.name=Knowledge Test", "-c", "user.email=knowledge@example.invalid",
+             "-C", str(root), *args],
+            text=True, capture_output=True, check=True,
+        ).stdout.strip()
+
+    def commit(self, root):
+        self.git(root, "add", "docs")
+        self.git(root, "commit", "-qm", "test knowledge")
+        return self.git(root, "rev-parse", "HEAD")
+
+    def write_knowledge(self, root, owner, candidate, *, shared=False):
+        directory = "docs/delivery-knowledge" if shared else "docs/agent-knowledge"
+        doc = root / directory / "testing-guide.md"
+        doc.parent.mkdir(parents=True, exist_ok=True)
+        doc.write_text("# Verified delivery knowledge\n")
+        value = entry(
+            doc.relative_to(root), knowledge_id=f"{owner}-{'shared' if shared else 'delivered'}",
+            scope="cross_repo" if shared else owner,
+            repositories=["frontend", "backend"] if shared else [owner],
+            content_digest=digest(doc),
+            provenance={
+                "kind": "delivery_evidence", "source_issue": "PRO-100",
+                "source_comment_uuid": "00000000-0000-4000-8000-000000000100",
+                "source_candidate_shas": {owner: SHA},
+                "source_candidate_digest": candidate,
+            },
+        )
+        (root / directory / "index.yaml").write_text(yaml.safe_dump(
+            {"schema_version": 1, "entries": [value]}, sort_keys=False,
+        ))
+
+    def verify(self, owner, sha, candidate=None):
+        return verify_merged_knowledge(
+            owner, sha, candidate or self.candidate,
+            frontend_root=self.frontend, backend_root=self.backend,
         )
 
-        with (
-            mock.patch(
-                "tools.multica.knowledge.subprocess.run",
-                return_value=completed,
-            ),
-            mock.patch(
-                "tools.multica.knowledge.verify_indexes",
-                return_value=(replace(matching, source_candidate_digest="e" * 64),),
-            ),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "merged knowledge"):
-                verify_merged_knowledge(
-                    "frontend",
-                    "b" * 40,
-                    self.digest,
-                    frontend_root=Path.cwd(),
-                    backend_root=Path.cwd(),
-                )
+    def test_uncommitted_candidate_cannot_be_verified_as_merged(self):
+        sha = self.git(self.frontend, "rev-parse", "HEAD")
+        self.write_knowledge(self.frontend, "frontend", "e" * 64)
+        with self.assertRaisesRegex(RuntimeError, "merged knowledge"):
+            self.verify("frontend", sha, "e" * 64)
+
+    def test_committed_knowledge_ignores_dirty_worktree_and_other_repository(self):
+        sha = self.git(self.frontend, "rev-parse", "HEAD")
+        (self.frontend / "docs/agent-knowledge/testing-guide.md").write_text("uncommitted")
+        (self.backend / "docs/agent-knowledge/index.yaml").write_text("invalid")
+        self.assertTrue(self.verify("frontend", sha))
+
+    def test_exact_commit_is_verified_even_after_checkout_moves(self):
+        sha = self.git(self.frontend, "rev-parse", "HEAD")
+        self.write_knowledge(self.frontend, "frontend", "e" * 64)
+        self.commit(self.frontend)
+        self.assertTrue(self.verify("frontend", sha))
+
+    def test_backend_cannot_borrow_frontend_shared_candidate(self):
+        self.write_knowledge(self.frontend, "frontend", "e" * 64, shared=True)
+        self.commit(self.frontend)
+        sha = self.git(self.backend, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(RuntimeError, "merged knowledge"):
+            self.verify("backend", sha, "e" * 64)
+
+    def test_valid_backend_and_shared_frontend_commits(self):
+        self.assertTrue(self.verify("backend", self.git(self.backend, "rev-parse", "HEAD")))
+        self.write_knowledge(self.frontend, "frontend", "e" * 64, shared=True)
+        self.assertTrue(self.verify("frontend", self.commit(self.frontend), "e" * 64))
+
+    def test_missing_commit_or_candidate_is_rejected(self):
+        for sha, candidate in (("f" * 40, self.candidate),
+                               (self.git(self.frontend, "rev-parse", "HEAD"), "e" * 64)):
+            with self.subTest(sha=sha, candidate=candidate):
+                with self.assertRaisesRegex(RuntimeError, "merged knowledge"):
+                    self.verify("frontend", sha, candidate)
+
+    def test_committed_symlink_cannot_supply_knowledge_bytes(self):
+        doc = self.frontend / "docs/agent-knowledge/testing-guide.md"
+        target = doc.with_name("symlink-target.md")
+        doc.rename(target)
+        doc.symlink_to(target.name)
+        sha = self.commit(self.frontend)
+        with self.assertRaisesRegex(RuntimeError, "merged knowledge"):
+            self.verify("frontend", sha)
 
 
 class KnowledgeCurationRecoveryTests(unittest.TestCase):

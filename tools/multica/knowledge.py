@@ -60,6 +60,25 @@ _SECRET_PATTERNS = (
 )
 _BOOTSTRAP_DESIGN_PATH = "docs/superpowers/specs/2026-08-31-eventra-repository-knowledge-loop-design.md"
 _BOOTSTRAP_DESIGN_COMMIT = "32a150dfa"
+# SHA-256 of each entire seed entry's canonical JSON (sorted keys, compact,
+# UTF-8). Frozen from frontend 9847b2f2e and backend 5128c7cd1 initial seeds.
+# Current backend invariants has since migrated to delivery evidence; its old
+# exact seed remains readable for historical checkouts, not arbitrary updates.
+# This lives in control code, outside the curator's documentation-only boundary.
+_BOOTSTRAP_SEEDS = {
+    "frontend-repository-map": "62894f99a5f9a6f9f1e9baf1481deeed78c53c6c4d31a370a829bfd88c287277",
+    "frontend-architecture": "66782ba392b2a480591d5358264bea0e36b3b49f4fa15bf2fbaa81c24fbbe021",
+    "frontend-invariants": "50f747e94a74c61eea13eb9af9d13451c3bca04a1fe74dd476cdce5b1be45abe",
+    "frontend-known-pitfalls": "281ec9a9d9f1e3d331031cda70e5520606bb47e52f01cde499c87d88db6e4c82",
+    "frontend-testing-guide": "4496f879a7cd996d3dc354ce60dec8e576ab671628085284e5244f6413840db4",
+    "eventra-system-map": "c60487283058a5434e95931486e8717b5075fb2efd993be6a57a80f2748a4fbc",
+    "eventra-dependency-graph": "bf535c9a634df0e2d55193a1db7c716c92d7c1269fa5a9e0c82e1a13d777d391",
+    "backend-repository-map": "c880077b0d9e691de89721a34b67185331ef139d186c8f383c991dd285ded670",
+    "backend-architecture": "c96ff07e58fd23ac0cd70a340110a7f7ecf3ca219222eb2ee326bcee36c84da0",
+    "backend-invariants": "8cf55f87e35e1f62746eb2fa426943249930cfd9b00a8739e9897113a4904389",
+    "backend-known-pitfalls": "e75466a761130247aa2f50085ae1bc4556364a17d4d6494fa0a64d4a8fa3820c",
+    "backend-testing-guide": "10e9455c012c8e0deabca3e80be10925a6b90a4f68c3646c2becf85c07c8be66",
+}
 _CANDIDATE_FENCE = "eventra-knowledge-candidate-v1"
 _CANDIDATE_BLOCK = re.compile(
     rf"(?m)^```{re.escape(_CANDIDATE_FENCE)}\n(?P<body>.*?)\n```[ \t]*$",
@@ -243,6 +262,19 @@ def _parse_entry(raw: Any, root: Path, owner_repository: str | None, shared_cano
         design_commit = provenance["design_commit"]
         if design_path != _BOOTSTRAP_DESIGN_PATH or design_commit != _BOOTSTRAP_DESIGN_COMMIT:
             _invalid()
+        try:
+            fingerprint = hashlib.sha256(json.dumps(
+                raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).encode("utf-8")).hexdigest()
+        except (TypeError, ValueError):
+            _invalid()
+        owner = "frontend" if scope == "cross_repo" else scope
+        if (
+            _BOOTSTRAP_SEEDS.get(knowledge_id) != fingerprint
+            or (owner_repository is not None and owner_repository != owner)
+            or shared_canonical != (scope == "cross_repo")
+        ):
+            _invalid()
     else:
         if set(provenance) != {
             "kind", "source_issue", "source_comment_uuid",
@@ -411,11 +443,7 @@ def build_context_receipt(
     ):
         raise ValueError("invalid context receipt")
     verified_set = set(verified_ids)
-    verified_set.update(
-        item.knowledge_id
-        for item in selected
-        if any(candidate_sha == item.last_verified_sha for _, candidate_sha in shas)
-    )
+    # Historical freshness is not an agent's task-time verification receipt.
     verified = tuple(item.knowledge_id for item in selected if item.knowledge_id in verified_set)
     receipt = ContextReceipt(
         schema_version=1,
@@ -1845,6 +1873,69 @@ def reconcile_knowledge_pr(
     return replace(merged, status="verified" if verified else "needs_human")
 
 
+def _committed_knowledge_entries(
+    root: Path, repository: str, commit_sha: str,
+) -> tuple[KnowledgeIndexEntry, ...]:
+    """Read raw Git blobs, never the index, worktree, or export filters."""
+    root = root.resolve(strict=True)
+
+    def git(*args: str) -> bytes:
+        completed = subprocess.run(
+            ["git", "--no-replace-objects", "-C", str(root), *args],
+            capture_output=True, check=False, timeout=30,
+        )
+        if completed.returncode != 0:
+            raise ValueError("unavailable knowledge object")
+        return completed.stdout
+
+    if git("cat-file", "-t", commit_sha).strip() != b"commit":
+        raise ValueError("not a knowledge commit")
+    directories = ["docs/agent-knowledge"]
+    if repository == "frontend":
+        directories.append("docs/delivery-knowledge")
+
+    def blob(relative_path: str) -> bytes:
+        path = _safe_relative(relative_path)
+        if not any(path.startswith(directory + "/") for directory in directories):
+            raise ValueError("noncanonical knowledge path")
+        record = git("ls-tree", "-z", commit_sha, "--", ":(literal)" + path)
+        fields = record.rstrip(b"\0").split(b"\t")
+        if len(fields) != 2 or fields[1] != path.encode("utf-8"):
+            raise ValueError("missing knowledge blob")
+        metadata = fields[0].split()
+        if (len(metadata) != 3 or metadata[0] not in {b"100644", b"100755"}
+                or metadata[1] != b"blob"):
+            raise ValueError("nonregular knowledge blob")
+        return git("cat-file", "blob", metadata[2].decode("ascii"))
+
+    # Reuse the strict YAML/digest/provenance validator on an immutable snapshot.
+    with tempfile.TemporaryDirectory(prefix="eventra-knowledge-commit-") as directory:
+        snapshot = Path(directory)
+        indexes = []
+        for canonical in directories:
+            index = snapshot / canonical / "index.yaml"
+            index.parent.mkdir(parents=True, exist_ok=True)
+            index.write_bytes(blob(canonical + "/index.yaml"))
+            value = _read_yaml(index)
+            if not isinstance(value, dict) or not isinstance(value.get("entries"), list):
+                _invalid()
+            for item in value["entries"]:
+                if not isinstance(item, dict):
+                    _invalid()
+                path = _safe_relative(item.get("relative_path"))
+                content = blob(path)
+                destination = snapshot / path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(content)
+            indexes.append(index)
+        entries = tuple(
+            entry for index in indexes for entry in load_index(index, snapshot, repository)
+        )
+        if len({entry.knowledge_id for entry in entries}) != len(entries):
+            _invalid()
+        return entries
+
+
 def verify_merged_knowledge(
     repository: str,
     merge_sha: str,
@@ -1853,7 +1944,7 @@ def verify_merged_knowledge(
     frontend_root: Path,
     backend_root: Path,
 ) -> bool:
-    """Verify the canonical indexes at the exact locally checked-out merge SHA."""
+    """Verify target-owned canonical knowledge in the exact Git commit tree."""
     if (
         repository not in _REPOSITORIES
         or not isinstance(merge_sha, str)
@@ -1866,20 +1957,8 @@ def verify_merged_knowledge(
         raise ValueError("invalid merged knowledge")
     target_root = frontend_root if repository == "frontend" else backend_root
     try:
-        completed = subprocess.run(
-            ["git", "-C", str(target_root.resolve(strict=True)), "rev-parse", "HEAD"],
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        raise RuntimeError("merged knowledge verification failed") from None
-    if completed.returncode != 0 or completed.stdout.strip() != merge_sha:
-        raise RuntimeError("merged knowledge verification failed")
-    try:
-        entries = verify_indexes(frontend_root, backend_root)
-    except ValueError:
+        entries = _committed_knowledge_entries(target_root, repository, merge_sha)
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
         raise RuntimeError("merged knowledge verification failed") from None
     matches = [
         item
