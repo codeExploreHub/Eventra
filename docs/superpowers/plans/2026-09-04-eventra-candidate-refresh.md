@@ -336,6 +336,8 @@ self.assertNotIn("content", manifest[0])
 `execute_refresh(api: RefreshAPI, git: RefreshGit, parent: str, request_uuid: str, grant_uuid: str, expected_action_key: str) -> RefreshExecutionResult`。
 本任务实现 reserved/child_initialized/child_dispatched；后续 publish 路径 Task7 接上。
 
+**分批执行状态（2026-09-05，Task 5A）：本地暂停登记完成。** `stage_refresh_request` 在 workspace+parent 非阻塞锁内只写固定四键前缀，每次写入均以 4B 的 baseline/revision 证明前后读回；写前/写后失败可安全重试，同值重放为 no-op。生产适配器仅增加受限 `set_metadata` 封装，尚未增加 status/child/run 写入，未接 CLI、未触碰 live。证据见 `2026-09-05-eventra-candidate-refresh-batch-3c.md`。Task 5B 的 reserved、child 创建/初始化/启动仍未实现，因此 Task 5 整体保持未完成。
+
 另定义 `stage_refresh_request(api: RefreshAPI, parent: str, request: RefreshRequest) -> RefreshExecutionResult`，仅用于显式获准的暂停登记：父任务保持 blocked，写入 version/merge_permission=hold/request_digest 与规范 request envelope，不创建 child、消费 grant 或更新 PR。新增持久键 `eventra.refresh.request` 保存 envelope；这是待授权意图，不是 reservation。写入前提必须验证 source/assignment/Stage1 状态及无其他运行；缺 grant 只允许此暂停登记，不允许执行刷新。Core 对完整等待授权意图返回 wait，对登记半途字段组合保持 fail-closed，不能回退旧 gate 路径。
 
 新增 API 写方法：`set_metadata(issue,key,value)`, `set_status(issue,status)`,
@@ -356,7 +358,7 @@ def mutate(self, operation, args, apply):
 ```
 
 - [ ] 首测 `test_duplicate_create_ack_loss_recovers_same_child`：create 成功后抛错，第二次执行必须找到原 child 且 create 总数=1；旧 source evidence JSON 与原值完全相等。Run `python3 -B -m unittest tools.multica.tests.test_refresh_executor -v` 记录 RED。
-- [ ] 执行本机锁用 `fcntl.flock(LOCK_EX|LOCK_NB)`，锁文件放 Git common-dir 的刷新专用目录，key 为 workspace+parent 的摘要；锁覆盖整个外部写序列，不依赖未合并 runtime_guard。不同 action 同 parent 也互斥。锁描述符随进程退出释放；不可由清理文件伪造 stale 解锁。
+- [x] 执行本机锁用 `fcntl.flock(LOCK_EX|LOCK_NB)`，锁文件放 Git common-dir 的刷新专用目录，key 为 workspace+parent 的摘要；锁覆盖整个外部写序列，不依赖未合并 runtime_guard。不同 action 同 parent 也互斥。锁描述符随进程退出释放；不可由清理文件伪造 stale 解锁。
 - [ ] 先测试暂停登记和缺 grant 时的唤醒：Core/Watcher 不能创建普通 gate 或恢复普通 Lead 动作。暂停登记各写入前缀只能由相同 request 恢复；不同 digest 不可覆盖。request/grant 评论 UUID 后续由实际读回绑定，不能预先猜测。
 - [ ] 先校验精确 request/grant 与单一 Lead，再写并读回 reserved；初始化 feature/request/grant/hold 字段仅允许已知写入前缀。无活动 child 前提只用于首次入口，恢复时改为检查恰好一个当前 child/允许的 run，而非拒绝自身已创建的 child。
 - [ ] child 必须 `--status backlog --stage 2` 并赋 Engineer/Frontend Project；写 kind=refresh、attempt=0、target=repository:frontend、role=frontend_engineer、creation_action、source SHA、managed PR 与 request digest。每个字段读回；未知额外 phase/refresh 字段阻断。完整初始化后写父 next_stage=3/last_action 和 in_progress，最后才启动 child。

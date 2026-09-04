@@ -7,9 +7,12 @@ integration; constructing RefreshScope is not itself human deployment approval.
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import os
 import re
 import subprocess
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import quote
@@ -25,6 +28,14 @@ class RefreshScope:
     profile: str
     workspace_id: str
     approved_control_sha: str
+
+
+@dataclass(frozen=True)
+class RefreshExecutionResult:
+    action_key: str
+    status: str
+    mutation_count: int
+    child_identifier: str
 
 
 def _need(condition, reason):
@@ -49,6 +60,43 @@ class RefreshAPI:
         self._scope()
         return self.runner.run([*args, "--output", "json", "--profile", self.scope.profile,
                                 "--workspace-id", self.scope.workspace_id])
+
+    @contextmanager
+    def parent_lock(self, parent):
+        """Non-blocking process lock scoped to the configured workspace and parent."""
+        self._scope()
+        c._match(parent, c._ISSUE)
+        result = subprocess.run(
+            ["git", "--no-replace-objects", "-c", "core.fsmonitor=false",
+             "rev-parse", "--git-common-dir"],
+            cwd=self.control_root, text=True, capture_output=True, timeout=15,
+        )
+        _need(result.returncode == 0, "control common directory unavailable")
+        common = Path(result.stdout.strip())
+        if not common.is_absolute():
+            common = (self.control_root / common).resolve()
+        _need(common.is_dir(), "control common directory unavailable")
+        lock_dir = common / "eventra-refresh-locks"
+        lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        name = hashlib.sha256((self.scope.workspace_id + "\0" + parent).encode()).hexdigest() + ".lock"
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(lock_dir / name, flags, 0o600)
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError("refresh authority: parent executor lock is busy") from None
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    def set_metadata(self, issue, key, value):
+        c._match(issue, c._ISSUE)
+        _need(type(key) is str and key.startswith(c.REFRESH_PREFIX), "invalid refresh metadata key")
+        c._size(value, c.MAX_COMMENT_BYTES)
+        return self._read(["issue", "metadata", "set", issue, "--key", key,
+                           "--value", value, "--type", "string"])
 
     def _tool(self):
         self._scope()
@@ -251,3 +299,41 @@ def load_refresh_snapshot(runner, github, parent, *, control_root=None, scope=No
     """No ambient profile or request-supplied deployment approval fallback."""
     _need(control_root is not None, "explicit control checkout required")
     return RefreshAPI(runner, github, control_root, scope=scope, prerequisite_pr=prerequisite_pr).snapshot(parent)
+
+
+def stage_refresh_request(api, parent: str, request: c.RefreshRequest) -> RefreshExecutionResult:
+    """Persist only the four-key pause prefix, reconciling every observed effect."""
+    payload = c._request(request)
+    _need(parent == payload["parent"]["identifier"], "request parent mismatch")
+    envelope = c.canonical_json({"payload": payload, "digest": request.digest,
+                                 "staging_ref": request.staging_ref})
+    prefix = [
+        (c.REFRESH_PREFIX + "request", envelope),
+        (c.REFRESH_PREFIX + "version", "1"),
+        (c.REFRESH_PREFIX + "merge_permission", "hold"),
+        (c.REFRESH_PREFIX + "request_digest", request.digest),
+    ]
+    mutations = 0
+    with api.parent_lock(parent):
+        while True:
+            before = c.validate_initial_refresh_progress(request, api.snapshot(parent))
+            _need(before.metadata_writes <= len(prefix), "request staging already passed pause prefix")
+            _need(before.metadata_writes == len(prefix) or before.comment_writes == 0,
+                  "refresh comments precede complete pause metadata")
+            if before.metadata_writes == len(prefix):
+                return RefreshExecutionResult(c.refresh_action(request), "request_staged", mutations, "")
+            key, value = prefix[before.metadata_writes]
+            failure = None
+            try:
+                api.set_metadata(parent, key, value)
+            except RuntimeError as exc:
+                failure = exc
+            after = c.validate_initial_refresh_progress(request, api.snapshot(parent))
+            if (after.metadata_writes, after.comment_writes) == (
+                    before.metadata_writes + 1, before.comment_writes):
+                mutations += 1
+                continue
+            if (after.metadata_writes, after.comment_writes) == (
+                    before.metadata_writes, before.comment_writes) and failure is not None:
+                raise failure
+            raise RuntimeError("refresh authority: metadata effect was not uniquely observed")

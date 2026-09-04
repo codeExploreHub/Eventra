@@ -7,6 +7,7 @@ import importlib.util
 import subprocess
 import tempfile
 import unittest
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
@@ -496,11 +497,111 @@ class SnapshotTests(unittest.TestCase):
                                        prerequisite_pr=self.runner.payload["prerequisite"]["pr_url"]).snapshot("PRO-900")
             self.assertEqual(self.runner.calls, [])
 
+    def test_parent_executor_lock_is_nonblocking_and_parent_scoped(self):
+        with self.api.parent_lock("PRO-900"):
+            with self.assertRaisesRegex(RuntimeError, "lock is busy"):
+                with self.api.parent_lock("PRO-900"):
+                    self.fail("same parent lock unexpectedly re-entered")
+
     def test_snapshot_does_not_share_mutable_state(self):
         snapshot = self.snapshot()
         state = snapshot.state()
         state["parent"]["revision"] = 99
         self.assertEqual(snapshot.state()["parent"]["revision"], 7)
+
+
+class MemoryRefreshAPI:
+    """Task-owned write fake with the observed metadata revision semantics."""
+
+    def __init__(self):
+        from tools.multica.tests.test_candidate_refresh import refresh_snapshot_fixture
+        self.request, self.state = refresh_snapshot_fixture(state="entry")
+        self.writes, self.write_index = [], 0
+        self.fail_at, self.fail_after = None, False
+
+    def parent_lock(self, parent):
+        if parent != self.state["parent"]["identifier"]:
+            raise RuntimeError("wrong parent lock")
+        return nullcontext()
+
+    def snapshot(self, parent):
+        if parent != self.state["parent"]["identifier"]:
+            raise RuntimeError("unknown parent")
+        return contracts.RefreshSnapshot(contracts.canonical_json(copy.deepcopy(self.state)))
+
+    def set_metadata(self, issue, key, value):
+        if issue != self.state["parent"]["identifier"]:
+            raise RuntimeError("unknown issue")
+        self.write_index += 1
+        if self.fail_at == self.write_index and not self.fail_after:
+            raise RuntimeError("injected before effect")
+        if self.state["metadata"].get(key) != value:
+            self.state["metadata"][key] = value
+            self.state["parent"]["metadata"] = copy.deepcopy(self.state["metadata"])
+            self.state["parent"]["revision"] += 1
+            self.writes.append(("set_metadata", issue, key, value))
+        if self.fail_at == self.write_index and self.fail_after:
+            raise RuntimeError("injected after effect")
+
+
+class StageRequestTests(unittest.TestCase):
+    def test_stage_request_writes_exact_four_key_prefix_and_is_idempotent(self):
+        api = MemoryRefreshAPI()
+        result = self.module().stage_refresh_request(api, "PRO-900", api.request)
+        self.assertEqual((result.status, result.mutation_count, result.child_identifier),
+                         ("request_staged", 4, ""))
+        self.assertEqual([write[2] for write in api.writes], [
+            "eventra.refresh.request", "eventra.refresh.version",
+            "eventra.refresh.merge_permission", "eventra.refresh.request_digest"])
+        progress = contracts.validate_initial_refresh_progress(api.request, api.snapshot("PRO-900"))
+        self.assertEqual((progress.metadata_writes, progress.comment_writes), (4, 0))
+        replay = self.module().stage_refresh_request(api, "PRO-900", api.request)
+        self.assertEqual((replay.status, replay.mutation_count, len(api.writes)),
+                         ("request_staged", 0, 4))
+
+    def test_stage_request_recovers_every_metadata_failure_boundary(self):
+        for fail_at in range(1, 5):
+            for fail_after in (False, True):
+                api = MemoryRefreshAPI()
+                api.fail_at, api.fail_after = fail_at, fail_after
+                with self.subTest(fail_at=fail_at, fail_after=fail_after):
+                    if fail_after:
+                        self.module().stage_refresh_request(api, "PRO-900", api.request)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "before effect"):
+                            self.module().stage_refresh_request(api, "PRO-900", api.request)
+                        api.fail_at = None
+                        self.module().stage_refresh_request(api, "PRO-900", api.request)
+                    progress = contracts.validate_initial_refresh_progress(
+                        api.request, api.snapshot("PRO-900"))
+                    self.assertEqual((progress.metadata_writes, progress.comment_writes), (4, 0))
+                    self.assertEqual(len(api.writes), 4)
+                    self.assertEqual(api.state["parent"]["revision"], 11)
+
+    def test_stage_request_never_overwrites_conflict_or_early_comment(self):
+        api = MemoryRefreshAPI()
+        api.state["metadata"]["eventra.refresh.request"] = "different"
+        api.state["parent"]["metadata"] = copy.deepcopy(api.state["metadata"])
+        api.state["parent"]["revision"] += 1
+        with self.assertRaises(ValueError):
+            self.module().stage_refresh_request(api, "PRO-900", api.request)
+        self.assertEqual(api.writes, [])
+
+        api = MemoryRefreshAPI()
+        envelope = {"payload": api.request.payload(), "digest": api.request.digest,
+                    "staging_ref": api.request.staging_ref}
+        record = comment_record(12, block("request", envelope), author=7, issue=uid(2))
+        api.state["comments"].append(asdict(contracts.RefreshComment(
+            uid(2), uid(12), uid(7), "agent", 1, record["content"])))
+        api.state["comment_manifest"] = contracts.comment_manifest([record], uid(2))
+        api.state["parent"]["revision"] += 1
+        with self.assertRaises(ValueError):
+            self.module().stage_refresh_request(api, "PRO-900", api.request)
+        self.assertEqual(api.writes, [])
+
+    @staticmethod
+    def module():
+        return importlib.import_module("tools.multica.refresh_executor")
 
 
 if __name__ == "__main__":
