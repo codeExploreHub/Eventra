@@ -215,6 +215,8 @@ def test_reversed_parents_are_rejected(self):
 
 ## Task 3: 读取完整 authority 与精确请求预检
 
+**执行状态（2026-09-04）：本地实现与回归完成。** 提交 `effadc49f09930ce94a04b19dd50500899ebcba1`；18 项新增只读边界测试先 RED 后 GREEN。部署审批记录与 CLI 配置接线仍归 Task 8，不把调用者构造的 scope 当作部署批准。详见 `2026-09-04-eventra-candidate-refresh-batch-2.md`。
+
 **Files:** Create `refresh_executor.py`, `tests/test_refresh_executor.py`；Modify `candidate_refresh.py`。
 
 **Interfaces:** 在 candidate_refresh 定义
@@ -244,6 +246,8 @@ def test_no_api_revision_is_not_assumed_immutable(self):
 - [ ] 测试所有入口负例和跨 scope grant；记录 reads-only fake 的 writes 始终为空。Run 模块 GREEN；Commit：`feat(multica): bind refresh admission to authoritative snapshots`。
 
 ## Task 4: 纯状态机和旧 workflow 的防护接入
+
+**执行状态（2026-09-04）：本地实现与回归完成。** 提交 `3df04fa8f5c30de7a583702ff90d7ee8934f9313`；本批最终 Python 全量 584 项通过。完成纯状态建议、已采纳历史校验、旧 planner 绑定、fresh Stage 3 和持续 merge hold；Task 5–8 的真实写入、恢复、完成入口、Watcher/CLI 全面接线仍未完成。
 
 **Files:** Modify `candidate_refresh.py`, `workflow.py`, `tests/test_candidate_refresh.py`, `tests/test_workflow.py`。
 
