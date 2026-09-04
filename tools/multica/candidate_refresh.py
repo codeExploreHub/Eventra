@@ -10,7 +10,7 @@ import hashlib
 import json
 import re
 import uuid
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, fields
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -324,3 +324,131 @@ def parse_prepared(comment: RefreshComment, request: RefreshRequest, child_id: s
     return PreparedCandidate(request.digest, child_id, value["source_sha"], value["prerequisite_sha"],
                              value["target_sha"], value["tree_sha"], comment.comment_uuid,
                              hashlib.sha256(comment.content.encode("utf-8")).hexdigest(), request.staging_ref)
+
+
+@dataclass(frozen=True)
+class RefreshSnapshot:
+    """Immutable authority projection produced by RefreshAPI, never by a request."""
+
+    canonical_state: str
+
+    def state(self) -> dict[str, Any]:
+        return _object(_load_json(self.canonical_state, 4_194_304),
+                       "parent metadata children runs comments pr prerequisite assignment tool")
+
+
+def _snapshot(snapshot: RefreshSnapshot) -> dict[str, Any]:
+    _require(type(snapshot) is RefreshSnapshot, "missing refresh authority")
+    state = snapshot.state()
+    _require(canonical_json(state) == snapshot.canonical_state, "noncanonical refresh authority")
+    for key in ("parent", "metadata", "pr", "prerequisite", "assignment", "tool"):
+        _require(type(state[key]) is dict, "invalid refresh authority")
+    for key in ("children", "runs", "comments"):
+        _require(type(state[key]) is list, "invalid refresh authority")
+    _require(all(type(k) is str and type(v) is str for k, v in state["metadata"].items()))
+    return state
+
+
+def _grant_in_state(request: RefreshRequest, state: dict, grant: RefreshComment) -> None:
+    validate_grant(grant, request)
+    matches = [item for item in state["comments"] if item.get("comment_uuid") == grant.comment_uuid]
+    _require(matches == [asdict(grant)], "grant is not the authoritative scoped comment")
+    granting = []
+    for record in state["comments"]:
+        try:
+            candidate = RefreshComment(**record)
+            validate_grant(candidate, request)
+        except (ValueError, TypeError):
+            continue
+        granting.append(candidate.comment_uuid)
+    _require(granting == [grant.comment_uuid], "ambiguous refresh grants")
+
+
+def _source_authority(payload: dict, state: dict) -> dict:
+    parent, source, assignment = payload["parent"], payload["source"], payload["assignment"]
+    children = state["children"]
+    matches = [child for child in children if child.get("detail", {}).get("id") == source["child_id"]]
+    _require(len(matches) == 1, "missing or duplicate source child")
+    child = _object(matches[0], "detail metadata evidence")
+    detail, metadata, evidence = child["detail"], child["metadata"], child["evidence"]
+    _require(type(detail) is dict and type(metadata) is dict and type(evidence) is dict, "invalid source")
+    expected = {"id": source["child_id"], "identifier": source["child_identifier"],
+                "parent_issue_id": parent["id"], "workspace_id": payload["workspace_id"],
+                "stage": 1, "status": "done", "project_id": assignment["project_id"],
+                "assignee_type": "agent", "assignee_id": assignment["engineer_id"]}
+    _require(all(type(detail.get(k)) is type(v) and detail[k] == v for k, v in expected.items()),
+             "source child authority mismatch")
+    expected_metadata = {"eventra.workflow.version": "2", "eventra.phase.kind": "implementation",
+                         "eventra.phase.attempt": "0", "eventra.phase.result": "pass",
+                         "eventra.phase.sha.frontend": source["sha"], "eventra.phase.pr": payload["pr"]["url"],
+                         "eventra.phase.evidence_comment": source["evidence_uuid"],
+                         "eventra.phase.creation_action": parent["last_action"],
+                         "eventra.phase.target": "repository:frontend", "eventra.phase.role": "frontend_engineer"}
+    _require(all(metadata.get(k) == v for k, v in expected_metadata.items()), "source metadata mismatch")
+    _require(not any(k.startswith(("eventra.repair.", "eventra.refresh.")) for k in metadata)
+             and "eventra.phase.sha.backend" not in metadata, "source provenance mismatch")
+    allowed = set(expected_metadata) | {"eventra.phase.failure_repositories"}
+    _require(not any(k.startswith(("eventra.phase.", "eventra.workflow.")) and k not in allowed for k in metadata),
+             "unknown source authority field")
+    _require(metadata.get("eventra.phase.failure_repositories", "[]") == "[]", "source failure ownership")
+    try:
+        comment = RefreshComment(**evidence)
+    except TypeError:
+        raise ValueError("invalid source evidence") from None
+    _comment(comment, source["child_id"], "agent")
+    _require(comment.author_id == assignment["engineer_id"] and comment.comment_uuid == source["evidence_uuid"]
+             and comment.revision == source["evidence_revision"]
+             and hashlib.sha256(comment.content.encode()).hexdigest() == source["evidence_digest"],
+             "source evidence changed")
+    return child
+
+
+def _shared_authority(payload: dict, state: dict) -> None:
+    parent, assignment = state["parent"], state["assignment"]
+    expected = payload["assignment"]
+    _require(assignment.get("workspace_id") == payload["workspace_id"]
+             and all(assignment.get(k) == v for k, v in expected.items()), "assignment authority mismatch")
+    _require(parent.get("workspace_id") == payload["workspace_id"]
+             and parent.get("id") == payload["parent"]["id"]
+             and parent.get("identifier") == payload["parent"]["identifier"]
+             and parent.get("parent_issue_id") is None
+             and parent.get("project_id") == expected["project_id"]
+             and parent.get("assignee_type") == "squad"
+             and parent.get("assignee_id") == expected["squad_id"], "parent assignment mismatch")
+    _require(state["tool"] == {"sha": payload["control_tool_sha"], "git_version": payload["git_version"]},
+             "control tool identity mismatch")
+    pr = state["pr"]
+    _require(all(pr.get(k) == v for k, v in payload["pr"].items())
+             and pr.get("state") == "open" and pr.get("merged") is False, "managed PR identity mismatch")
+    prerequisite = state["prerequisite"]
+    _require(all(prerequisite.get(k) == v for k, v in payload["prerequisite"].items())
+             and prerequisite.get("merged") is True
+             and prerequisite.get("ancestor_sha") == payload["prerequisite"]["merge_sha"],
+             "prerequisite or base identity mismatch")
+    _source_authority(payload, state)
+
+
+def admit_refresh(request: RefreshRequest, snapshot: RefreshSnapshot, grant: RefreshComment) -> None:
+    """First entry only. Resumption must validate an exact durable projection separately."""
+    payload, state = _request(request), _snapshot(snapshot)
+    _shared_authority(payload, state)
+    _grant_in_state(request, state, grant)
+    parent, expected = state["parent"], payload["parent"]
+    _require(type(parent.get("revision")) is int and parent["revision"] == expected["revision"]
+             and parent.get("status") == expected["status"], "frozen parent revision or status changed")
+    metadata = state["metadata"]
+    required = {"eventra.workflow.version": "2", "eventra.workflow.classification": "frontend-only",
+                "eventra.workflow.attempt": "0", "eventra.workflow.next_stage": "2",
+                "eventra.workflow.merge_state": "not_ready", "eventra.workflow.last_action": expected["last_action"],
+                "eventra.workflow.frontend_sha": payload["source"]["sha"]}
+    _require(all(metadata.get(k) == v for k, v in required.items()), "refresh entry metadata mismatch")
+    _require(not any(k.startswith(("eventra.refresh.", "eventra.repair.", "eventra.smoke."))
+                     or (k.startswith("eventra.workflow.") and k not in required) for k in metadata),
+             "refresh entry has reservations, consumption or unknown authority")
+    _require(len(state["children"]) == 1, "refresh requires a unique Stage 1 and no later children")
+    _require(state["pr"].get("head_sha") == payload["source"]["sha"], "managed head drift")
+    active = [run for run in state["runs"] if run.get("status") in
+              {"queued", "dispatched", "running", "waiting_local_directory"}]
+    _require(len(active) <= 1 and all(run.get("issue_id") == parent["id"]
+             and run.get("agent_id") == payload["assignment"]["lead_id"] for run in active),
+             "active child or nonunique Lead writer")
