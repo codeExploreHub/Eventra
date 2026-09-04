@@ -11,13 +11,14 @@ import json
 import re
 import uuid
 from dataclasses import asdict, dataclass, fields
+from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Any
 
 from .knowledge_contracts import ContextReceipt
 
 
-MAX_REQUEST_BYTES = 16_384
+MAX_REQUEST_BYTES = 3_072
 MAX_COMMENT_BYTES = 65_536
 STAGING_PREFIX = "refs/heads/eventra-refresh/"
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -131,9 +132,64 @@ def _branch(value: object) -> None:
                  for part in value.split("/")), "invalid refresh branch")
 
 
+def comment_manifest(records: object, issue_id: str) -> list[dict[str, object]]:
+    """Canonical immutable identities for one complete parent comment history."""
+    _uuid(issue_id)
+    _require(type(records) is list, "incomplete refresh comments")
+    required = {"id", "author_id", "author_type", "content", "revision", "type", "created_at"}
+    auxiliary = {"issue_id", "parent_id", "updated_at", "reply_count", "last_activity_at"}
+    result, seen = [], set()
+    for record in records:
+        _require(type(record) is dict and "revision" in record,
+                 "missing refresh comment revision")
+        _require(type(record) is dict and required <= set(record) <= required | auxiliary,
+                 "invalid refresh comment fields")
+        comment_id, parent_id = record["id"], record.get("parent_id")
+        _uuid(comment_id)
+        _require(comment_id not in seen, "duplicate refresh comment")
+        _uuid(record["author_id"])
+        _require(record.get("issue_id", issue_id) == issue_id, "cross-scope refresh comment")
+        _require(record["author_type"] in {"member", "agent"} and record["type"] == "comment",
+                 "invalid refresh comment identity")
+        _integer(record["revision"])
+        if parent_id is not None:
+            _uuid(parent_id)
+            _require(parent_id in seen, "incomplete refresh comment thread")
+        created_at = record["created_at"]
+        _require(type(created_at) is str, "invalid refresh comment time")
+        try:
+            parsed_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError("invalid refresh comment time") from None
+        _require(parsed_time.tzinfo is not None, "invalid refresh comment time")
+        content = _size(record["content"], MAX_COMMENT_BYTES)
+        if "reply_count" in record:
+            _require(type(record["reply_count"]) is int and record["reply_count"] >= 0,
+                     "invalid refresh reply count")
+        seen.add(comment_id)
+        result.append({"issue_id": issue_id, "comment_uuid": comment_id,
+                       "author_id": record["author_id"], "author_type": record["author_type"],
+                       "type": "comment", "revision": record["revision"], "parent_id": parent_id,
+                       "created_at": created_at,
+                       "content_digest": hashlib.sha256(content.encode("utf-8")).hexdigest()})
+    for record in records:
+        if "reply_count" in record:
+            descendants = {record["id"]}
+            for child in records:
+                if child.get("parent_id") in descendants:
+                    descendants.add(child["id"])
+            _require(record["reply_count"] == len(descendants) - 1,
+                     "incomplete refresh comment replies")
+    return sorted(result, key=lambda item: item["comment_uuid"])
+
+
+def comment_manifest_digest(records: object, issue_id: str) -> str:
+    return hashlib.sha256(canonical_json(comment_manifest(records, issue_id)).encode("utf-8")).hexdigest()
+
+
 def build_request(payload: dict[str, object]) -> RefreshRequest:
     """Validate the entire immutable request before deriving its ref name."""
-    value = _object(payload, "schema_version workspace_id parent source pr prerequisite assignment "
+    value = _object(payload, "schema_version workspace_id parent source pr prerequisite assignment baseline "
                     "refresh_stage refresh_generation staging_ref_prefix tree_transform "
                     "merge_permission control_tool_sha git_version")
     encoded = _size(canonical_json(value), MAX_REQUEST_BYTES)
@@ -147,6 +203,9 @@ def build_request(payload: dict[str, object]) -> RefreshRequest:
     _require(value["merge_permission"] == "hold")
     _require(type(value["git_version"]) is str and
              re.fullmatch(r"git version [0-9][A-Za-z0-9. ()_-]{0,127}", value["git_version"]) is not None)
+    baseline = _object(value["baseline"], "authority_digest comments_digest")
+    for digest in baseline.values():
+        _match(digest, _DIGEST)
     parent = _object(value["parent"], "id identifier revision stage attempt next_stage status merge_state last_action")
     _uuid(parent["id"])
     _match(parent["identifier"], _ISSUE)
@@ -185,7 +244,10 @@ def build_request(payload: dict[str, object]) -> RefreshRequest:
         _uuid(identity)
     _require(assignment["lead_id"] != assignment["engineer_id"])
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-    return RefreshRequest(encoded, digest, STAGING_PREFIX + digest)
+    staging_ref = STAGING_PREFIX + digest
+    _size(canonical_json({"payload": value, "digest": digest, "staging_ref": staging_ref}),
+          MAX_REQUEST_BYTES)
+    return RefreshRequest(encoded, digest, staging_ref)
 
 
 def parse_request(raw: object) -> RefreshRequest:
@@ -203,6 +265,32 @@ def _request(request: RefreshRequest) -> dict[str, Any]:
     checked = build_request(request.payload())
     _require(checked == request, "unvalidated refresh request")
     return checked.payload()
+
+
+def validate_metadata_budget(metadata: object, *, request: RefreshRequest | None = None) -> None:
+    """Conservative preflight; the server remains the final 8KB/50-key authority."""
+    _require(type(metadata) is dict and all(type(key) is str and type(value) is str
+                                            for key, value in metadata.items()),
+             "invalid refresh metadata map")
+    _require(len(metadata) <= 50, "refresh metadata exceeds key budget")
+    prospective = dict(metadata)
+    if request is not None:
+        payload = _request(request)
+        _require(len(payload["parent"]["identifier"]) <= 64
+                 and len(payload["source"]["child_identifier"]) <= 64,
+                 "refresh identifier exceeds budget")
+        envelope = canonical_json({"payload": payload, "digest": request.digest,
+                                   "staging_ref": request.staging_ref})
+        _size(envelope, MAX_REQUEST_BYTES)
+        current = prospective.get(REFRESH_PREFIX + "request")
+        _require(current in {None, envelope}, "different refresh request already stored")
+        prospective[REFRESH_PREFIX + "request"] = envelope
+    _require(len(prospective) <= 50, "refresh metadata exceeds key budget")
+    try:
+        encoded = json.dumps(prospective, sort_keys=True, ensure_ascii=True, allow_nan=False)
+    except (TypeError, ValueError, RecursionError):
+        raise ValueError("invalid refresh metadata map") from None
+    _require(len(encoded.encode("utf-8")) <= 6_144, "refresh metadata exceeds byte budget")
 
 
 def _comment(comment: RefreshComment, issue: str, author_type: str) -> None:
@@ -335,6 +423,55 @@ class RefreshSnapshot:
     def state(self) -> dict[str, Any]:
         return _object(_load_json(self.canonical_state, 4_194_304),
                        "parent metadata children runs comments pr prerequisite assignment tool")
+
+
+_ISSUE_DETAIL_FIELDS = frozenset({
+    "assignee_id", "assignee_type", "created_at", "creator_id", "creator_type",
+    "description", "due_date", "id", "identifier", "labels", "last_activity_at",
+    "metadata", "number", "parent_issue_id", "position", "priority", "project_id",
+    "properties", "revision", "stage", "start_date", "status", "status_category",
+    "title", "updated_at", "workspace_id",
+})
+_VOLATILE_DETAIL_FIELDS = frozenset({"metadata", "updated_at", "last_activity_at"})
+
+
+def authority_projection(snapshot: RefreshSnapshot) -> dict[str, object]:
+    """Return the complete stable authority that a new refresh request freezes."""
+    state = _snapshot(snapshot)
+    parent = state["parent"]
+    _require(set(parent) == _ISSUE_DETAIL_FIELDS, "unknown parent authority field")
+    _require(parent["metadata"] == state["metadata"], "parent metadata echo conflict")
+    _require(parent["parent_issue_id"] is None and parent["status"] == "blocked",
+             "refresh freeze requires blocked parent")
+    _require(len(state["children"]) == 1, "refresh freeze requires one source child")
+    source = _object(state["children"][0], "detail metadata evidence")
+    detail = source["detail"]
+    _require(type(detail) is dict and set(detail) == _ISSUE_DETAIL_FIELDS,
+             "unknown source authority field")
+    _require(detail["metadata"] == source["metadata"], "source metadata echo conflict")
+    _require(detail["parent_issue_id"] == parent["id"] and detail["stage"] == 1
+             and detail["status"] == "done", "invalid source freeze state")
+    _require(type(source["metadata"]) is dict and
+             all(type(k) is str and type(v) is str for k, v in source["metadata"].items()),
+             "invalid source metadata")
+    _require(type(source["evidence"]) is dict, "missing source evidence")
+    _require(not any(key.startswith(("eventra.refresh.", "eventra.repair.", "eventra.smoke."))
+                     for key in state["metadata"]), "refresh freeze has active reservation")
+    projection = {
+        "parent": {key: value for key, value in parent.items() if key not in _VOLATILE_DETAIL_FIELDS},
+        "metadata": state["metadata"],
+        "source": {
+            "detail": {key: value for key, value in detail.items() if key not in _VOLATILE_DETAIL_FIELDS},
+            "metadata": source["metadata"], "evidence": source["evidence"],
+        },
+        "assignment": state["assignment"], "pr": state["pr"],
+        "prerequisite": state["prerequisite"], "tool": state["tool"],
+    }
+    return _load_json(canonical_json(projection), 4_194_304)
+
+
+def authority_digest(snapshot: RefreshSnapshot) -> str:
+    return hashlib.sha256(canonical_json(authority_projection(snapshot)).encode("utf-8")).hexdigest()
 
 
 def _snapshot(snapshot: RefreshSnapshot) -> dict[str, Any]:

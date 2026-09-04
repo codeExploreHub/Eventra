@@ -283,6 +283,51 @@ def test_unadopted_refresh_cannot_open_gate(self):
 
 **执行状态（2026-09-04）：协议修订方向已获用户同意，书面补充待审阅。** 官方 v0.4.38 的评论创建也推进父 Issue revision；现有请求缺少冻结 authority/评论基线，无法证明请求与 grant 发布后的合法推进。不得用固定 `+2` 或 `revision >= old` 放宽。此前 584 项回归通过，但不覆盖真实评论创建副作用；Task 5/6 尚未实现。证据见 `2026-09-04-eventra-candidate-refresh-batch-3-preflight.md`，修订见 `../specs/2026-09-04-eventra-candidate-refresh-authority-design.md`。该书面补充获准后先补 Task 3/4 的基线契约与真实副作用测试，再执行下列初始化步骤；原步骤不能绕过新增基线与部署契约要求。
 
+### Task 4A: 冻结基线的纯协议与容量边界
+
+**执行状态（2026-09-05）：本地实现与回归完成。** 请求现已强制绑定两份基线摘要；评论 manifest、完整稳定 authority 投影和元数据容量预检已实现。首个请求测试与评论/authority/容量测试均先 RED 后 GREEN；相关 76 项及 Python 全量 590 项通过。Task 4B 尚未实现，因此尚不能接受评论导致的合法 revision 推进，也不存在 live 写入口。
+
+**Files:** Modify `candidate_refresh.py`, `tests/test_candidate_refresh.py`。
+
+**Interfaces:** `comment_manifest(records, issue_id) -> list[dict[str, object]]`；
+`comment_manifest_digest(records, issue_id) -> str`；
+`authority_projection(snapshot) -> dict[str, object]`；
+`authority_digest(snapshot) -> str`；
+`validate_metadata_budget(metadata, *, request=None) -> None`。
+
+- [x] Request payload 增加精确 `baseline={authority_digest,comments_digest}`，两值均为 SHA-256；缺失、额外、错类型、非规范摘要拒绝。request envelope UTF-8 上限 3072 bytes。
+- [x] 先写 `BaselineContractTests.test_request_baseline_participates_in_digest`，用测试内独立 canonical JSON 计算期望 digest；运行单测，确认因未知 baseline 字段 RED。
+- [x] 最小实现 request baseline 校验并更新显式 fixture；运行 Request/Grant/Prepared/Git 契约回归 GREEN。
+- [x] 写评论清单 RED：完整记录规范成固定九字段，按 UUID 排序；正文只进入 content_digest。错 scope、未知字段、重复 UUID、缺 parent、错时间、折叠/分页输入拒绝。
+
+```python
+manifest = comment_manifest([root, reply], uid(2))
+self.assertEqual(manifest[0]["content_digest"], hashlib.sha256(b"old").hexdigest())
+self.assertNotIn("content", manifest[0])
+```
+
+- [x] 实现 strict manifest/digest；适配器在已有评论解析前复用它，不维护第二套宽松语义。Run GREEN。
+- [x] 写 authority 投影 RED：完整父/source detail、完整 metadata、assignment、PR/prerequisite/tool 均参与；只剔除三个活动/回显字段；未知 detail、echo metadata 冲突、非 blocked、非唯一 Stage 1 拒绝。
+- [x] 实现 canonical projection/digest；增加 metadata 整图 ASCII JSON 6144-byte、50-key、request 3072-byte 与 identifier 64 字符预算。峰值 fixture 必须验证，不截断/删除数据。Run candidate/executor/Git tests GREEN。
+- [x] Commit：`feat(multica): bind refresh requests to frozen authority baselines`。
+
+### Task 4B: 可信读取与评论 revision 前缀证明
+
+**Files:** Modify `refresh_executor.py`, `candidate_refresh.py`, `workflow.py`, `tests/test_refresh_executor.py`, `tests/test_candidate_refresh.py`, `tests/test_workflow.py`。
+
+**Interfaces:** `freeze_refresh_request(snapshot) -> RefreshRequest`；
+`InitialRefreshProgress(request, metadata_writes, comment_writes, request_comment, grant_comment)`；
+`validate_initial_refresh_progress(request, snapshot) -> InitialRefreshProgress`。
+
+- [ ] 严格 read fake 模拟官方副作用：新评论与 changed KV 各将 parent revision +1；相同 KV 重放为 no-op。注入同 revision 差额但不同正文/parent 字段，必须零写入拒绝。
+- [ ] 首个 RED 从 R0=7 执行四笔暂停 KV、request、grant、两个 UUID 绑定，验证 progress 为 M=6/K=2/current revision=15；不同内容但 revision 同为 15 拒绝。
+- [ ] 快照保存完整 comment manifest 与 detail echo 校验；`freeze_refresh_request` 只接受 blocked、无 feature/reservation、唯一源和合法单 Lead authority，并由双读结果生成两摘要。
+- [ ] `validate_initial_refresh_progress` 只接受固定 KV 前缀与 K=0/1/2；grant 无 request、评论出现在未完整暂停前缀、额外父评论、编辑/删除、旧评论充当新增均拒绝。
+- [ ] 重构首次 admission 使用 progress 证明，不保留 `revision >=`、固定 `+2` 或 caller 覆盖 revision 的旁路；旧普通 v2 行为不变。Run candidate/executor/workflow GREEN。
+- [ ] Commit：`feat(multica): prove refresh revision changes from exact writes`。
+
+完成 4A/4B 后才执行 Task 5。Task 5 每个 checkpoint 复用同一投影算法；任何写入前缀无法唯一逆向还原时停止。Task 8 仍需独立验证 pro-1 部署 mutation contract；本地 CLI 版本不构成启用许可。
+
 **Files:** Modify `refresh_executor.py`, `candidate_refresh.py`, `workflow.py`, `tests/test_refresh_executor.py`。
 
 **Interfaces:** `RefreshExecutionResult(action_key: str, status: str, mutation_count: int, child_identifier: str)`；

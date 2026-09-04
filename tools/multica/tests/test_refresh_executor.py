@@ -183,6 +183,7 @@ class SnapshotTests(unittest.TestCase):
 
     def test_comment_scope_author_revision_and_unknown_semantics_fail_closed(self):
         for change in ({"issue_id": uid(90)}, {"author_id": "member-1"}, {"revision": True},
+                       {"created_at": "yesterday"},
                        {"content_truncated": True}, {"folded_count": 1}, {"unexpected": True}):
             with self.subTest(change=change), self.assertRaises((ValueError, RuntimeError)):
                 self.api.parse_scoped_comment([dict(self.runner.grant, **change)], uid(10), uid(2))

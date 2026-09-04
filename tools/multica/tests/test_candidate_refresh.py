@@ -247,6 +247,7 @@ def request_payload():
                          "merge_sha": "d" * 40, "base_sha": "d" * 40},
         "assignment": {"project_id": uid(5), "squad_id": uid(6),
                        "lead_id": uid(7), "engineer_id": uid(8)},
+        "baseline": {"authority_digest": "1" * 64, "comments_digest": "2" * 64},
         "refresh_stage": 2, "refresh_generation": 1,
         "staging_ref_prefix": "refs/heads/eventra-refresh/",
         "tree_transform": "clean-two-parent-merge-v1", "merge_permission": "hold",
@@ -302,6 +303,20 @@ class ContractCase(unittest.TestCase):
 
 
 class RequestTests(ContractCase):
+    def test_request_baseline_participates_in_digest(self):
+        payload = request_payload()
+        expected = hashlib.sha256(encode(payload).encode()).hexdigest()
+
+        try:
+            request = self.api.build_request(payload)
+        except ValueError as exc:
+            self.fail(f"approved baseline was rejected: {exc}")
+
+        self.assertEqual(request.digest, expected)
+        changed = copy.deepcopy(payload)
+        changed["baseline"]["comments_digest"] = "3" * 64
+        self.assertNotEqual(self.api.build_request(changed).digest, expected)
+
     def test_request_digest_and_ref_bind_all_payload_bytes(self):
         expected = hashlib.sha256(encode(request_payload()).encode()).hexdigest()
         self.assertEqual(self.request.digest, expected)
@@ -320,7 +335,7 @@ class RequestTests(ContractCase):
         self.assertEqual(request.payload()["parent"]["revision"], 7)
 
     def test_extra_or_missing_fields_at_every_level_are_rejected(self):
-        for section in (None, "parent", "source", "pr", "prerequisite", "assignment"):
+        for section in (None, "parent", "source", "pr", "prerequisite", "assignment", "baseline"):
             for operation in ("extra", "missing"):
                 payload = request_payload()
                 target = payload if section is None else payload[section]
@@ -355,6 +370,7 @@ class RequestTests(ContractCase):
             ("prerequisite.pr_url", "https://github.com/codeExploreHub/Eventra/pull/90"),
             ("prerequisite.merge_sha", "b" * 40),
             ("assignment.engineer_id", uid(7)), ("assignment.project_id", None),
+            ("baseline.authority_digest", "x" * 64), ("baseline.comments_digest", True),
         ]
         for path, value in cases:
             payload = request_payload()
@@ -413,6 +429,103 @@ class GrantTests(ContractCase):
         with self.assertRaises(ValueError):
             self.api.validate_grant(self.grant(), forged)
 
+
+class BaselineContractTests(ContractCase):
+    def records(self):
+        return [
+            {"id": uid(30), "issue_id": uid(2), "author_id": uid(11),
+             "author_type": "member", "type": "comment", "revision": 1,
+             "created_at": "2026-09-04T01:00:00Z", "content": "old"},
+            {"id": uid(31), "issue_id": uid(2), "parent_id": uid(30),
+             "author_id": uid(7), "author_type": "agent", "type": "comment",
+             "revision": 2, "created_at": "2026-09-04T01:01:00+00:00",
+             "content": "reply", "reply_count": 0},
+        ]
+
+    def test_comment_manifest_binds_thread_identity_without_copying_content(self):
+        self.assertTrue(hasattr(self.api, "comment_manifest"),
+                        "comment manifest contract not implemented")
+        manifest = self.api.comment_manifest(self.records(), uid(2))
+        expected = [
+            {"issue_id": uid(2), "comment_uuid": uid(30), "author_id": uid(11),
+             "author_type": "member", "type": "comment", "revision": 1,
+             "parent_id": None, "created_at": "2026-09-04T01:00:00Z",
+             "content_digest": hashlib.sha256(b"old").hexdigest()},
+            {"issue_id": uid(2), "comment_uuid": uid(31), "author_id": uid(7),
+             "author_type": "agent", "type": "comment", "revision": 2,
+             "parent_id": uid(30), "created_at": "2026-09-04T01:01:00+00:00",
+             "content_digest": hashlib.sha256(b"reply").hexdigest()},
+        ]
+        self.assertEqual(manifest, expected)
+        self.assertEqual(self.api.comment_manifest_digest(self.records(), uid(2)),
+                         hashlib.sha256(encode(expected).encode()).hexdigest())
+
+    def test_comment_manifest_rejects_incomplete_or_ambiguous_history(self):
+        cases = []
+        cases.append(self.records() + [copy.deepcopy(self.records()[0])])
+        wrong_scope = self.records(); wrong_scope[0]["issue_id"] = uid(9); cases.append(wrong_scope)
+        unknown = self.records(); unknown[0]["folded"] = True; cases.append(unknown)
+        orphan = self.records(); orphan[1]["parent_id"] = uid(99); cases.append(orphan)
+        invalid_time = self.records(); invalid_time[0]["created_at"] = "yesterday"; cases.append(invalid_time)
+        incomplete = self.records(); incomplete[0]["reply_count"] = 2; cases.append(incomplete)
+        for records in cases:
+            with self.subTest(records=records), self.assertRaises(ValueError):
+                self.api.comment_manifest(records, uid(2))
+        for wrapper in ({"items": self.records(), "has_more": True}, None):
+            with self.subTest(wrapper=type(wrapper).__name__), self.assertRaises(ValueError):
+                self.api.comment_manifest(wrapper, uid(2))
+
+    def authority_state(self):
+        _, data = refresh_snapshot_fixture(state="entry")
+        data["parent"]["metadata"] = copy.deepcopy(data["metadata"])
+        data["children"][0]["detail"]["metadata"] = copy.deepcopy(data["children"][0]["metadata"])
+        return data
+
+    def test_authority_digest_binds_complete_nonvolatile_parent_and_source(self):
+        self.assertTrue(hasattr(self.api, "authority_projection"),
+                        "authority baseline projection not implemented")
+        data = self.authority_state()
+        projection = self.api.authority_projection(self.api.RefreshSnapshot(encode(data)))
+        self.assertEqual(set(projection), {"parent", "metadata", "source", "assignment",
+                                           "pr", "prerequisite", "tool"})
+        self.assertNotIn("updated_at", projection["parent"])
+        self.assertNotIn("last_activity_at", projection["source"]["detail"])
+        self.assertNotIn("metadata", projection["parent"])
+        self.assertEqual(projection["parent"]["revision"], 7)
+        self.assertEqual(projection["source"]["metadata"], data["children"][0]["metadata"])
+        self.assertEqual(self.api.authority_digest(self.api.RefreshSnapshot(encode(data))),
+                         hashlib.sha256(encode(projection).encode()).hexdigest())
+        changed = copy.deepcopy(data)
+        changed["parent"]["title"] = "changed at the same revision"
+        self.assertNotEqual(self.api.authority_digest(self.api.RefreshSnapshot(encode(changed))),
+                            self.api.authority_digest(self.api.RefreshSnapshot(encode(data))))
+
+    def test_authority_projection_rejects_echo_unknown_and_freeze_state_conflicts(self):
+        cases = []
+        echo = self.authority_state(); echo["parent"]["metadata"] = {}; cases.append(echo)
+        unknown = self.authority_state(); unknown["parent"]["future_semantic"] = "x"; cases.append(unknown)
+        active = self.authority_state(); active["parent"]["status"] = "in_progress"; cases.append(active)
+        later = self.authority_state(); later["children"].append(copy.deepcopy(later["children"][0])); cases.append(later)
+        for state in cases:
+            with self.subTest(state=state["parent"].get("status")), self.assertRaises(ValueError):
+                self.api.authority_projection(self.api.RefreshSnapshot(encode(state)))
+
+    def test_metadata_budget_counts_whole_ascii_encoded_map_and_request(self):
+        self.assertTrue(hasattr(self.api, "validate_metadata_budget"),
+                        "refresh metadata budget not implemented")
+        self.assertIsNone(self.api.validate_metadata_budget(
+            {"eventra.workflow.version": "2", "other": "雪"}, request=self.request))
+        for metadata in ({f"k{index}": "" for index in range(51)},
+                         {"existing": "雪" * 1100}):
+            with self.subTest(keys=len(metadata)), self.assertRaises(ValueError):
+                self.api.validate_metadata_budget(metadata, request=self.request)
+        payload = request_payload()
+        payload["parent"]["identifier"] = "PRO-" + "9" * 61
+        payload["parent"]["last_action"] = ("2:" + payload["parent"]["identifier"]
+            + ":create_implementation_stage:0:frontend:" + "a" * 40 + ":-:next-stage:1")
+        long_request = self.api.build_request(payload)
+        with self.assertRaises(ValueError):
+            self.api.validate_metadata_budget({}, request=long_request)
 
 class PreparedTests(ContractCase):
     def evidence(self, payload=None, **changes):

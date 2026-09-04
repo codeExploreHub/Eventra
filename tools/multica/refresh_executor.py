@@ -80,6 +80,10 @@ class RefreshAPI:
     @staticmethod
     def _comments(records, issue_id):
         c._uuid(issue_id)
+        try:
+            c.comment_manifest(records, issue_id)
+        except ValueError as exc:
+            raise RuntimeError("refresh authority: " + str(exc)) from None
         _need(type(records) is list, "incomplete comment pagination")
         result, seen = [], set()
         required = {"id", "author_id", "author_type", "content", "revision", "type", "created_at"}
