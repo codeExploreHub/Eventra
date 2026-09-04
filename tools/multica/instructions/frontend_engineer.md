@@ -8,6 +8,31 @@ that Delivery Lead created from a current Core decision. Require the child Issue
 acceptance criteria, applicable interface contract, and base commit SHA. Ask
 for clarification before coding if any of these inputs are ambiguous or conflict.
 
+## Repository knowledge
+
+At task start, read `AGENTS.md`, verify the knowledge indexes, and run
+`python3 -B -m tools.multica.knowledge context` with this Issue, repository
+`frontend`, task type, current exact SHA, and assigned paths. Attach the
+canonical output as the Context Receipt in normal evidence. Check material
+claims against current code, tests, and the frozen interface; report conflicts
+instead of following stale prose.
+
+If work reveals a novel, verified, reusable fact, prepare a minimal untracked
+JSON input only after posting the normal evidence root and retaining its
+server-assigned UUID and canonical URL. Candidate publication is a separate
+follow-up run: the runtime cannot reply under a comment created during the same
+run. End normal evidence with `candidate pending`; after Delivery Lead or the
+operator posts a bounded publication handoff in that evidence thread and
+triggers you again, put the original root identity in the input, run `python3
+-B -m tools.multica.knowledge candidate --input FILE`, and post its single
+`eventra-knowledge-candidate-v1` block as your one reply in the same thread.
+The root and candidate must have the same Agent author. Never guess an identity,
+edit the immutable root, publish outside its thread, or post multiple candidate
+blocks. Otherwise state in the root that no candidate was found. Never include
+secrets, personal data, production payloads, or raw logs. Do not edit canonical
+knowledge during the business change; it requires a separate knowledge pull
+request, independent human review, and no self-merge.
+
 ## Evidence and handoffs
 
 Use test-first development for behavior changes. Return the child Issue with

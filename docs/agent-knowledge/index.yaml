@@ -1,0 +1,87 @@
+schema_version: 1
+entries:
+  - knowledge_id: frontend-repository-map
+    title: Frontend repository map
+    purpose: Route work to authoritative frontend paths and repositories.
+    relative_path: docs/agent-knowledge/repository-map.md
+    scope: frontend
+    repositories: [frontend]
+    repository_paths: ["**"]
+    task_types: [planning, implementation, qa, review, integration]
+    status: active
+    replacement_id: null
+    provenance:
+      kind: bootstrap_design
+      design_path: docs/superpowers/specs/2026-08-31-eventra-repository-knowledge-loop-design.md
+      design_commit: 32a150dfa
+    last_verified_sha: 202dffb0d43af8cf005c8626a58cf933f269e57e
+    last_verified_date: "2026-08-31"
+    content_digest: b8012180e7ceeab8b1cd865d07fedccb0b5d03a00cba8234876f0cba2ac9394f
+  - knowledge_id: frontend-architecture
+    title: Frontend architecture
+    purpose: Preserve runtime, build, and API integration boundaries.
+    relative_path: docs/agent-knowledge/architecture.md
+    scope: frontend
+    repositories: [frontend]
+    repository_paths: ["src/**", "package.json", "next.config.ts"]
+    task_types: [planning, implementation, qa, review, integration]
+    status: active
+    replacement_id: null
+    provenance:
+      kind: bootstrap_design
+      design_path: docs/superpowers/specs/2026-08-31-eventra-repository-knowledge-loop-design.md
+      design_commit: 32a150dfa
+    last_verified_sha: 202dffb0d43af8cf005c8626a58cf933f269e57e
+    last_verified_date: "2026-08-31"
+    content_digest: 5c63f217d5f62766b93d5b4c35fe2b386244964b8e54b8485a9ce4edfc64c424
+  - knowledge_id: frontend-invariants
+    title: Frontend invariants
+    purpose: Apply non-negotiable build, security, ownership, and evidence gates.
+    relative_path: docs/agent-knowledge/invariants.md
+    scope: frontend
+    repositories: [frontend]
+    repository_paths: ["**"]
+    task_types: [planning, implementation, qa, review, integration]
+    status: active
+    replacement_id: null
+    provenance:
+      kind: bootstrap_design
+      design_path: docs/superpowers/specs/2026-08-31-eventra-repository-knowledge-loop-design.md
+      design_commit: 32a150dfa
+    last_verified_sha: 202dffb0d43af8cf005c8626a58cf933f269e57e
+    last_verified_date: "2026-08-31"
+    content_digest: 48f430289212e9e320701dd67d763a9ca98dca5aeb9e54dc65da6aa0f9858051
+  - knowledge_id: frontend-known-pitfalls
+    title: Frontend known pitfalls
+    purpose: Avoid repeated repository, builder, and local configuration failures.
+    relative_path: docs/agent-knowledge/known-pitfalls.md
+    scope: frontend
+    repositories: [frontend]
+    repository_paths: ["**"]
+    task_types: [implementation, qa, review, integration]
+    status: active
+    replacement_id: null
+    provenance:
+      kind: bootstrap_design
+      design_path: docs/superpowers/specs/2026-08-31-eventra-repository-knowledge-loop-design.md
+      design_commit: 32a150dfa
+    last_verified_sha: 202dffb0d43af8cf005c8626a58cf933f269e57e
+    last_verified_date: "2026-08-31"
+    content_digest: c4da9281e317ec71533e6feceab82f27d13dc907ad48bede6d2a737c35b2198e
+  - knowledge_id: frontend-testing-guide
+    title: Frontend testing guide
+    purpose: Select the supported local checks and produce exact evidence.
+    relative_path: docs/agent-knowledge/testing-guide.md
+    scope: frontend
+    repositories: [frontend]
+    repository_paths: ["**"]
+    task_types: [implementation, qa, review, integration]
+    status: active
+    replacement_id: null
+    provenance:
+      kind: bootstrap_design
+      design_path: docs/superpowers/specs/2026-08-31-eventra-repository-knowledge-loop-design.md
+      design_commit: 32a150dfa
+    last_verified_sha: 202dffb0d43af8cf005c8626a58cf933f269e57e
+    last_verified_date: "2026-08-31"
+    content_digest: 21b02c4f90faf9504f696ace27e7dd7c6e175543f8cbd7e0638d402ace4d1783

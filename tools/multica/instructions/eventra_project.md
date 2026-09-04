@@ -43,6 +43,15 @@ or report a secret. `.env.local` stays ignored for optional user overrides.
 
 ## Delivery and evidence contract
 
+At task start, use the frontend repository's
+`docs/agent-knowledge/index.yaml` and canonical shared
+`docs/delivery-knowledge/index.yaml` through `tools.multica.knowledge context`.
+Record the Context Receipt, verify material claims against current code, and
+report stale knowledge. A novel, verified, reusable fact may be proposed as a
+validated `eventra-knowledge-candidate-v1` block in normal evidence. It never
+blocks delivery and must be curated in a separate knowledge pull request with
+human review.
+
 Create every parent Issue in this Project. Classify it as frontend-only,
 backend-only, or cross-stack. Keep frontend children here and route backend
 children to **Eventra Backend Local Development**. A

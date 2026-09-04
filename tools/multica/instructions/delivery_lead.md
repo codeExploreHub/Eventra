@@ -20,6 +20,65 @@ observation. After QA, ask the process owner to stop only that known service.
 If the service cannot be kept available across the two tasks, block the parent;
 do not waive integration QA or merge.
 
+## Knowledge evidence at parent completion
+
+At parent start, use `tools.multica.knowledge context` with task type
+`planning`, affected repository SHA set, and declared paths. Record the shared
+system/dependency Context Receipt and verify its material claims against the
+current manifests before classification and sequencing.
+
+Require every execution handoff to include its Context Receipt and either one
+validated `eventra-knowledge-candidate-v1` reference or an explicit `none`.
+Candidates do not change delivery gates. Before closing or blocking the parent,
+aggregate only validated candidate digests and their evidence comment UUIDs in
+one immutable knowledge summary comment.
+
+A pilot candidate uses one immutable evidence thread across two Agent runs.
+The Agent first posts normal evidence and retains that evidence UUID and
+canonical URL. Because the runtime cannot reply under a comment created during
+the same run, post one bounded candidate-publication handoff as a reply in that
+evidence thread and trigger the same Agent again. The Agent then posts exactly
+one candidate block as its reply in the same thread. Validate the complete
+ancestor chain, bind the summary to the original evidence UUID, require the
+candidate author to match the evidence author, and reject a missing root,
+candidate outside that thread, foreign-author candidate, guessed identity, or
+multiple candidate blocks. The handoff itself contains no candidate prose.
+
+For the one selected pilot candidate, render the machine-readable pointer from
+the authoritative Eventra control repository:
+
+```text
+python3 -B -m tools.multica.knowledge summary --child PRO-N --evidence-comment COMMENT_UUID --candidate-digest SHA256
+```
+
+Post the single `eventra-knowledge-summary-v1` block without copying the claim
+or candidate body. Its exact JSON fields are `schema_version`,
+`child_identifier`, `evidence_comment_uuid`, and `candidate_digest`. Retain the
+new summary comment UUID for parent metadata. Multiple candidates are outside
+this pilot; do not concatenate blocks or choose through prose.
+
+When no candidate exists, write only these string metadata values and omit the
+summary UUID and digest:
+
+```text
+eventra.knowledge.version=1
+eventra.knowledge.status=none
+```
+
+When candidates exist, write these four string fields:
+
+```text
+eventra.knowledge.version=1
+eventra.knowledge.status=pending
+eventra.knowledge.summary_comment=COMMENT_UUID
+eventra.knowledge.candidate_digest=SHA256
+```
+
+Reread the parent metadata after writing it. Parent delivery
+does not wait for curation: proceed with the existing merge, smoke, done, or
+blocked decision independently. Never promote a prose claim into canonical
+knowledge or mix knowledge edits into a business pull request.
+
 ## Ownership and inputs
 
 Own delivery coordination, Issue classification, task decomposition, gate
@@ -175,6 +234,28 @@ next barrier group, then advance `next_stage` and record `last_action`.
   merged PR heads block without overwrite. This depends on the provisioned
   single serialized Delivery Lead; it is not generic CAS or transaction safety.
   Complete the parent only after exact assigned smoke PASS.
+- `retry_smoke_stage`: This is the only recovery from a post-merge Smoke that
+  finished `done + blocked` solely because external infrastructure prevented
+  mandatory provenance verification. A member posts exactly one immutable root
+  comment on the blocked parent. Its byte-for-byte canonical body for PRO-116 is:
+
+  ```json
+  {"candidate_shas":{"backend":"c7b9a38a2d05ba05eec6b16c83184653aefba750"},"granted_smoke_retry":1,"source_evidence_comment_uuid":"01a0622e-72e3-7660-9fcd-a806c07a5c0f","source_smoke":"PRO-120"}
+  ```
+
+  Store only its server-returned UUID in
+  `eventra.workflow.smoke_retry_authorization_comment`. Rerun `plan-parent` and
+  proceed only when it returns `retry_smoke_stage` with an exact action key.
+  Invoke the existing `execute-parent-smoke --expected-action-key ACTION_KEY`;
+  do not create smoke children manually or reconstruct the key. The executor
+  binds the retry to the source Smoke, its evidence UUID, unchanged candidate
+  SHA map, merged PR heads, and original PASS Gate. It moves only the blocked
+  parent back to `in_progress`, creates exactly one next-Stage Integration QA
+  child, and records the same UUID in
+  `eventra.workflow.smoke_retry_authorization_consumed` before clearing its
+  reservation. A PASS may complete the parent. BLOCKED or FAIL blocks it
+  permanently: no second retry, replacement authorization, or manual override
+  is allowed.
 - `complete_parent`: in approved unattended local-development mode, run
   `python3 -B -m tools.multica.workflow finish-parent PRO-M` from the
   authoritative control repository. This revalidates the merged smoke barrier

@@ -1,0 +1,11 @@
+schema_version: 1
+system: Eventra
+canonical_repository: frontend
+repositories:
+  frontend:
+    authority: Eventra user interface and local delivery control plane
+    local_service: http://localhost:3000
+  backend:
+    authority: Eventra HTTP API and persistence
+    local_service: http://localhost:8080
+shared_knowledge_root: docs/delivery-knowledge

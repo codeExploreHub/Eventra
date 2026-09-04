@@ -196,6 +196,48 @@ keeps one pull request per repository, and records exact reviewed and tested
 commit SHAs. A partial two-repository merge stops immediately and requires
 human escalation; it does not trigger rollback or deployment.
 
+Every execution role retrieves indexed knowledge before acting. Run the
+read-only context command from the authoritative Eventra control repository,
+supplying one `--sha REPOSITORY=FULL_SHA` per affected repository and one or
+more assigned paths:
+
+```text
+python3 -B -m tools.multica.knowledge context --task-id PRO-N --repository frontend --task-type implementation --sha frontend=FULL_SHA --path src/PATH
+```
+
+Attach the canonical JSON output as the Context Receipt and verify material
+claims against current code, tests, or an authoritative contract. Rerun with
+one `--verified-id KNOWLEDGE_ID` per checked entry and `--conflict TEXT` for
+each stale or contradictory claim; current code and exact-SHA evidence win.
+`verified_ids` contains only those explicit checks. A historical
+`last_verified_sha` match, whether in the same repository or another one,
+never marks a claim verified for the current task.
+If a novel,
+verified, reusable, public-repository-safe fact emerges, place its JSON in a
+temporary untracked file and render the only accepted evidence format:
+
+```text
+python3 -B -m tools.multica.knowledge candidate --input CANDIDATE_JSON_FILE
+```
+
+The output is one `eventra-knowledge-candidate-v1` block. Delete the temporary
+input after posting normal evidence. Do not include credentials, personal data,
+production payloads, or raw logs. Candidates never block delivery and never
+authorize incidental knowledge edits; accepted changes use a separate
+knowledge pull request with human review and no Curator self-merge.
+
+At parent completion, Delivery Lead selects the one pilot candidate and posts
+only a machine-readable pointer; it does not copy the candidate claim:
+
+```text
+python3 -B -m tools.multica.knowledge summary --child PRO-N --evidence-comment COMMENT_UUID --candidate-digest SHA256
+```
+
+The resulting `eventra-knowledge-summary-v1` block contains only
+`schema_version`, `child_identifier`, `evidence_comment_uuid`, and
+`candidate_digest`. The Curator follows that pointer back to the original
+comment and requires every identity and digest to match.
+
 Cross-stack gates respect the one-worktree Project boundary. Reviewer tasks run
 once per Project and are combined by Delivery Lead. QA verifies the backend SHA
 in the backend Project, then Backend Engineer keeps that verified SHA running
@@ -323,6 +365,50 @@ duplicating the child. Conflicting identity, metadata, Gate evidence, assignment
 or merged PR state blocks without overwrite. This recovery uses the same single
 serialized Delivery Lead and is not generic CAS or transaction safety.
 
+### One-time infrastructure-blocked Smoke retry
+
+The Eventra pilot exposes one explicit state-machine transition,
+`retry_smoke_stage`, rather than rewriting a failed result or accepting degraded
+provenance. It applies only when the parent is blocked, the latest canonical
+Smoke is `done + blocked` with no responsible repository, the merged PR heads
+still equal the exact merged candidate SHA map, the original Gate is an exact
+PASS set, and no retry was previously created or consumed.
+
+A member posts exactly one immutable root comment on the parent. For PRO-116,
+the byte-for-byte canonical body is:
+
+```json
+{"candidate_shas":{"backend":"c7b9a38a2d05ba05eec6b16c83184653aefba750"},"granted_smoke_retry":1,"source_evidence_comment_uuid":"01a0622e-72e3-7660-9fcd-a806c07a5c0f","source_smoke":"PRO-120"}
+```
+
+Store the server-returned comment UUID as
+`eventra.workflow.smoke_retry_authorization_comment`, rerun `plan-parent`, and
+require exactly `retry_smoke_stage`. Pass its returned action key unchanged to
+the existing executor:
+
+```text
+python3 -B -m tools.multica.workflow execute-parent-smoke PRO-116 --expected-action-key ACTION_KEY
+```
+
+The executor reserves the exact source Smoke/evidence, unchanged candidate
+SHAs, merged PRs, original PASS Gate, member authorization, prior parent status,
+Stage, and action. It creates one backlog retry child, initializes all canonical
+metadata, changes only `blocked -> in_progress` with no parent run, starts one
+Integration QA run, records
+`eventra.workflow.smoke_retry_authorization_consumed`, and clears the reservation
+last. Replaying the same key resumes or no-ops; another key, child, run, comment,
+SHA, PR head, assignment, or status fails closed.
+
+The retry must still perform a fresh PR-ref fetch and exact `FETCH_HEAD`
+verification in a clean detached worktree. PASS permits normal
+`complete_parent`; BLOCKED or FAIL leaves the parent blocked. No second retry,
+manual child, result rewrite, deployment, or production mutation is permitted.
+
+```text
+PRO-120 done+blocked -> member authorization -> retry_smoke_stage
+-> exactly one Stage 4 Smoke -> done+pass -> complete_parent -> PRO-116 done
+```
+
 For round 3 the caller supplies only an authoritative parent-scoped comment UUID.
 The helper authoritatively rereads the parent thread and accepts only
 `author_type=member` with an exact canonical body containing the current bundle
@@ -413,6 +499,175 @@ it must not create another child or PR. Do not manually mark PRO-36 PASS. The
 Frontend Engineer records the real build result, posts evidence, and calls
 `finish-phase`. Native Stages then drive review, QA, bounded repair, merge, and
 local smoke. Production remains untouched.
+
+## Repository knowledge loop pilot runbook
+
+This pilot adds one independent **Eventra Knowledge Curator** Agent and one
+run-only **Eventra · Knowledge Curator** Autopilot to the two existing Eventra
+Projects. The Curator is outside `Eventra Local Delivery`, receives no backend
+environment, and runs at `17 2 * * *` in `Asia/Shanghai`. Each scheduled or
+manual control pass handles at most one candidate. Candidate production and
+curation are asynchronous: an absent, rejected, paused, or delayed candidate
+does not block delivery. The existing **Eventra · Stalled Work Watcher remains
+active** and retains its own schedule and recovery authority.
+
+This is an Eventra-only trial. The generic `multica-multi-repo-delivery`
+remains unchanged; do not copy pilot IDs, paths, schedules, or state into it. The
+Curator can create one knowledge Issue after validated evidence, while the
+assigned Curator task may prepare a knowledge-only pull request. It cannot
+approve, merge, deploy, edit business code, or change delivery state.
+
+### Read-only preflight
+
+From the frontend control worktree, first verify both repositories and inspect
+pending evidence. These commands do not mutate Multica or GitHub:
+
+```bash
+python3 -B -m tools.multica.knowledge verify \
+  --frontend-root FRONTEND_ROOT \
+  --backend-root BACKEND_ROOT
+python3 -B -m tools.multica.knowledge scan \
+  --project-id FRONTEND_PROJECT_ID \
+  --backend-project-id BACKEND_PROJECT_ID
+python3 -B -m tools.multica.knowledge plan \
+  --project-id FRONTEND_PROJECT_ID \
+  --backend-project-id BACKEND_PROJECT_ID
+```
+
+Then audit the live contract shapes and render the desired reconciliation. Both
+commands are read-only; scalar-free audit output is evidence about structure,
+not permission to infer missing IDs:
+
+```bash
+python3 -m tools.multica.contract_audit \
+  --runtime-id RUNTIME_ID \
+  --daemon-id DAEMON_ID
+python3 -m tools.multica.provision \
+  --runtime-id RUNTIME_ID \
+  --daemon-id DAEMON_ID
+```
+
+Stop if either Eventra Project, either exact repository resource, the existing
+Watcher, or the five-member Squad cannot be resolved unambiguously. A valid dry
+run proposes only the missing or drifted Curator objects, preserves Watcher and
+trigger IDs, leaves the Squad at five members, and makes no operational-agent
+environment change.
+
+### Approval, apply, and authoritative reread
+
+Stop for **explicit live-mutation approval** before adding/updating the Curator,
+running `curate --apply`, triggering an Autopilot, creating a knowledge Issue or
+pull request, or changing an Autopilot status. After that approval, reconcile
+once while preserving the existing backend environment in-process:
+
+```bash
+python3 -m tools.multica.provision \
+  --runtime-id RUNTIME_ID \
+  --daemon-id DAEMON_ID \
+  --apply \
+  --reuse-backend-env
+```
+
+Use only IDs returned by that apply and reread the result:
+
+```bash
+multica agent get KNOWLEDGE_CURATOR_AGENT_ID --output json
+multica squad member list SQUAD_ID --output json
+multica autopilot get KNOWLEDGE_CURATOR_AUTOPILOT_ID --output json
+multica autopilot get WATCHER_AUTOPILOT_ID --output json
+```
+
+Require the Curator Agent to be absent from the Squad, the Curator Autopilot to
+be active/run-only and assigned to it, the schedule to remain `17 2 * * *` in
+`Asia/Shanghai`, and the Watcher IDs/schedule to be unchanged. Re-run the normal
+apply without an environment-mode flag; it must report a `mutation_count` of
+`0`.
+
+### One bounded curation pass and PR handoff
+
+The scheduled description invokes this exact mutation after approval:
+
+```bash
+python3 -B -m tools.multica.knowledge curate \
+  --project-id FRONTEND_PROJECT_ID \
+  --backend-project-id BACKEND_PROJECT_ID \
+  --curator-agent-id KNOWLEDGE_CURATOR_AGENT_ID \
+  --frontend-root FRONTEND_ROOT \
+  --backend-root BACKEND_ROOT \
+  --apply
+```
+
+Both roots are explicit because scheduled tasks execute in runtime-managed
+worktrees that are not necessarily nested under either repository.
+
+For a manual scenario, trigger only the known Curator Autopilot and then reread
+its run history and the affected Issue metadata:
+
+```bash
+multica autopilot trigger KNOWLEDGE_CURATOR_AUTOPILOT_ID --output json
+multica autopilot runs KNOWLEDGE_CURATOR_AUTOPILOT_ID --limit 5 --output json
+```
+
+One pass may create at most one deterministic knowledge Issue. Cross-run
+uniqueness relies on the deterministic action-key title, Multica's default
+active-duplicate rejection (the command never passes `--allow-duplicate`), and
+the Curator Agent's configured concurrency of 1. A loser or lost acknowledgement
+is recovered by authoritative search; this is not a generic client-side CAS for
+arbitrary callers. The assigned Curator rereads source evidence, changes only the repository knowledge
+allowlist, runs `check-change`, opens one source-linked PR, records the canonical
+`eventra.knowledge.pr` state, and stops at `pr_open` for human review. A human
+may reject or merge; the Curator never does either. `verified` is recorded only
+after a read-only PR observation and exact merged-SHA index verification.
+
+Merged-SHA verification reads raw blobs from the target repository's immutable
+Git commit tree (with replace objects disabled), not its working directory,
+staging area, export filters, or the other repository. The requested commit
+must be available locally; HEAD need not still point to it. Only regular files
+inside that repository's canonical knowledge directories are accepted. Missing
+or invalid indexes, symlinks, ambiguous candidate matches, and unavailable
+commits fail closed. This content check does not replace GitHub merge-status
+observation or human review.
+
+The `bootstrap_design` exception is frozen to the 12 original seed entries:
+full canonical entry fingerprints bind identity, content digest, scope, paths,
+provenance, and verification metadata in control code. Original historical
+seeds remain readable; new entries or updates (including verification metadata
+updates) must migrate to `delivery_evidence`. Do not extend the seed allowlist
+as part of documentation-only curation. YAML formatting changes that preserve
+the parsed entry are harmless. Canonical knowledge still requires human review.
+
+### Pause, rollback, and continuity
+
+The safe operational rollback is to pause only the Curator after explicit
+approval, not to delete Agents, Issues, comments, PRs, triggers, or Git history:
+
+```bash
+multica autopilot update KNOWLEDGE_CURATOR_AUTOPILOT_ID \
+  --status paused \
+  --output json
+multica autopilot get KNOWLEDGE_CURATOR_AUTOPILOT_ID --output json
+```
+
+Confirm it is paused and that **Eventra · Stalled Work Watcher remains active**.
+Delivery, Stage barriers, local smoke, and Watcher recovery continue normally;
+new candidates remain durable and pending. Resume only after separate approval
+with `multica autopilot update KNOWLEDGE_CURATOR_AUTOPILOT_ID --status active
+--output json`, reread it, and let oldest-first bounded processing continue.
+Repository rollback, PR revert, production deployment, and candidate deletion
+are not automatic rollback actions.
+
+### Pilot measures
+
+For every scenario record: retrieved-entry relevance, Context Receipt count,
+candidate count, candidate acceptance rate, duplicate rate, human review
+correction rate, stale-entry rate, candidate-to-reviewed-knowledge latency,
+Curator failure/retry count, and business delivery delay. Compare delivery
+lead time with the Curator active and paused. A useful pilot improves future
+retrieval without increasing delivery delay, leaking sensitive data, or
+creating duplicate Issues/PRs.
+
+The eight knowledge-specific scenarios and expected evidence are in
+[the pilot Issue runbook](../../docs/multica/pilot-issues.md#repository-knowledge-loop-scenarios).
 
 ## Pilot dispatch and evidence runbook
 

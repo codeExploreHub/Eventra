@@ -24,6 +24,7 @@ from .contracts import (
     parse_autopilot_list,
 )
 from .eventra_adapter import build_eventra_config
+from .issue_contracts import parse_issue_comments
 from .provision import MulticaRunner
 
 
@@ -139,6 +140,30 @@ def _parse_audit_environment(value: Any, expected_id: str) -> None:
     parse_agent_environment(value, expected_id)
     if set(value) != {"agent_id", "custom_env"}:
         raise RuntimeError("malformed agent environment")
+
+
+def collect_comment_contract_shape(
+    runner: MulticaRunner, issue_identifier: str, comment_uuid: str
+) -> dict[str, Any]:
+    """Read one bounded thread and retain only its versioned JSON shape."""
+
+    value = _read(
+        runner,
+        [
+            "issue", "comment", "list", issue_identifier,
+            "--thread", comment_uuid,
+            "--tail", "30",
+            "--compact",
+            "--output", "json",
+        ],
+    )
+    parsed = parse_issue_comments(value, issue_identifier)
+    if not any(record["id"] == comment_uuid for record in parsed):
+        raise RuntimeError("malformed issue comments")
+    return {
+        "schema_version": 1,
+        "response": _shape(value, target_id=comment_uuid, target_field="id"),
+    }
 
 
 def collect_contract_audit(
@@ -290,20 +315,22 @@ def collect_contract_audit(
 
     autopilot_list = _read(runner, ["autopilot", "list", "--output", "json"])
     autopilot_records = parse_autopilot_list(autopilot_list)
-    autopilot_id = _exact_id(
-        autopilot_records, "title", config.watcher.title
-    )
     autopilot_report: dict[str, Any] = {
         "list": _shape(autopilot_list),
-        "detail": None,
+        "details": [],
     }
-    if autopilot_id is not None:
+    for spec in sorted(config.operational_automations, key=lambda item: item.key):
+        autopilot_id = _exact_id(
+            autopilot_records, "title", spec.title
+        )
+        if autopilot_id is None:
+            continue
         detail = _read(
             runner, ["autopilot", "get", autopilot_id, "--output", "json"]
         )
         parse_autopilot_detail(detail, autopilot_id)
-        autopilot_report["detail"] = _shape(
-            detail, target_id=autopilot_id, target_field="id"
+        autopilot_report["details"].append(
+            _shape(detail, target_id=autopilot_id, target_field="id")
         )
     report["autopilots"] = autopilot_report
     return report

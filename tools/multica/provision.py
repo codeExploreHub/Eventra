@@ -101,9 +101,15 @@ class ProvisioningResult:
     project_id: str | None
     backend_project_id: str | None
     resource_ids: dict[str, str | None]
-    autopilot_id: str | None
+    autopilot_ids: dict[str, str | None]
     mutation_count: int
     plan: ProvisioningPlan | None = None
+
+    @property
+    def autopilot_id(self) -> str | None:
+        """Compatibility view for the original workflow Watcher."""
+
+        return self.autopilot_ids.get("workflow-watcher")
 
 
 @dataclass(frozen=True)
@@ -183,7 +189,7 @@ class _Preflight:
     backend_project_detail: dict[str, Any] | None
     resources: dict[str, dict[str, Any] | None]
     backend_resources: dict[str, dict[str, Any] | None]
-    autopilot_detail: dict[str, Any] | None
+    autopilot_details: dict[str, dict[str, Any] | None]
 
 
 class MulticaRunner:
@@ -301,11 +307,14 @@ class Provisioner:
                         **state.backend_resources,
                     }.items()
                 },
-                autopilot_id=(
-                    None
-                    if state.autopilot_detail is None
-                    else state.autopilot_detail["autopilot"]["id"]
-                ),
+                autopilot_ids={
+                    key: (
+                        None
+                        if detail is None
+                        else detail["autopilot"]["id"]
+                    )
+                    for key, detail in state.autopilot_details.items()
+                },
                 mutation_count=self.runner.mutation_count - starting_mutation_count,
                 plan=plan,
             )
@@ -343,13 +352,19 @@ class Provisioner:
                 state.backend_resources,
             )
         )
-        autopilot_id = self._reconcile_autopilot(
-            config,
-            state.autopilot_detail,
-            agent_ids[config.watcher.agent_role],
-            project_id,
-            backend_project_id,
-        )
+        autopilot_ids = {
+            spec.key: self._reconcile_autopilot(
+                spec,
+                state.autopilot_details[spec.key],
+                agent_ids[spec.agent_role],
+                agent_ids,
+                project_id,
+                backend_project_id,
+                config.resources[0].local_path,
+                config.resources[1].local_path,
+            )
+            for spec in config.operational_automations
+        }
         return ProvisioningResult(
             agent_ids=agent_ids,
             skill_ids=skill_ids,
@@ -357,7 +372,7 @@ class Provisioner:
             project_id=project_id,
             backend_project_id=backend_project_id,
             resource_ids=resource_ids,
-            autopilot_id=autopilot_id,
+            autopilot_ids=autopilot_ids,
             mutation_count=self.runner.mutation_count - starting_mutation_count,
             plan=plan,
         )
@@ -447,17 +462,19 @@ class Provisioner:
         autopilot_records = parse_autopilot_list(
             self.runner.run(["autopilot", "list", "--output", "json"])
         )
-        autopilot_item = self._exact_record(
-            autopilot_records,
-            config.watcher.title,
-            "title",
-            "Autopilot",
-        )
-        autopilot_detail = (
-            None
-            if autopilot_item is None
-            else self._autopilot_get(autopilot_item["id"])
-        )
+        autopilot_details = {}
+        for spec in config.operational_automations:
+            autopilot_item = self._exact_record(
+                autopilot_records,
+                spec.title,
+                "title",
+                "Autopilot",
+            )
+            autopilot_details[spec.key] = (
+                None
+                if autopilot_item is None
+                else self._autopilot_get(autopilot_item["id"])
+            )
         return _Preflight(
             skill_details,
             agent_details,
@@ -469,7 +486,7 @@ class Provisioner:
             backend_project_detail,
             resources,
             backend_resources,
-            autopilot_detail,
+            autopilot_details,
         )
 
     def _validate_runtime_capability(self, config) -> None:
@@ -506,11 +523,22 @@ class Provisioner:
         }
         if configured_roles != delivery_roles | operational_roles:
             raise ValueError("configured Agent catalog does not match the blueprint")
+        automations = config.operational_automations
+        keys = [item.key for item in automations]
+        titles = [item.title for item in automations]
+        automation_roles = [item.agent_role for item in automations]
         if (
-            config.watcher.agent_role not in operational_roles
-            or config.watcher.agent_role in delivery_roles
+            not automations
+            or len(keys) != len(set(keys))
+            or len(titles) != len(set(titles))
+            or len(automation_roles) != len(set(automation_roles))
         ):
-            raise ValueError("watcher must target an operational Agent")
+            raise ValueError("operational automation keys, titles, and roles must be unique")
+        if (
+            set(automation_roles) != operational_roles
+            or any(role in delivery_roles for role in automation_roles)
+        ):
+            raise ValueError("each automation must target one operational Agent")
         recipients = {agent.role for agent in config.agents if agent.needs_backend_env}
         if recipients != ENV_RECIPIENTS:
             raise ValueError("backend environment recipients must be Backend Engineer and Integration QA")
@@ -548,14 +576,39 @@ class Provisioner:
             for resource in config.resources
         ):
             raise ValueError("configuration resources must be local_directory worktrees")
-        watcher_text = config.watcher.description_file.read_text()
-        if (
-            watcher_text.count("__FRONTEND_PROJECT_ID__") != 1
-            or watcher_text.count("__BACKEND_PROJECT_ID__") != 1
-            or config.watcher.cron != "*/30 * * * *"
-            or config.watcher.timezone != "Asia/Shanghai"
-        ):
-            raise ValueError("watcher configuration is invalid")
+        expected = {
+            "workflow-watcher": (
+                "Eventra · Stalled Work Watcher",
+                "Eventra stalled-work recovery",
+                "*/30 * * * *",
+                "workflow_watcher",
+                0,
+            ),
+            "knowledge-curator": (
+                "Eventra · Knowledge Curator",
+                "Eventra repository knowledge curation",
+                "17 2 * * *",
+                "knowledge_curator",
+                1,
+            ),
+        }
+        if keys != list(expected):
+            raise ValueError("operational automation configuration is invalid")
+        for spec in automations:
+            text = spec.description_file.read_text()
+            title, label, cron, role, curator_placeholders = expected[spec.key]
+            if (
+                spec.title != title
+                or spec.label != label
+                or spec.cron != cron
+                or spec.timezone != "Asia/Shanghai"
+                or spec.agent_role != role
+                or text.count("__FRONTEND_PROJECT_ID__") != 1
+                or text.count("__BACKEND_PROJECT_ID__") != 1
+                or text.count("__KNOWLEDGE_CURATOR_AGENT_ID__")
+                != curator_placeholders
+            ):
+                raise ValueError("operational automation configuration is invalid")
 
     @staticmethod
     def _validate_backend_env(backend_env: dict[str, str] | None) -> None:
@@ -847,7 +900,6 @@ class Provisioner:
                     "project.resource.update", {"execution_mode": "worktree"},
                 )
 
-        autopilot = state.autopilot_detail
         frontend_project_id = (
             None if state.project_detail is None else state.project_detail["id"]
         )
@@ -856,49 +908,65 @@ class Provisioner:
             if state.backend_project_detail is None
             else state.backend_project_detail["id"]
         )
-        watcher_id = agent_ids[config.watcher.agent_role]
-        if autopilot is None:
-            add(
-                "create", "autopilot", "workflow_watcher",
-                config.watcher.title, "new", "autopilot.create",
-                {"fields": ["assignee", "description", "mode", "project"]},
-            )
-            add(
-                "create", "autopilot_trigger", "workflow_watcher_schedule",
-                config.watcher.label, "new", "autopilot.trigger-add",
-                {"fields": ["cron", "enabled", "timezone"]},
-            )
-        else:
+        curator_id = agent_ids["knowledge_curator"]
+        for spec in config.operational_automations:
+            autopilot = state.autopilot_details[spec.key]
+            action_key = spec.key.replace("-", "_")
+            trigger_key = f"{action_key}_schedule"
+            operational_agent_id = agent_ids[spec.agent_role]
+            if autopilot is None:
+                add(
+                    "create", "autopilot", action_key,
+                    spec.title, "new", "autopilot.create",
+                    {"fields": ["assignee", "description", "mode", "project"]},
+                )
+                add(
+                    "create", "autopilot_trigger", trigger_key,
+                    spec.label, "new", "autopilot.trigger-add",
+                    {"fields": ["cron", "enabled", "timezone"]},
+                )
+                continue
+
             autopilot_id = autopilot["autopilot"]["id"]
-            if None in {frontend_project_id, backend_project_id, watcher_id}:
+            if None in {
+                frontend_project_id,
+                backend_project_id,
+                operational_agent_id,
+                curator_id,
+            }:
                 autopilot_changed = ["assignee_id", "description", "project_id"]
             else:
                 wanted = self._desired_autopilot(
-                    config, watcher_id, frontend_project_id, backend_project_id
+                    spec,
+                    operational_agent_id,
+                    curator_id,
+                    frontend_project_id,
+                    backend_project_id,
+                    config.resources[0].local_path,
+                    config.resources[1].local_path,
                 )
                 autopilot_changed = self._changed_fields(
                     autopilot["autopilot"], wanted
                 )
             if autopilot_changed:
                 add(
-                    "update", "autopilot", "workflow_watcher",
-                    config.watcher.title, autopilot_id, "autopilot.update",
+                    "update", "autopilot", action_key,
+                    spec.title, autopilot_id, "autopilot.update",
                     {"fields": autopilot_changed},
                 )
             triggers = autopilot["triggers"]
             if not triggers:
                 add(
-                    "create", "autopilot_trigger", "workflow_watcher_schedule",
-                    config.watcher.label, "new", "autopilot.trigger-add",
+                    "create", "autopilot_trigger", trigger_key,
+                    spec.label, "new", "autopilot.trigger-add",
                     {"fields": ["cron", "enabled", "timezone"]},
                 )
             else:
-                wanted_trigger = self._desired_trigger(config, autopilot_id)
+                wanted_trigger = self._desired_trigger(spec, autopilot_id)
                 trigger_changed = self._changed_fields(triggers[0], wanted_trigger)
                 if trigger_changed:
                     add(
-                        "update", "autopilot_trigger",
-                        "workflow_watcher_schedule", config.watcher.label,
+                        "update", "autopilot_trigger", trigger_key, spec.label,
                         triggers[0]["id"], "autopilot.trigger-update",
                         {"fields": trigger_changed},
                     )
@@ -1216,17 +1284,23 @@ class Provisioner:
 
     def _reconcile_autopilot(
         self,
-        config,
+        spec,
         detail,
-        watcher_agent_id,
+        operational_agent_id,
+        agent_ids,
         frontend_project_id,
         backend_project_id,
+        frontend_root,
+        backend_root,
     ):
         wanted = self._desired_autopilot(
-            config,
-            watcher_agent_id,
+            spec,
+            operational_agent_id,
+            agent_ids["knowledge_curator"],
             frontend_project_id,
             backend_project_id,
+            frontend_root,
+            backend_root,
         )
         if detail is None:
             self.runner.run(
@@ -1234,7 +1308,7 @@ class Provisioner:
                     "autopilot", "create",
                     "--title", wanted["title"],
                     "--description", wanted["description"],
-                    "--agent", watcher_agent_id,
+                    "--agent", operational_agent_id,
                     "--mode", "run_only",
                     "--project", frontend_project_id,
                     "--output", "json",
@@ -1248,7 +1322,7 @@ class Provisioner:
                     "autopilot", "update", autopilot_id,
                     "--title", wanted["title"],
                     "--description", wanted["description"],
-                    "--agent", watcher_agent_id,
+                    "--agent", operational_agent_id,
                     "--mode", "run_only",
                     "--project", frontend_project_id,
                     "--status", "active",
@@ -1263,15 +1337,15 @@ class Provisioner:
 
         autopilot_id = detail["autopilot"]["id"]
         triggers = detail["triggers"]
-        wanted_trigger = self._desired_trigger(config, autopilot_id)
+        wanted_trigger = self._desired_trigger(spec, autopilot_id)
         if not triggers:
             self.runner.run(
                 [
                     "autopilot", "trigger-add", autopilot_id,
                     "--kind", "schedule",
-                    "--cron", config.watcher.cron,
-                    "--timezone", config.watcher.timezone,
-                    "--label", config.watcher.label,
+                    "--cron", spec.cron,
+                    "--timezone", spec.timezone,
+                    "--label", spec.label,
                     "--output", "json",
                 ]
             )
@@ -1280,9 +1354,9 @@ class Provisioner:
                 [
                     "autopilot", "trigger-update", autopilot_id,
                     triggers[0]["id"],
-                    "--cron", config.watcher.cron,
-                    "--timezone", config.watcher.timezone,
-                    "--label", config.watcher.label,
+                    "--cron", spec.cron,
+                    "--timezone", spec.timezone,
+                    "--label", spec.label,
                     "--enabled",
                     "--output", "json",
                 ]
@@ -1298,33 +1372,42 @@ class Provisioner:
 
     @staticmethod
     def _desired_autopilot(
-        config, watcher_agent_id, frontend_project_id, backend_project_id
+        spec,
+        operational_agent_id,
+        curator_agent_id,
+        frontend_project_id,
+        backend_project_id,
+        frontend_root,
+        backend_root,
     ):
         description = (
-            config.watcher.description_file.read_text()
+            spec.description_file.read_text()
             .replace("__FRONTEND_PROJECT_ID__", frontend_project_id)
             .replace("__BACKEND_PROJECT_ID__", backend_project_id)
+            .replace("__KNOWLEDGE_CURATOR_AGENT_ID__", curator_agent_id)
+            .replace("__FRONTEND_ROOT__", frontend_root)
+            .replace("__BACKEND_ROOT__", backend_root)
         )
         return {
             "id": None,
-            "title": config.watcher.title,
+            "title": spec.title,
             "description": description,
             "execution_mode": "run_only",
             "project_id": frontend_project_id,
-            "assignee_id": watcher_agent_id,
+            "assignee_id": operational_agent_id,
             "assignee_type": "agent",
             "status": "active",
         }
 
     @staticmethod
-    def _desired_trigger(config, autopilot_id):
+    def _desired_trigger(spec, autopilot_id):
         return {
             "autopilot_id": autopilot_id,
             "kind": "schedule",
-            "cron_expression": config.watcher.cron,
-            "timezone": config.watcher.timezone,
+            "cron_expression": spec.cron,
+            "timezone": spec.timezone,
             "enabled": True,
-            "label": config.watcher.label,
+            "label": spec.label,
         }
 
     def _autopilot_get(self, autopilot_id):
@@ -1580,7 +1663,7 @@ def _apply_output(result: ProvisioningResult) -> str:
             "project_id": result.project_id,
             "backend_project_id": result.backend_project_id,
             "resource_ids": result.resource_ids,
-            "autopilot_id": result.autopilot_id,
+            "autopilot_ids": result.autopilot_ids,
             "mutation_count": result.mutation_count,
         },
         sort_keys=True,

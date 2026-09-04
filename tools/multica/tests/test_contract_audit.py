@@ -5,9 +5,14 @@ import copy
 import io
 import json
 import unittest
+from pathlib import Path
 
 from tools.multica.provision import MUTATION_COMMAND_PREFIXES
-from tools.multica.contract_audit import build_parser, collect_contract_audit
+from tools.multica.contract_audit import (
+    build_parser,
+    collect_comment_contract_shape,
+    collect_contract_audit,
+)
 
 
 SENTINELS = {
@@ -34,6 +39,40 @@ SENTINELS = {
     "autopilot_id": "AUTOPILOT_ID_SENTINEL",
     "trigger_id": "TRIGGER_ID_SENTINEL",
 }
+COMMENT_UUID = "01a00000-0000-7000-8000-000000000010"
+COMMENT_REPLY_UUID = "01a00000-0000-7000-8000-000000000011"
+COMMENT_AUTHOR_UUID = "00000000-0000-4000-8000-000000000012"
+COMMENT_BODY_SENTINEL = "COMMENT_BODY_SENTINEL"
+COMMENT_COMMAND = (
+    "issue", "comment", "list", "PRO-100", "--thread", COMMENT_UUID,
+    "--tail", "30", "--compact", "--output", "json",
+)
+
+
+def comment_replies():
+    return {
+        COMMENT_COMMAND: [
+            {
+                "author_id": COMMENT_AUTHOR_UUID,
+                "author_type": "agent",
+                "content": COMMENT_BODY_SENTINEL,
+                "created_at": "2026-08-31T08:00:00Z",
+                "id": COMMENT_UUID,
+                "revision": 1,
+                "type": "comment",
+            },
+            {
+                "author_id": COMMENT_AUTHOR_UUID,
+                "author_type": "member",
+                "content": "COMMENT_REPLY_BODY_SENTINEL",
+                "created_at": "2026-08-31T08:01:00Z",
+                "id": COMMENT_REPLY_UUID,
+                "parent_id": COMMENT_UUID,
+                "revision": 1,
+                "type": "comment",
+            },
+        ]
+    }
 
 
 class RecordingRunner:
@@ -184,6 +223,37 @@ def audit_replies():
 
 
 class ContractAuditTests(unittest.TestCase):
+    def test_comment_audit_discards_scalars_and_matches_versioned_fixture(self):
+        runner = RecordingRunner(comment_replies())
+        report = collect_comment_contract_shape(runner, "PRO-100", COMMENT_UUID)
+        rendered = json.dumps(report, sort_keys=True)
+        for scalar in (
+            COMMENT_BODY_SENTINEL,
+            "COMMENT_REPLY_BODY_SENTINEL",
+            COMMENT_UUID,
+            COMMENT_REPLY_UUID,
+            COMMENT_AUTHOR_UUID,
+            "PRO-100",
+        ):
+            self.assertNotIn(scalar, rendered)
+        fixture = json.loads(
+            Path("tools/multica/fixtures/comment_contract_shape_v1.json").read_text()
+        )
+        self.assertEqual(report, fixture)
+        self.assertEqual(runner.calls, [(list(COMMENT_COMMAND), None)])
+
+    def test_comment_audit_rejects_missing_target_without_scalar_output(self):
+        replies = comment_replies()
+        replies[COMMENT_COMMAND][0]["id"] = "01a00000-0000-7000-8000-000000000099"
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            with self.assertRaisesRegex(RuntimeError, "malformed issue comments") as caught:
+                collect_comment_contract_shape(
+                    RecordingRunner(replies), "PRO-100", COMMENT_UUID
+                )
+        self.assertNotIn(COMMENT_BODY_SENTINEL, str(caught.exception))
+        self.assertEqual(stdout.getvalue(), "")
+
     def test_audit_discards_all_scalar_sentinels_and_reports_environment_shape(self):
         runner = RecordingRunner(audit_replies())
 
@@ -206,13 +276,56 @@ class ContractAuditTests(unittest.TestCase):
             ]
         )
         self.assertTrue(
-            report["autopilots"]["detail"]["fields"]["autopilot"]["fields"]["id"][
+            report["autopilots"]["details"][0]["fields"]["autopilot"]["fields"]["id"][
                 "target_id_matches"
             ]
         )
         self.assertEqual(
-            report["autopilots"]["detail"]["fields"]["triggers"]["length"],
+            report["autopilots"]["details"][0]["fields"]["triggers"]["length"],
             1,
+        )
+
+    def test_audit_reads_all_present_target_automations_in_stable_key_order(self):
+        replies = audit_replies()
+        curator_id = "CURATOR_AUTOPILOT_ID_SENTINEL"
+        curator_trigger_id = "CURATOR_TRIGGER_ID_SENTINEL"
+        listing = replies[("autopilot", "list", "--output", "json")]
+        curator = copy.deepcopy(listing["autopilots"][0])
+        curator.update(
+            id=curator_id,
+            title="Eventra · Knowledge Curator",
+        )
+        listing["autopilots"].append(curator)
+        listing["total"] = 2
+        detail = copy.deepcopy(
+            replies[("autopilot", "get", SENTINELS["autopilot_id"], "--output", "json")]
+        )
+        detail["autopilot"].update(
+            id=curator_id,
+            title="Eventra · Knowledge Curator",
+        )
+        detail["triggers"][0].update(
+            id=curator_trigger_id,
+            autopilot_id=curator_id,
+            cron_expression="17 2 * * *",
+            label="Eventra repository knowledge curation",
+        )
+        replies[("autopilot", "get", curator_id, "--output", "json")] = detail
+        runner = RecordingRunner(replies)
+
+        report = collect_contract_audit(
+            SENTINELS["runtime_id"], SENTINELS["daemon_id"], runner
+        )
+
+        self.assertEqual(len(report["autopilots"]["details"]), 2)
+        get_calls = [
+            args[2]
+            for args, _ in runner.calls
+            if args[:2] == ["autopilot", "get"]
+        ]
+        self.assertEqual(
+            get_calls,
+            [curator_id, SENTINELS["autopilot_id"]],
         )
 
     def test_audit_commands_are_fixed_reads_with_no_mutation_prefix(self):

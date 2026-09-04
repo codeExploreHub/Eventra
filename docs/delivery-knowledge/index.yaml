@@ -1,0 +1,36 @@
+schema_version: 1
+entries:
+  - knowledge_id: eventra-system-map
+    title: Eventra system map
+    purpose: Locate repository authority, local services, and shared knowledge ownership.
+    relative_path: docs/delivery-knowledge/system-map.yaml
+    scope: cross_repo
+    repositories: [frontend, backend]
+    repository_paths: ["**"]
+    task_types: [planning, implementation, qa, review, integration]
+    status: active
+    replacement_id: null
+    provenance:
+      kind: bootstrap_design
+      design_path: docs/superpowers/specs/2026-08-31-eventra-repository-knowledge-loop-design.md
+      design_commit: 32a150dfa
+    last_verified_sha: 202dffb0d43af8cf005c8626a58cf933f269e57e
+    last_verified_date: "2026-08-31"
+    content_digest: 4d5804dde75cdbc11558d315444baf4ebbe5956903cdf2048721376818caf903
+  - knowledge_id: eventra-dependency-graph
+    title: Eventra dependency graph
+    purpose: Preserve dependency, integration start, command, and merge ordering.
+    relative_path: docs/delivery-knowledge/dependency-graph.yaml
+    scope: cross_repo
+    repositories: [frontend, backend]
+    repository_paths: ["**"]
+    task_types: [planning, implementation, qa, review, integration]
+    status: active
+    replacement_id: null
+    provenance:
+      kind: bootstrap_design
+      design_path: docs/superpowers/specs/2026-08-31-eventra-repository-knowledge-loop-design.md
+      design_commit: 32a150dfa
+    last_verified_sha: 202dffb0d43af8cf005c8626a58cf933f269e57e
+    last_verified_date: "2026-08-31"
+    content_digest: ff17272e7abd2dac2b2abf94c63f50deb9f3a61c8f9228782dfb7f5f3fc16121

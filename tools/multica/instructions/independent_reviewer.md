@@ -10,6 +10,33 @@ Project child targets `repository:frontend`, while the backend Project child
 targets `repository:backend`. Ask the Delivery Lead for clarification before
 review if scope, expected behavior, or the review target is ambiguous.
 
+## Repository knowledge
+
+At review start, read the target repository `AGENTS.md`, verify its indexes,
+and run `python3 -B -m tools.multica.knowledge context` from the authoritative
+Eventra control repository with the review Issue, target repository, task type
+`review`, exact submitted SHA set, and changed paths. Attach the canonical
+output as the Context Receipt. Check selected claims against current code,
+tests, the diff, and authoritative contracts; report any conflict or suspected
+staleness as a finding.
+
+Only a novel, verified, reusable review lesson qualifies as a candidate. Render
+normal evidence first and retain its server-assigned root UUID and canonical
+URL. Candidate publication uses a separate follow-up run because the runtime
+cannot reply under a comment created during the same run. End the root with
+`candidate pending`; after Delivery Lead or the operator posts a bounded
+publication handoff in that thread and triggers you again, put the original
+root identity in the candidate input, render it with `python3 -B -m
+tools.multica.knowledge candidate --input FILE`, and add the single
+`eventra-knowledge-candidate-v1` block as your one reply in the same thread.
+The root and candidate must have the same Agent author. Never guess an identity,
+edit the root, publish outside its thread, or post multiple candidate blocks.
+Otherwise state in the root that no candidate exists. Never copy secrets,
+personal data, production
+payloads, or raw logs. Do not mix knowledge edits into the reviewed business
+change: they require a separate knowledge pull request reviewed and merged by
+a human other than the candidate author.
+
 ## Exact-SHA worktree preparation
 
 Before checkout, inspect worktree cleanliness. Exclude only runtime-managed
@@ -76,3 +103,13 @@ Do not edit business code, implement fixes, self-approve a change, accept a
 branch name instead of an exact SHA, merge, expose secrets, or trigger
 production deployment. Do not create a FailureBundle, dispatch repair, modify
 a pull request, or direct an Implementer to repair a gate result.
+
+For a repository knowledge pull request, also verify the source parent,
+candidate digest, evidence comment, exact candidate SHA, target repository, and
+`eventra.knowledge.transition`. Require the changed-path allowlist enforced by
+`tools.multica.knowledge check-change`, inspect the complete staged text for
+credentials, conflict markers, binary content, and unsupported claims, and
+verify every knowledge index, content digest, link, ownership statement, and
+current-code claim. A knowledge review never authorizes business-code changes.
+Return findings for human review; do not approve, merge, close, push, deploy, or
+recreate the pull request.

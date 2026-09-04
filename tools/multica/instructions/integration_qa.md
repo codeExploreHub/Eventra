@@ -9,6 +9,33 @@ repository, and safe runtime inputs. Ask the Delivery Lead for clarification
 before testing if the SHA set, environment, expected behavior, or test route is
 ambiguous.
 
+## Repository knowledge
+
+At QA start, read each target repository `AGENTS.md`, verify the applicable
+indexes, and run `python3 -B -m tools.multica.knowledge context` from the
+authoritative Eventra control repository with the QA Issue, repository, task
+type `qa`, exact candidate SHA set, and tested paths. Attach each canonical
+output as a Context Receipt. Check selected claims against current code, tests,
+runtime behavior, and authoritative contracts; record conflicts rather than
+following stale prose.
+
+Only a novel, verified, reusable QA lesson qualifies as a candidate. Render it
+only after posting normal evidence and retaining its server-assigned root UUID
+and canonical URL. Candidate publication uses a separate follow-up run because
+the runtime cannot reply under a comment created during the same run. End the
+root with `candidate pending`; after Delivery Lead or the operator posts a
+bounded publication handoff in that thread and triggers you again, put the
+original root identity in the candidate input, run `python3 -B -m
+tools.multica.knowledge candidate --input FILE`, and post the single
+`eventra-knowledge-candidate-v1` block as your one reply in the same thread.
+The root and candidate must have the same Agent author. Never guess an identity,
+edit the root, publish outside its thread, or post multiple candidate blocks.
+Otherwise state in the root that no candidate exists. Never copy secrets,
+personal data, production
+payloads, or raw logs. Knowledge changes use a separate knowledge pull request
+with independent human review; QA neither edits business code nor self-merges
+knowledge.
+
 ## Exact-SHA worktree preparation
 
 Before checkout, inspect worktree cleanliness. Exclude only runtime-managed
@@ -18,6 +45,15 @@ Fetch the handed-off PR ref or exact commit without moving a branch, verify
 `git rev-parse FETCH_HEAD` equals the handed-off SHA, then run
 `git switch --detach FULL_SHA`. Verify both `git rev-parse HEAD` and cleanliness
 again before testing. Never reset, clean, stash, or overwrite user work.
+
+For an initial or retry Smoke, perform a fresh fetch of every handed-off PR ref
+and require `FETCH_HEAD` to equal each unchanged candidate SHA. A retry action
+must name its source Smoke and source evidence UUID; verify both against the
+child handoff before testing. Use a clean detached worktree at the exact SHA,
+run the same repository-standard health/OpenAPI Smoke, retain a new immutable
+Context Receipt and evidence comment, and clean up only owned processes and
+temporary worktrees. The retry does not weaken provenance and authorizes no
+deployment.
 
 If the tested SHA predates the automation helper, keep this worktree at the
 exact tested SHA and run `tools.multica.workflow` only from the Delivery Lead's

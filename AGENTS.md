@@ -22,6 +22,22 @@ temporary CSS-worker port, while the Webpack production build is supported.
 The committed development API default is `http://localhost:8080` through
 `NEXT_PUBLIC_API_BASE_URL`.
 
+## Repository knowledge
+
+At task start, verify `docs/agent-knowledge/index.yaml` and the frontend-owned
+shared `docs/delivery-knowledge/index.yaml`, then run the path-scoped
+`tools.multica.knowledge context` command with the task, task type, changed
+paths, and current exact repository SHA. Attach its canonical JSON as the
+Context Receipt in normal task evidence.
+
+Knowledge is navigation, not truth. Check every material selected claim
+against current code, tests, or an authoritative contract. Report stale or
+conflicting knowledge in the Context Receipt; code, tests, and exact-SHA
+evidence win. If delivery reveals a novel, verified, reusable fact, propose a
+Knowledge Candidate in the versioned evidence block. Do not edit canonical
+knowledge incidentally during business work. Curation uses a separate
+knowledge pull request with human review; never self-approve or self-merge it.
+
 ## Secret safety
 
 `.env.local` is optional for personal overrides. Never commit or print it, or
