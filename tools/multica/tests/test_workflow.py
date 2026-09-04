@@ -2838,6 +2838,220 @@ def committed_smoke_retry_snapshot(*, result="pass", identifier="PRO-65", **over
     return replace(source, **values)
 
 
+class RefreshWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        from tools.multica import candidate_refresh as c
+        from tools.multica.tests.test_candidate_refresh import refresh_snapshot_fixture
+        self.c = c
+        self.fixture = refresh_snapshot_fixture
+        self.assertIn("refresh_state", ParentSnapshot.__dataclass_fields__, "workflow refresh guard not implemented")
+
+    def parent(self, data):
+        meta, detail, assignment = data["metadata"], data["parent"], data["assignment"]
+        return ParentSnapshot(identifier=detail["identifier"], classification=meta["eventra.workflow.classification"],
+            attempt=int(meta["eventra.workflow.attempt"]), last_action=meta["eventra.workflow.last_action"],
+            merge_state=meta["eventra.workflow.merge_state"], candidate_frontend_sha=meta["eventra.workflow.frontend_sha"],
+            candidate_backend_sha=None, children=tuple(workflow_module._phase_snapshot(child["detail"], child["metadata"])
+                                                      for child in data["children"]),
+            pull_requests=(PullRequestSnapshot("frontend", data["pr"]["url"], data["pr"]["head_sha"], "open", True, True),),
+            parent_status=detail["status"], next_stage=int(meta["eventra.workflow.next_stage"]), parent_id=detail["id"],
+            parent_project_id=detail["project_id"], parent_assignee_type="squad", parent_assignee_id=assignment["squad_id"],
+            delivery_squad_id=assignment["squad_id"], delivery_lead_id=assignment["lead_id"], delivery_squad_leader_id=assignment["lead_id"],
+            assignment_agent_ids=tuple(sorted((role, identity) for role, identity in assignment["roles"].items() if role != "delivery_lead")),
+            assignment_project_ids=tuple(sorted(assignment["projects"].items())),
+            delivery_squad_members=tuple(sorted((item["member_id"], item["member_type"], item["role"]) for item in assignment["members"])),
+            refresh_state=self.c.RefreshSnapshot(self.c.canonical_json(data)))
+
+    def gates(self, data, *, result="pass"):
+        from tools.multica.tests.test_candidate_refresh import uid
+        from tools.multica.tests.test_issue_contracts import issue_detail
+        data = copy.deepcopy(data)
+        action = "2:PRO-900:create_gate_stage:0:frontend:" + "f" * 40 + ":-:next-stage:3"
+        data["metadata"].update({"eventra.workflow.next_stage": "4", "eventra.workflow.last_action": action})
+        for index, (kind, role) in enumerate((("review", "independent_reviewer"), ("qa", "integration_qa"))):
+            meta = {"eventra.workflow.version": "2", "eventra.phase.kind": kind, "eventra.phase.attempt": "0",
+                    "eventra.phase.result": result if kind == "review" else "pass", "eventra.phase.sha.frontend": "f" * 40,
+                    "eventra.phase.creation_action": action, "eventra.phase.target": "repository:frontend", "eventra.phase.role": role,
+                    "eventra.phase.evidence_comment": uid(42 + index), "eventra.phase.failure_repositories": "[]"}
+            if result != "pass" and kind == "review":
+                meta.update({"eventra.phase.failure_repositories": '["frontend"]',
+                             "eventra.phase.evidence_comment_url": "https://example.test/comments/" + uid(42 + index)})
+            data["children"].append({"detail": issue_detail(id=uid(40 + index), identifier=f"PRO-{940 + index}", parent_issue_id=uid(2),
+                                     stage=3, project_id=uid(5), assignee_id=data["assignment"]["roles"][role], status="done", workspace_id=uid(1)),
+                                     "metadata": meta, "evidence": None})
+        return data
+
+    def test_legacy_gate_decision_remains_unchanged(self):
+        self.assertEqual(decide_parent_action(parent_snapshot()).kind, "create_gate_stage")
+
+    def test_paused_intent_does_not_fall_through_to_old_gate(self):
+        _, data = self.fixture(state="intent")
+        self.assertEqual(decide_parent_action(self.parent(data)).kind, "noop")
+
+    def test_registered_target_requires_publication_not_old_gate(self):
+        _, data = self.fixture()
+        result = decide_parent_action(self.parent(data))
+        self.assertEqual(result.kind, "publish_refresh")
+
+    def test_adoption_creates_stage_three_and_preserves_stage_one(self):
+        _, data = self.fixture(adopted=True)
+        parent = self.parent(data)
+        before = parent.children[0]
+        result = decide_parent_action(parent)
+        self.assertEqual(result.kind, "create_gate_stage")
+        self.assertIn("next-stage:3", result.action_key)
+        self.assertEqual(parent.children[0], before)
+        self.assertEqual(parent.children[0].frontend_sha, "b" * 40)
+
+    def test_full_gate_pass_keeps_human_merge_hold(self):
+        _, data = self.fixture(adopted=True)
+        result = decide_parent_action(self.parent(self.gates(data)))
+        self.assertEqual(result.kind, "noop")
+        self.assertEqual(result.reason, "human merge approval required")
+
+    def test_true_gate_failure_still_enters_existing_repair(self):
+        _, data = self.fixture(adopted=True)
+        result = decide_parent_action(self.parent(self.gates(data, result="fail")))
+        self.assertEqual(result.kind, "create_repair_stage")
+        self.assertIn("create_repair_stage:1", result.action_key)
+
+    def test_refresh_failure_is_block_not_repair(self):
+        _, data = self.fixture(state="child_dispatched")
+        data["children"][1]["metadata"]["eventra.phase.result"] = "fail"
+        result = decide_parent_action(self.parent(data))
+        self.assertEqual(result.kind, "block_parent")
+        self.assertIsNone(result.failure_bundle)
+
+    def test_missing_refresh_authority_is_not_legacy_compatibility(self):
+        _, data = self.fixture(adopted=True)
+        parent = replace(self.parent(data), refresh_state=None)
+        self.assertEqual(decide_parent_action(parent).kind, "block_parent")
+
+    def test_outer_candidate_cannot_disagree_with_refresh_snapshot(self):
+        _, data = self.fixture(adopted=True)
+        parent = replace(self.parent(data), candidate_frontend_sha="a" * 40)
+        self.assertEqual(decide_parent_action(parent).kind, "block_parent")
+
+    def test_unknown_or_partial_parent_feature_metadata_is_rejected(self):
+        base = FakeWorkflowRunner().parent_metadata
+        for values in ({"eventra.refresh.version": "1"}, {"eventra.refresh.merge_permission": "allow"}):
+            with self.subTest(values=values), self.assertRaises(RuntimeError):
+                workflow_module._parent_metadata(base | values)
+
+    def test_refresh_kind_needs_complete_feature_provenance(self):
+        _, data = self.fixture()
+        child = data["children"][1]
+        parsed = workflow_module._phase_snapshot(child["detail"], child["metadata"])
+        self.assertIsNotNone(parsed.refresh_provenance)
+        for key in ("eventra.refresh.version", "eventra.refresh.request_digest", "eventra.refresh.source_sha"):
+            meta = dict(child["metadata"])
+            del meta[key]
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                workflow_module._phase_snapshot(child["detail"], meta)
+
+    def test_refresh_cannot_use_ordinary_finish_phase(self):
+        runner = FakeWorkflowRunner()
+        with self.assertRaises(ValueError):
+            finish_phase(runner, "PRO-36", replace(implementation_completion(), kind="refresh"))
+        self.assertEqual(runner.mutation_count, 0)
+
+    def test_duplicate_or_misplaced_refresh_does_not_count_as_repair_history(self):
+        _, data = self.fixture(adopted=True)
+        parent = self.parent(data)
+        self.assertTrue(workflow_module._attempt_history_is_consistent(parent))
+        self.assertFalse(workflow_module._attempt_history_is_consistent(replace(parent, children=parent.children + (parent.children[1],))))
+        self.assertFalse(workflow_module._attempt_history_is_consistent(replace(parent, children=(parent.children[0], replace(parent.children[1], stage=3)))))
+
+    def test_legacy_loader_requires_configured_refresh_authority_reader(self):
+        runner = FakeParentRunner()
+        _, data = self.fixture(state="intent")
+        runner.metadata["PRO-35"].update({key: value for key, value in data["metadata"].items() if key.startswith("eventra.refresh.")})
+        with self.assertRaisesRegex(RuntimeError, "configured authoritative reader"):
+            load_parent_snapshot(runner, FakeGitHubRunner(), "PRO-35")
+
+    def test_hold_survives_real_repair_and_later_gate_pass(self):
+        from tools.multica.tests.test_candidate_refresh import uid
+        from tools.multica.tests.test_issue_contracts import issue_detail
+        _, data = self.fixture(adopted=True)
+        data = self.gates(data, result="fail")
+        parent = self.parent(data)
+        decision = decide_parent_action(parent)
+        self.assertEqual(decision.kind, "create_repair_stage")
+        reservation = _build_repair_reservation(parent, decision)
+        spec = _repair_child_specs(parent, decision.failure_bundle)[0]
+        meta = workflow_module._repair_child_metadata(reservation, spec)
+        meta.update({"eventra.phase.result": "pass", "eventra.phase.sha.frontend": "9" * 40,
+                     "eventra.phase.evidence_comment": uid(55)})
+        data["children"].append({"detail": issue_detail(id=uid(54), identifier="PRO-954", parent_issue_id=uid(2), stage=4,
+                                  project_id=uid(5), assignee_id=uid(8), status="done", workspace_id=uid(1)),
+                                  "metadata": meta, "evidence": None})
+        data["metadata"].update({"eventra.workflow.next_stage": "5", "eventra.workflow.attempt": "1",
+                                 "eventra.workflow.frontend_sha": "9" * 40, "eventra.workflow.last_action": decision.action_key})
+        data["pr"]["head_sha"] = "9" * 40
+        gate_decision = decide_parent_action(self.parent(data))
+        self.assertEqual(gate_decision.kind, "create_gate_stage", gate_decision.reason)
+        for offset, original in enumerate(data["children"][2:4]):
+            gate = copy.deepcopy(original)
+            gate["detail"].update(id=uid(60 + offset), identifier=f"PRO-{960 + offset}", stage=5)
+            gate["metadata"].update({"eventra.phase.result": "pass", "eventra.phase.attempt": "1",
+                                      "eventra.phase.sha.frontend": "9" * 40, "eventra.phase.failure_repositories": "[]",
+                                      "eventra.phase.evidence_comment": uid(62 + offset),
+                                      "eventra.phase.creation_action": gate_decision.action_key})
+            gate["metadata"].pop("eventra.phase.evidence_comment_url", None)
+            data["children"].append(gate)
+        data["metadata"].update({"eventra.workflow.next_stage": "6", "eventra.workflow.last_action": gate_decision.action_key})
+        final = decide_parent_action(self.parent(data))
+        self.assertEqual((final.kind, final.reason), ("noop", "human merge approval required"))
+        self.assertEqual(json.loads(data["metadata"]["eventra.refresh.adoption"])["target_sha"], "f" * 40)
+
+    def test_loader_rechecks_specialized_authority_after_outer_reads(self):
+        from tools.multica.tests.test_refresh_executor import ReadBoundary
+        from tools.multica.tests.test_candidate_refresh import uid
+        _, data = self.fixture(state="intent")
+        class Runner(ReadBoundary):
+            def run(self, args):
+                return super().run(args + ["--profile", "pro-1", "--workspace-id", uid(1)])
+        class GitHub:
+            def run(self, args):
+                if args != ["pr", "view", data["pr"]["url"], "--json",
+                            "url,headRefOid,state,mergeable,mergeStateStatus,statusCheckRollup"]:
+                    raise AssertionError("unexpected GitHub query")
+                return {"url": data["pr"]["url"], "headRefOid": "b" * 40, "state": "OPEN",
+                        "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "statusCheckRollup": []}
+        class Reader:
+            calls = 0
+            drift = False
+            def snapshot(self, key):
+                if key != "PRO-900":
+                    raise AssertionError("cross-parent read")
+                self.calls += 1
+                value = copy.deepcopy(data)
+                if self.drift and self.calls > 1:
+                    value["parent"]["revision"] += 1
+                return workflow_module.refresh.RefreshSnapshot(workflow_module.refresh.canonical_json(value))
+        runner = Runner("e" * 40, "git version 2.50.1")
+        runner.parent, runner.metadata = copy.deepcopy(data["parent"]), copy.deepcopy(data["metadata"])
+        reader = Reader()
+        parent = load_parent_snapshot(runner, GitHub(), "PRO-900", refresh_api=reader)
+        self.assertEqual(decide_parent_action(parent).kind, "noop")
+        self.assertGreaterEqual(reader.calls, 2)
+        reader.calls, reader.drift = 0, True
+        with self.assertRaisesRegex(RuntimeError, "changed"):
+            load_parent_snapshot(runner, GitHub(), "PRO-900", refresh_api=reader)
+
+    def test_finish_parent_cannot_complete_a_refresh_merge_hold(self):
+        runner = FakeParentCompletionRunner()
+        _, data = self.fixture(adopted=True)
+        # The outer legacy snapshot is otherwise genuinely completion-ready and
+        # matches the called parent. Ignoring refresh_state would mutate it.
+        ready = ParentCompletionTests().completion_snapshot()
+        self.assertEqual(decide_parent_action(ready).kind, "complete_parent")
+        held = replace(ready, refresh_state=self.c.RefreshSnapshot(self.c.canonical_json(data)))
+        with self.assertRaises(RuntimeError):
+            finish_parent(runner, "PRO-35", lambda: held)
+        self.assertFalse(any(call[:2] == ("issue", "status") for call in runner.calls))
+
+
 class ParentDecisionTests(unittest.TestCase):
     def test_committed_retry_smoke_pass_completes_and_nonpass_cannot_retry_again(self):
         passed = decide_parent_action(committed_smoke_retry_snapshot())
@@ -7760,6 +7974,18 @@ class FakeRepairRunner:
 
 
 class SmokeExecutionTests(unittest.TestCase):
+    def test_existing_smoke_reservation_cannot_bypass_refresh_hold(self):
+        runner, github, decision = self._planned()
+        runner.hard_interrupt_after_create = True
+        with self.assertRaises(KeyboardInterrupt):
+            execute_parent_smoke(runner, github, "PRO-65", expected_action_key=decision.action_key)
+        runner.hard_interrupt_after_create = False
+        runner.metadata["PRO-65"]["eventra.refresh.merge_permission"] = "hold"
+        before = runner.committed_mutations
+        result = execute_parent_smoke(runner, github, "PRO-65", expected_action_key=decision.action_key)
+        self.assertEqual(result.next_action, "block")
+        self.assertEqual(runner.committed_mutations, before)
+
     class GitHub(FakeRepairGitHubRunner):
         def run(self, args):
             value = super().run(args)

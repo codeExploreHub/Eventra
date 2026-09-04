@@ -452,3 +452,274 @@ def admit_refresh(request: RefreshRequest, snapshot: RefreshSnapshot, grant: Ref
     _require(len(active) <= 1 and all(run.get("issue_id") == parent["id"]
              and run.get("agent_id") == payload["assignment"]["lead_id"] for run in active),
              "active child or nonunique Lead writer")
+
+
+REFRESH_PREFIX = "eventra.refresh."
+REFRESH_FIELDS = frozenset({"version", "request", "request_comment", "request_digest", "authorization_comment",
+                            "reservation", "consumed", "adoption", "merge_permission"})
+RESERVATION_STATES = ("reserved", "child_initialized", "child_dispatched", "candidate_registered", "published", "adopted")
+
+
+@dataclass(frozen=True)
+class RefreshDecision:
+    kind: str
+    action_key: str | None
+    reason: str
+
+
+def refresh_action(request: RefreshRequest) -> str:
+    payload = _request(request)
+    return (f"2:{payload['parent']['identifier']}:create_refresh_stage:0:frontend:"
+            f"{payload['source']['sha']}:next-stage:2:refresh:1:{request.digest}")
+
+
+def refresh_metadata(metadata: dict[str, str]) -> dict[str, Any] | None:
+    """Reject partial/unknown feature markers instead of falling back to legacy gates."""
+    _require(type(metadata) is dict and all(type(k) is str and type(v) is str for k, v in metadata.items()))
+    values = {k.removeprefix(REFRESH_PREFIX): v for k, v in metadata.items() if k.startswith(REFRESH_PREFIX)}
+    if not values:
+        return None
+    _require(set(values) <= REFRESH_FIELDS and {"version", "request", "request_digest", "merge_permission"} <= set(values),
+             "incomplete refresh feature metadata")
+    _require(values["version"] == "1" and values["merge_permission"] == "hold", "refresh merge hold is immutable")
+    request = parse_request(values["request"])
+    _require(values["request"] == canonical_json({"payload": request.payload(), "digest": request.digest,
+                                                  "staging_ref": request.staging_ref}), "noncanonical refresh request")
+    _require(values["request_digest"] == request.digest, "refresh feature request mismatch")
+    for key in ("request_comment", "authorization_comment"):
+        if key in values:
+            _uuid(values[key])
+    for key in ("reservation", "consumed", "adoption"):
+        if key in values:
+            raw = _load_json(values[key], MAX_COMMENT_BYTES)
+            _require(type(raw) is dict and values[key] == canonical_json(raw), "noncanonical refresh receipt")
+            values[key] = raw
+    return values
+
+
+def parent_projection_digest(state: dict) -> str:
+    """Bind the last observed parent effect; never ignore revision drift globally.
+
+    Reservation excludes itself and the issue detail's echoed KV map to avoid
+    digest recursion. Server-maintained activity clocks are not business effects;
+    revision and all other authority remain bound. The separate metadata read is
+    bound exactly once. The writer must compute
+    an expected projection for each effect and re-read it (Task 5); this hash alone
+    does not prove that an external writer was authorized.
+    """
+    metadata = {k: v for k, v in state["metadata"].items() if k != REFRESH_PREFIX + "reservation"}
+    parent = {k: v for k, v in state["parent"].items() if k not in {"metadata", "updated_at", "last_activity_at"}}
+    return hashlib.sha256(canonical_json({"parent": parent, "metadata": metadata}).encode()).hexdigest()
+
+
+def _request_comment(request: RefreshRequest, state: dict, feature: dict) -> None:
+    wanted = feature.get("request_comment")
+    _require(wanted is not None, "request comment missing")
+    matches = [item for item in state["comments"] if item.get("comment_uuid") == wanted]
+    _require(len(matches) == 1, "request comment missing or duplicate")
+    comment = RefreshComment(**matches[0])
+    payload = request.payload()
+    _comment(comment, payload["parent"]["id"], comment.author_type)
+    _require(comment.author_type == "member" or (comment.author_type == "agent"
+             and comment.author_id == payload["assignment"]["lead_id"]), "request author mismatch")
+    parsed = parse_request(_block(comment.content, "request", only=True))
+    _require(parsed == request, "request comment changed")
+
+
+def _refresh_child(request: RefreshRequest, state: dict) -> tuple[dict, PreparedCandidate | None]:
+    payload = request.payload()
+    matches = [child for child in state["children"] if child["detail"]["stage"] == 2]
+    _require(len(matches) == 1, "refresh Stage 2 membership mismatch")
+    child = _object(matches[0], "detail metadata evidence")
+    detail, metadata = child["detail"], child["metadata"]
+    _uuid(detail["id"])
+    _match(detail["identifier"], _ISSUE)
+    _require(detail["id"] not in (payload["parent"]["id"], payload["source"]["child_id"])
+             and detail["identifier"] not in (payload["parent"]["identifier"], payload["source"]["child_identifier"])
+             and detail["workspace_id"] == payload["workspace_id"] and detail["parent_issue_id"] == payload["parent"]["id"]
+             and detail["project_id"] == payload["assignment"]["project_id"]
+             and detail["assignee_type"] == "agent" and detail["assignee_id"] == payload["assignment"]["engineer_id"],
+             "refresh child assignment mismatch")
+    expected = {"eventra.workflow.version": "2", "eventra.phase.kind": "refresh", "eventra.phase.attempt": "0",
+                "eventra.phase.target": "repository:frontend", "eventra.phase.role": "frontend_engineer",
+                "eventra.phase.creation_action": refresh_action(request), "eventra.phase.pr": payload["pr"]["url"],
+                "eventra.refresh.version": "1", "eventra.refresh.request_digest": request.digest,
+                "eventra.refresh.source_sha": payload["source"]["sha"]}
+    _require(all(metadata.get(k) == v for k, v in expected.items()), "refresh child provenance mismatch")
+    allowed = set(expected) | {"eventra.phase.sha.frontend", "eventra.phase.result", "eventra.phase.evidence_comment",
+                              "eventra.phase.failure_repositories"}
+    _require(not any(k.startswith(("eventra.phase.", "eventra.workflow.", REFRESH_PREFIX, "eventra.repair."))
+                     and k not in allowed for k in metadata), "unknown refresh child authority")
+    _require(metadata.get("eventra.phase.failure_repositories", "[]") == "[]", "refresh is not repair")
+    result = metadata.get("eventra.phase.result")
+    _require(result not in {"fail", "blocked"}, "refresh preparation failed; no automatic repair")
+    _require(detail["status"] in {"backlog", "todo", "in_progress", "in_review", "done"}, "refresh child status")
+    if detail["status"] != "done":
+        _require(result is None and child["evidence"] is None
+                 and metadata.get("eventra.phase.sha.frontend") == payload["source"]["sha"], "partial preparation requires executor")
+        return child, None
+    _require(result == "pass" and type(child["evidence"]) is dict, "missing prepared PASS")
+    comment = RefreshComment(**child["evidence"])
+    prepared = parse_prepared(comment, request, detail["id"])
+    body = _block(comment.content, "prepared")
+    _require(body["context_receipt"]["task_id"] == detail["identifier"]
+             and metadata.get("eventra.phase.sha.frontend") == prepared.target_sha
+             and metadata.get("eventra.phase.evidence_comment") == prepared.evidence_uuid, "prepared completion mismatch")
+    return child, prepared
+
+
+def _receipt_match(feature: dict, request: RefreshRequest, prepared: PreparedCandidate, *, partial: bool = False) -> None:
+    expected = {"version": 1, "request_digest": request.digest,
+                "authorization_uuid": feature["authorization_comment"], "child_id": prepared.child_id, "target_sha": prepared.target_sha}
+    if not partial or "consumed" in feature:
+        consumed = _object(feature.get("consumed"), "version request_digest authorization_uuid child_id target_sha")
+        _integer(consumed["version"], 1)
+        _require(consumed == expected and "adoption" in feature, "refresh consumption mismatch")
+    if not partial or "adoption" in feature:
+        adoption = _object(feature.get("adoption"), "version request_digest authorization_uuid child_id target_sha "
+                           "source_sha prerequisite_sha evidence_uuid evidence_digest stage control_tool_sha")
+        _integer(adoption["version"], 1)
+        _integer(adoption["stage"], 2)
+        _require(adoption == {**expected, "source_sha": prepared.source_sha, "prerequisite_sha": prepared.prerequisite_sha,
+                              "evidence_uuid": prepared.evidence_uuid, "evidence_digest": prepared.evidence_digest,
+                              "stage": 2, "control_tool_sha": request.payload()["control_tool_sha"]}, "refresh adoption mismatch")
+
+
+def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> RefreshDecision:
+    payload, state = _request(request), _snapshot(snapshot)
+    _shared_authority(payload, state)
+    feature = refresh_metadata(state["metadata"])
+    key = refresh_action(request)
+    if feature is None:
+        matching = []
+        for raw in state["comments"]:
+            try:
+                grant = RefreshComment(**raw)
+                validate_grant(grant, request)
+                matching.append(grant)
+            except (TypeError, ValueError):
+                continue
+        _require(len(matching) == 1, "exact member grant required")
+        admit_refresh(request, snapshot, matching[0])
+        return RefreshDecision("create_refresh_stage", key, "exact refresh request admitted")
+    _require(feature["request_digest"] == request.digest, "refresh request changed")
+    metadata = state["metadata"]
+    _require(metadata.get("eventra.workflow.version") == "2"
+             and metadata.get("eventra.workflow.classification") == "frontend-only"
+             and "eventra.workflow.backend_sha" not in metadata, "invalid refresh scope")
+    if "authorization_comment" not in feature:
+        _require(not {"reservation", "consumed", "adoption"} & set(feature)
+                 and len(state["children"]) == 1 and metadata.get("eventra.workflow.attempt") == "0"
+                 and metadata.get("eventra.workflow.next_stage") == "2"
+                 and metadata.get("eventra.workflow.last_action") == payload["parent"]["last_action"]
+                 and metadata.get("eventra.workflow.merge_state") == "not_ready"
+                 and metadata.get("eventra.workflow.frontend_sha") == payload["source"]["sha"]
+                 and state["pr"]["head_sha"] == payload["source"]["sha"]
+                 and state["parent"]["status"] == "blocked", "invalid paused refresh intent")
+        return RefreshDecision("wait", None, "refresh intent awaits exact member authorization")
+    _request_comment(request, state, feature)
+    grant = [item for item in state["comments"] if item.get("comment_uuid") == feature["authorization_comment"]]
+    _require(len(grant) == 1, "missing refresh grant")
+    _grant_in_state(request, state, RefreshComment(**grant[0]))
+    reservation = feature.get("reservation")
+    if reservation is None:
+        child, prepared = _refresh_child(request, state)
+        _require(prepared is not None, "refresh has no completed preparation")
+        _receipt_match(feature, request, prepared)
+        _require(metadata.get("eventra.workflow.attempt") in {"0", "1", "2", "3"}, "refresh attempt mismatch")
+        # Later exact gates/repairs are checked by the existing workflow planner.
+        # The adoption stays tied to Stage 2, never rewritten to a later repair SHA.
+        if len(state["children"]) > 2:
+            later = [item for item in state["children"] if item["detail"]["id"] not in
+                     (payload["source"]["child_id"], prepared.child_id)]
+            _require(len(later) == len(state["children"]) - 2
+                     and all(type(item["detail"]["stage"]) is int and item["detail"]["stage"] >= 3 for item in later),
+                     "invalid post-refresh history")
+            gates = [item for item in later if item["detail"]["stage"] == 3]
+            _require(sorted(item["metadata"].get("eventra.phase.kind", "") for item in gates) == ["qa", "review"],
+                     "missing fresh Stage 3 gates")
+            for gate in gates:
+                role = "independent_reviewer" if gate["metadata"]["eventra.phase.kind"] == "review" else "integration_qa"
+                expected_action = f"2:{payload['parent']['identifier']}:create_gate_stage:0:frontend:{prepared.target_sha}:-:next-stage:3"
+                _require(gate["metadata"].get("eventra.phase.sha.frontend") == prepared.target_sha
+                         and gate["metadata"].get("eventra.phase.attempt") == "0"
+                         and gate["metadata"].get("eventra.phase.creation_action") == expected_action
+                         and gate["metadata"].get("eventra.phase.target") == "repository:frontend"
+                         and gate["metadata"].get("eventra.phase.role") == role
+                         and gate["detail"]["parent_issue_id"] == payload["parent"]["id"]
+                         and gate["detail"]["project_id"] == payload["assignment"]["project_id"]
+                         and gate["detail"]["assignee_type"] == "agent"
+                         and gate["detail"]["assignee_id"] == state["assignment"]["roles"][role], "fresh gate provenance mismatch")
+            return RefreshDecision("wait", None, "refresh adopted; validate normal gate or repair history")
+        _require(metadata.get("eventra.workflow.attempt") == "0"
+                 and metadata.get("eventra.workflow.next_stage") == "3"
+                 and metadata.get("eventra.workflow.last_action") == key
+                 and metadata.get("eventra.workflow.frontend_sha") == prepared.target_sha
+                 and metadata.get("eventra.workflow.merge_state") == "not_ready"
+                 and state["pr"]["head_sha"] == prepared.target_sha, "adopted candidate mismatch")
+        return RefreshDecision("create_gate_stage", None, "adopted refresh requires fresh Stage 3 gates")
+    reservation = _object(reservation, "version request_digest authorization_uuid action_key state child_id "
+                          "child_identifier prepared parent_projection_digest")
+    _integer(reservation["version"], 1)
+    _require(reservation["request_digest"] == request.digest and reservation["authorization_uuid"] == feature["authorization_comment"]
+             and reservation["action_key"] == key and reservation["state"] in RESERVATION_STATES,
+             "reservation identity mismatch")
+    _require(reservation["parent_projection_digest"] == parent_projection_digest(state), "reservation parent projection drift")
+    _require(metadata.get("eventra.workflow.attempt") == "0"
+             and metadata.get("eventra.workflow.merge_state") == "not_ready"
+             and not any(k in metadata for k in ("eventra.workflow.repair_reservation", "eventra.workflow.smoke_reservation")),
+             "conflicting refresh reservation")
+    active = [run for run in state["runs"] if run["status"] in {"queued", "dispatched", "running", "waiting_local_directory"}]
+    parent_runs = [run for run in active if run["issue_id"] == payload["parent"]["id"]]
+    _require(len(parent_runs) <= 1 and all(run["agent_id"] == payload["assignment"]["lead_id"] for run in parent_runs),
+             "nonunique Lead writer")
+    if reservation["state"] == "reserved":
+        _require(len(state["children"]) == 1 and reservation["child_id"] is None
+                 and reservation["child_identifier"] is None and reservation["prepared"] is None
+                 and not {"adoption", "consumed"} & set(feature)
+                 and metadata.get("eventra.workflow.next_stage") == "2"
+                 and metadata.get("eventra.workflow.last_action") == payload["parent"]["last_action"]
+                 and metadata.get("eventra.workflow.frontend_sha") == payload["source"]["sha"]
+                 and state["pr"]["head_sha"] == payload["source"]["sha"] and active == parent_runs,
+                 "reserved initialization requires exact executor recovery")
+        return RefreshDecision("resume_refresh", key, "resume reserved Stage 2 initialization")
+    child, prepared = _refresh_child(request, state)
+    _require(len(state["children"]) == 2 and reservation["child_id"] == child["detail"]["id"]
+             and reservation["child_identifier"] == child["detail"]["identifier"]
+             and metadata.get("eventra.workflow.next_stage") == "3" and metadata.get("eventra.workflow.last_action") == key,
+             "reservation child mismatch")
+    child_runs = [run for run in active if run not in parent_runs]
+    _require(len(child_runs) <= 1 and all(run["issue_id"] == child["detail"]["id"]
+             and run["agent_id"] == payload["assignment"]["engineer_id"] for run in child_runs), "unexpected active child")
+    if reservation["state"] in {"child_initialized", "child_dispatched"}:
+        _require(reservation["prepared"] is None and not {"adoption", "consumed"} & set(feature)
+                 and state["pr"]["head_sha"] == payload["source"]["sha"]
+                 and metadata.get("eventra.workflow.frontend_sha") == payload["source"]["sha"], "unregistered head drift")
+        if prepared is not None:
+            _require(not child_runs, "preparation still has an active writer")
+        return RefreshDecision("resume_refresh" if prepared or reservation["state"] == "child_initialized" else "wait",
+                               key, "resume preparation registration" if prepared else "refresh preparation pending")
+    _require(prepared is not None and not child_runs and reservation["prepared"] == asdict(prepared), "registered preparation mismatch")
+    _require(state["pr"]["head_sha"] in {prepared.source_sha, prepared.target_sha}, "unregistered head drift")
+    if reservation["state"] == "candidate_registered":
+        _require(not {"adoption", "consumed"} & set(feature)
+                 and metadata.get("eventra.workflow.frontend_sha") == prepared.source_sha, "premature adoption")
+        return RefreshDecision("publish_refresh", key, "publish or reconcile registered candidate")
+    _require(state["pr"]["head_sha"] == prepared.target_sha, "published head mismatch")
+    _require(metadata.get("eventra.workflow.frontend_sha") in {prepared.source_sha, prepared.target_sha}, "adoption drift")
+    _receipt_match(feature, request, prepared, partial=True)
+    _require((metadata["eventra.workflow.frontend_sha"] != prepared.target_sha or "adoption" in feature)
+             and ("consumed" not in feature or metadata["eventra.workflow.frontend_sha"] == prepared.target_sha),
+             "illegal partial adoption order")
+    if reservation["state"] == "adopted":
+        _receipt_match(feature, request, prepared)
+        _require(metadata["eventra.workflow.frontend_sha"] == prepared.target_sha, "adoption is incomplete")
+    return RefreshDecision("resume_refresh", key, "resume adoption; gates wait for reservation clearance")
+
+
+def plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> RefreshDecision:
+    """A pure, fail-closed recommendation; no decision authorizes an I/O side effect."""
+    try:
+        return _plan_refresh(request, snapshot)
+    except (ValueError, TypeError, KeyError, AttributeError, IndexError):
+        return RefreshDecision("block", None, "refresh authority, provenance or state is inconsistent")

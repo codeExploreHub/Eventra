@@ -9,6 +9,221 @@ import unittest
 from dataclasses import replace
 
 
+def refresh_snapshot_fixture(*, state="candidate_registered", adopted=False):
+    """Explicit authority fixture, without production admission/planner helpers."""
+    from tools.multica import candidate_refresh as c
+    from tools.multica.tests.test_refresh_executor import ReadBoundary
+    from tools.multica.tests.test_issue_contracts import issue_detail
+    boundary = ReadBoundary("e" * 40, "git version 2.50.1")
+    request = boundary.request
+    comment = lambda raw, issue: {"issue_id": issue, "comment_uuid": raw["id"], "author_id": raw["author_id"],
+                                  "author_type": raw["author_type"], "revision": raw["revision"], "content": raw["content"]}
+    action = "2:PRO-900:create_refresh_stage:0:frontend:" + "b" * 40 + ":next-stage:2:refresh:1:" + request.digest
+    envelope = {"payload": request.payload(), "digest": request.digest, "staging_ref": request.staging_ref}
+    data = {"parent": copy.deepcopy(boundary.parent), "metadata": copy.deepcopy(boundary.metadata),
+            "children": [{"detail": copy.deepcopy(boundary.child), "metadata": copy.deepcopy(boundary.child_metadata),
+                          "evidence": comment(boundary.evidence, uid(3))}], "runs": [],
+            "comments": [comment(boundary.grant, uid(2))],
+            "pr": {**request.payload()["pr"], "head_sha": "b" * 40, "state": "open", "merged": False},
+            "prerequisite": {**request.payload()["prerequisite"], "merged": True, "ancestor_sha": "d" * 40},
+            "assignment": {**request.payload()["assignment"], "workspace_id": uid(1), "roles": boundary.role_ids,
+                           "projects": {"frontend": uid(5), "backend": uid(30)},
+                           "members": sorted([{k: value[k] for k in ("member_id", "member_type", "role")}
+                                              for value in boundary.members], key=lambda item: (item["role"], item["member_id"]))},
+            "tool": {"sha": "e" * 40, "git_version": "git version 2.50.1"}}
+    if state == "entry":
+        return request, data
+    data["metadata"].update({"eventra.refresh.version": "1", "eventra.refresh.request": encode(envelope),
+                              "eventra.refresh.request_digest": request.digest, "eventra.refresh.merge_permission": "hold",
+                              "eventra.refresh.request_comment": uid(12), "eventra.refresh.authorization_comment": uid(10)})
+    data["comments"].append({"issue_id": uid(2), "comment_uuid": uid(12), "author_type": "agent", "author_id": uid(7),
+                             "revision": 1, "content": block("request", envelope)})
+    data["parent"]["revision"] = 8
+    if state == "intent":
+        del data["metadata"]["eventra.refresh.authorization_comment"]
+        data["comments"] = data["comments"][1:]
+        return request, data
+    prepared_block = prepared_payload(request)
+    prepared_comment = {"issue_id": uid(9), "comment_uuid": uid(13), "author_id": uid(8), "author_type": "agent",
+                        "revision": 1, "content": block("prepared", prepared_block)}
+    prepared = {"request_digest": request.digest, "child_id": uid(9), "source_sha": "b" * 40,
+                "prerequisite_sha": "d" * 40, "target_sha": "f" * 40, "tree_sha": "1" * 40,
+                "evidence_uuid": uid(13), "evidence_digest": hashlib.sha256(prepared_comment["content"].encode()).hexdigest(),
+                "staging_ref": request.staging_ref}
+    if state != "reserved":
+        data["parent"]["status"] = "in_progress"
+        data["metadata"].update({"eventra.workflow.next_stage": "3", "eventra.workflow.last_action": action})
+        metadata = {"eventra.workflow.version": "2", "eventra.phase.kind": "refresh", "eventra.phase.attempt": "0",
+                    "eventra.phase.target": "repository:frontend", "eventra.phase.role": "frontend_engineer",
+                    "eventra.phase.creation_action": action, "eventra.phase.pr": request.payload()["pr"]["url"],
+                    "eventra.phase.sha.frontend": "f" * 40, "eventra.phase.result": "pass", "eventra.phase.evidence_comment": uid(13),
+                    "eventra.phase.failure_repositories": "[]",
+                    "eventra.refresh.version": "1", "eventra.refresh.request_digest": request.digest, "eventra.refresh.source_sha": "b" * 40}
+        data["children"].append({"detail": issue_detail(id=uid(9), identifier="PRO-902", parent_issue_id=uid(2), stage=2,
+                                          project_id=uid(5), assignee_id=uid(8), status="done", workspace_id=uid(1)),
+                                  "metadata": metadata, "evidence": prepared_comment})
+    if adopted:
+        consumed = {"version": 1, "request_digest": request.digest, "authorization_uuid": uid(10),
+                    "child_id": uid(9), "target_sha": "f" * 40}
+        adoption = {**consumed, "source_sha": "b" * 40, "prerequisite_sha": "d" * 40, "evidence_uuid": uid(13),
+                    "evidence_digest": prepared["evidence_digest"], "stage": 2, "control_tool_sha": "e" * 40}
+        data["metadata"].update({"eventra.refresh.consumed": encode(consumed), "eventra.refresh.adoption": encode(adoption),
+                                 "eventra.workflow.frontend_sha": "f" * 40})
+        data["pr"]["head_sha"] = "f" * 40
+    else:
+        if state == "published":
+            data["pr"]["head_sha"] = "f" * 40
+        reservation = {"version": 1, "request_digest": request.digest, "authorization_uuid": uid(10), "action_key": action,
+                       "state": state, "child_id": None if state == "reserved" else uid(9),
+                       "child_identifier": None if state == "reserved" else "PRO-902",
+                       "prepared": prepared if state in {"candidate_registered", "published", "adopted"} else None,
+                       "parent_projection_digest": hashlib.sha256(encode({"parent": {k: v for k, v in data["parent"].items()
+                                                                                     if k not in {"metadata", "updated_at", "last_activity_at"}},
+                                                                           "metadata": data["metadata"]}).encode()).hexdigest()}
+        data["metadata"]["eventra.refresh.reservation"] = encode(reservation)
+    return request, data
+
+
+class RefreshDecisionTests(unittest.TestCase):
+    def setUp(self):
+        from tools.multica import candidate_refresh as c
+        self.c = c
+        self.assertTrue(hasattr(c, "plan_refresh"), "refresh state machine not implemented")
+
+    def decision(self, request, data):
+        return self.c.plan_refresh(request, self.c.RefreshSnapshot(encode(data)))
+
+    def test_entry_has_deterministic_refresh_identity(self):
+        request, data = refresh_snapshot_fixture(state="entry")
+        result = self.decision(request, data)
+        self.assertEqual(result.kind, "create_refresh_stage")
+        self.assertEqual(result.action_key, "2:PRO-900:create_refresh_stage:0:frontend:" + "b" * 40
+                         + ":next-stage:2:refresh:1:" + request.digest)
+
+    def test_unadopted_refresh_cannot_open_gate(self):
+        request, data = refresh_snapshot_fixture()
+        before = copy.deepcopy(data)
+        self.assertEqual(self.decision(request, data).kind, "publish_refresh")
+        self.assertEqual(data, before)
+
+    def test_published_reservation_only_resumes_same_action(self):
+        request, data = refresh_snapshot_fixture(state="published")
+        result = self.decision(request, data)
+        self.assertEqual(result.kind, "resume_refresh")
+        self.assertIn(request.digest, result.action_key)
+
+    def test_reserved_stage_resumes_not_recreates(self):
+        request, data = refresh_snapshot_fixture(state="reserved")
+        self.assertEqual(self.decision(request, data).kind, "resume_refresh")
+
+    def test_done_prepared_is_not_qa_and_needs_registration(self):
+        request, data = refresh_snapshot_fixture(state="child_dispatched")
+        self.assertEqual(self.decision(request, data).kind, "resume_refresh")
+
+    def test_complete_adoption_opens_fresh_gate_without_changing_history(self):
+        request, data = refresh_snapshot_fixture(adopted=True)
+        source = copy.deepcopy(data["children"][0])
+        self.assertEqual(self.decision(request, data).kind, "create_gate_stage")
+        self.assertEqual(data["children"][0], source)
+        self.assertEqual(data["metadata"]["eventra.workflow.attempt"], "0")
+
+    def test_intent_without_grant_waits(self):
+        request, data = refresh_snapshot_fixture(state="intent")
+        self.assertEqual(self.decision(request, data).kind, "wait")
+
+    def test_incomplete_or_unknown_feature_fields_block(self):
+        for key, value in (("eventra.refresh.version", "2"), ("eventra.refresh.request_digest", "0" * 64),
+                           ("eventra.refresh.merge_permission", "allow"), ("eventra.refresh.unknown", "1")):
+            request, data = refresh_snapshot_fixture()
+            data["metadata"][key] = value
+            with self.subTest(key=key):
+                self.assertEqual(self.decision(request, data).kind, "block")
+
+    def test_unregistered_or_unrelated_head_drift_blocks(self):
+        for state, head in (("child_dispatched", "f" * 40), ("candidate_registered", "a" * 40)):
+            request, data = refresh_snapshot_fixture(state=state)
+            data["pr"]["head_sha"] = head
+            with self.subTest(state=state):
+                self.assertEqual(self.decision(request, data).kind, "block")
+
+    def test_illegal_receipt_and_missing_consumption_block_gate(self):
+        for key in ("eventra.refresh.consumed", "eventra.refresh.adoption", "eventra.refresh.authorization_comment"):
+            request, data = refresh_snapshot_fixture(adopted=True)
+            del data["metadata"][key]
+            with self.subTest(key=key):
+                self.assertEqual(self.decision(request, data).kind, "block")
+
+    def test_source_evidence_rewrite_still_blocks_after_adoption(self):
+        request, data = refresh_snapshot_fixture(adopted=True)
+        data["children"][0]["evidence"]["content"] = "replacement PASS"
+        self.assertEqual(self.decision(request, data).kind, "block")
+
+    def test_duplicate_refresh_and_wrong_child_assignment_block(self):
+        request, data = refresh_snapshot_fixture(adopted=True)
+        data["children"].append(copy.deepcopy(data["children"][1]))
+        self.assertEqual(self.decision(request, data).kind, "block")
+        request, data = refresh_snapshot_fixture(adopted=True)
+        data["children"][1]["detail"]["assignee_id"] = uid(99)
+        self.assertEqual(self.decision(request, data).kind, "block")
+
+    def test_refresh_failure_blocks_without_repair_or_attempt_increment(self):
+        for outcome in ("fail", "blocked"):
+            request, data = refresh_snapshot_fixture(state="child_dispatched")
+            data["children"][1]["metadata"]["eventra.phase.result"] = outcome
+            with self.subTest(outcome=outcome):
+                self.assertEqual(self.decision(request, data).kind, "block")
+                self.assertEqual(data["metadata"]["eventra.workflow.attempt"], "0")
+
+    def test_reservation_projection_mismatch_blocks_recovery(self):
+        request, data = refresh_snapshot_fixture()
+        data["parent"]["revision"] += 1
+        self.assertEqual(self.decision(request, data).kind, "block")
+
+    def test_embedded_issue_metadata_does_not_make_reservation_digest_recursive(self):
+        request, data = refresh_snapshot_fixture()
+        # Real issue get can echo the KV reservation. The separate metadata read
+        # is authoritative; its echoed copy must not hash its own digest.
+        data["parent"]["metadata"] = copy.deepcopy(data["metadata"])
+        self.assertEqual(self.decision(request, data).kind, "publish_refresh")
+
+    def test_server_activity_clocks_are_not_self_written_projection_fields(self):
+        request, data = refresh_snapshot_fixture()
+        data["parent"]["updated_at"] = "2026-09-04T02:00:00Z"
+        data["parent"]["last_activity_at"] = "2026-09-04T02:00:00Z"
+        self.assertEqual(self.decision(request, data).kind, "publish_refresh")
+        data["parent"]["revision"] += 1
+        self.assertEqual(self.decision(request, data).kind, "block")
+
+    def test_prepared_identity_or_body_drift_blocks_publication(self):
+        request, data = refresh_snapshot_fixture()
+        data["children"][1]["evidence"]["revision"] = 2
+        self.assertEqual(self.decision(request, data).kind, "block")
+
+    def test_malformed_snapshot_returns_block_not_exception(self):
+        request, data = refresh_snapshot_fixture()
+        for changed in ({}, {**data, "children": [None]}, {**data, "pr": None}):
+            with self.subTest(changed=changed.keys()):
+                self.assertEqual(self.decision(request, changed).kind, "block")
+
+    def test_published_malformed_partial_receipt_must_not_resume(self):
+        request, data = refresh_snapshot_fixture(state="published")
+        data["metadata"]["eventra.refresh.adoption"] = encode({"target_sha": "a" * 40})
+        reservation = json.loads(data["metadata"]["eventra.refresh.reservation"])
+        projection = {"parent": {k: v for k, v in data["parent"].items() if k not in {"metadata", "updated_at", "last_activity_at"}}, "metadata": {k: v for k, v in data["metadata"].items()
+                                                               if k != "eventra.refresh.reservation"}}
+        reservation["parent_projection_digest"] = hashlib.sha256(encode(projection).encode()).hexdigest()
+        data["metadata"]["eventra.refresh.reservation"] = encode(reservation)
+        self.assertEqual(self.decision(request, data).kind, "block")
+
+    def test_post_adoption_children_cannot_skip_fresh_stage_three(self):
+        request, data = refresh_snapshot_fixture(adopted=True)
+        later = copy.deepcopy(data["children"][1])
+        later["detail"].update(id=uid(99), identifier="PRO-999", stage=4)
+        later["metadata"]["eventra.phase.kind"] = "qa"
+        data["children"].append(later)
+        self.assertEqual(self.decision(request, data).kind, "block")
+
+
 def uid(number):
     return f"00000000-0000-4000-8000-{number:012d}"
 

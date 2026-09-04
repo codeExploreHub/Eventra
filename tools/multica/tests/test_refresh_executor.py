@@ -53,7 +53,8 @@ class ReadBoundary:
                                "eventra.phase.sha.frontend": "b" * 40, "eventra.phase.evidence_comment": uid(4),
                                "eventra.phase.pr": self.payload["pr"]["url"],
                                "eventra.phase.creation_action": self.payload["parent"]["last_action"],
-                               "eventra.phase.target": "repository:frontend", "eventra.phase.role": "frontend_engineer"}
+                               "eventra.phase.target": "repository:frontend", "eventra.phase.role": "frontend_engineer",
+                               "eventra.phase.failure_repositories": "[]"}
         self.comments = {"PRO-900": [self.grant], "PRO-901": [self.evidence]}
         self.runs = {"PRO-900": [], "PRO-901": []}
         self.children = [self.child]

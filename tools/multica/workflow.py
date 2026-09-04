@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 from typing import Literal, Sequence
 
 from .blueprint import build_multi_repo_blueprint
+from . import candidate_refresh as refresh
 from .contracts import (
     parse_agent_list,
     parse_project_list,
@@ -176,6 +177,7 @@ class PhaseSnapshot:
     assignee_id: str = ""
     assignee_type: str = "agent"
     workflow_version: int = 2
+    refresh_provenance: str | None = None
 
 
 @dataclass(frozen=True)
@@ -235,6 +237,7 @@ class ParentSnapshot:
     delivery_lead_id: str = ""
     delivery_squad_leader_id: str = ""
     delivery_squad_members: tuple[tuple[str, str, str], ...] = ()
+    refresh_state: refresh.RefreshSnapshot | None = None
 
 
 @dataclass(frozen=True)
@@ -248,6 +251,9 @@ class ParentDecision:
         "retry_smoke_stage",
         "complete_parent",
         "block_parent",
+        "create_refresh_stage",
+        "resume_refresh",
+        "publish_refresh",
     ]
     action_key: str | None
     reason: str
@@ -819,6 +825,15 @@ def _work_repository_coverage(
 
 
 def _attempt_history_is_consistent(snapshot: ParentSnapshot) -> bool:
+    refresh_phases = tuple(item for item in snapshot.children if item.kind == "refresh" or item.refresh_provenance is not None)
+    if refresh_phases:
+        if (len(refresh_phases) != 1 or refresh_phases[0].kind != "refresh"
+                or refresh_phases[0].stage != 2 or refresh_phases[0].attempt != 0
+                or refresh_phases[0].refresh_provenance is None or snapshot.refresh_state is None):
+            return False
+        decision = _refresh_workflow_decision(snapshot)
+        if decision is not None and decision.kind == "block_parent":
+            return False
     completed = tuple(item for item in snapshot.children if item.status == "done")
     if not completed:
         return snapshot.attempt == 0
@@ -1446,6 +1461,57 @@ def _current_repair_provenance_problem(
     )
 
 
+def _refresh_workflow_decision(snapshot: ParentSnapshot) -> ParentDecision | None:
+    """Bind the specialized authority to this exact outer snapshot before routing."""
+    if snapshot.refresh_state is None:
+        if any(item.kind == "refresh" or item.refresh_provenance is not None for item in snapshot.children):
+            return ParentDecision("block_parent", None, "refresh history lacks authoritative provenance")
+        return None
+    try:
+        state = snapshot.refresh_state.state()
+        feature = refresh.refresh_metadata(state["metadata"])
+        if feature is None:
+            raise ValueError("missing feature marker")
+        request = refresh.parse_request(feature["request"])
+        metadata, parent, assignment, pr = state["metadata"], state["parent"], state["assignment"], state["pr"]
+        expected = {"identifier": parent["identifier"], "parent_id": parent["id"],
+                    "workflow_version": int(metadata["eventra.workflow.version"]),
+                    "classification": metadata["eventra.workflow.classification"],
+                    "attempt": int(metadata["eventra.workflow.attempt"]), "next_stage": int(metadata["eventra.workflow.next_stage"]),
+                    "last_action": metadata["eventra.workflow.last_action"], "merge_state": metadata["eventra.workflow.merge_state"],
+                    "candidate_frontend_sha": metadata["eventra.workflow.frontend_sha"], "candidate_backend_sha": None,
+                    "parent_status": parent["status"], "parent_project_id": parent["project_id"],
+                    "parent_assignee_id": parent["assignee_id"], "parent_assignee_type": parent["assignee_type"],
+                    "delivery_squad_id": assignment["squad_id"], "delivery_lead_id": assignment["lead_id"],
+                    "delivery_squad_leader_id": assignment["lead_id"],
+                    "assignment_agent_ids": tuple(sorted((role, identity) for role, identity in assignment["roles"].items()
+                                                         if role != "delivery_lead")),
+                    "assignment_project_ids": tuple(sorted(assignment["projects"].items())),
+                    "delivery_squad_members": tuple(sorted((item["member_id"], item["member_type"], item["role"])
+                                                           for item in assignment["members"]))}
+        if any(getattr(snapshot, key) != value for key, value in expected.items()):
+            raise ValueError("outer authority mismatch")
+        phases = tuple(_phase_snapshot(item["detail"], item["metadata"]) for item in state["children"])
+        if (sorted(phases, key=lambda item: item.issue_key) != sorted(snapshot.children, key=lambda item: item.issue_key)
+                or len(snapshot.pull_requests) != 1 or snapshot.pull_requests[0].repository != "frontend"
+                or snapshot.pull_requests[0].url != pr["url"] or snapshot.pull_requests[0].head_sha != pr["head_sha"]
+                or snapshot.pull_requests[0].state != pr["state"]):
+            raise ValueError("outer child or PR authority mismatch")
+        decision = refresh.plan_refresh(request, snapshot.refresh_state)
+        if decision.kind == "block":
+            return ParentDecision("block_parent", None, decision.reason)
+        if decision.kind == "create_gate_stage":
+            return _parent_decision(snapshot, "create_gate_stage", decision.reason)
+        if decision.kind == "wait":
+            if ("adoption" in feature and "consumed" in feature and "reservation" not in feature
+                    and decision.reason == "refresh adopted; validate normal gate or repair history"):
+                return None  # Normal exact gate/repair checks still run below.
+            return ParentDecision("noop", None, decision.reason)
+        return ParentDecision(decision.kind, decision.action_key, decision.reason)
+    except (ValueError, RuntimeError, TypeError, KeyError, AttributeError):
+        return ParentDecision("block_parent", None, "refresh workflow authority is conflicting")
+
+
 def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
     """Return one deterministic coordinator action without mutating state."""
 
@@ -1475,6 +1541,9 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
     parent_authority_problem = _parent_assignment_authority_problem(snapshot)
     if parent_authority_problem is not None:
         return ParentDecision("block_parent", None, parent_authority_problem)
+    refresh_decision = _refresh_workflow_decision(snapshot)
+    if refresh_decision is not None:
+        return refresh_decision
     if snapshot.repair_reservation is not None:
         return _parent_decision(
             snapshot,
@@ -1550,6 +1619,8 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
         )
 
     if snapshot.merge_state == "merged":
+        if snapshot.refresh_state is not None:
+            return ParentDecision("noop", None, "human merge approval required")
         if not _attempt_history_is_consistent(snapshot):
             return _parent_decision(
                 snapshot,
@@ -1682,6 +1753,8 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
                 "block_parent",
                 "current pull request state is not merge-ready",
             )
+        if snapshot.refresh_state is not None:
+            return ParentDecision("noop", None, "human merge approval required")
         return _parent_decision(
             snapshot,
             "merge",
@@ -2621,6 +2694,10 @@ def recover_once(runner: MulticaRunner, snapshot_loader) -> RecoveryResult:
 
 
 def _parent_metadata(value: dict[str, str]) -> dict[str, object]:
+    try:
+        refresh_feature = refresh.refresh_metadata(value)
+    except (ValueError, TypeError):
+        raise RuntimeError("malformed parent refresh metadata") from None
     version = value.get("eventra.workflow.version")
     classification = value.get("eventra.workflow.classification")
     next_stage = value.get("eventra.workflow.next_stage")
@@ -2707,6 +2784,7 @@ def _parent_metadata(value: dict[str, str]) -> dict[str, object]:
         ),
         "repair_reservation": repair_reservation,
         "smoke_reservation": smoke_reservation,
+        "refresh_feature": refresh_feature,
     }
 
 
@@ -2897,11 +2975,35 @@ def _decode_repair_reservation(value: str) -> dict[str, object]:
     return decoded
 
 
+def _refresh_phase_provenance(metadata: dict[str, str]) -> str | None:
+    keys = {key for key in metadata if key.startswith(refresh.REFRESH_PREFIX)}
+    kind = metadata.get("eventra.phase.kind")
+    if not keys and kind != "refresh":
+        return None
+    expected = {"eventra.refresh.version", "eventra.refresh.request_digest", "eventra.refresh.source_sha"}
+    source = metadata.get("eventra.refresh.source_sha", "")
+    digest = metadata.get("eventra.refresh.request_digest", "")
+    if (keys != expected or kind != "refresh" or metadata.get("eventra.refresh.version") != "1"
+            or metadata.get("eventra.workflow.version") != "2" or metadata.get("eventra.phase.attempt") != "0"
+            or SHA_PATTERN.fullmatch(source) is None or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or metadata.get("eventra.phase.target") != "repository:frontend"
+            or metadata.get("eventra.phase.role") != "frontend_engineer"
+            or "eventra.phase.sha.backend" in metadata
+            or any(key.startswith("eventra.repair.") for key in metadata)
+            or re.fullmatch(r"2:PRO-[1-9][0-9]*:create_refresh_stage:0:frontend:" + source
+                            + r":next-stage:2:refresh:1:" + digest, metadata.get("eventra.phase.creation_action", "")) is None):
+        raise RuntimeError("malformed child refresh provenance")
+    return _canonical_json({"version": 1, "request_digest": digest, "source_sha": source})
+
+
 def _phase_snapshot(
     issue: dict[str, object],
     metadata: dict[str, str],
 ) -> PhaseSnapshot:
     kind = metadata.get("eventra.phase.kind", "unknown")
+    refresh_provenance = _refresh_phase_provenance(metadata)
+    if refresh_provenance is not None and (type(issue["stage"]) is not int or issue["stage"] != 2):
+        raise RuntimeError("refresh must occupy Stage 2")
     result = metadata.get("eventra.phase.result")
     attempt_text = metadata.get("eventra.phase.attempt", "0")
     frontend_sha = metadata.get("eventra.phase.sha.frontend")
@@ -3005,7 +3107,7 @@ def _phase_snapshot(
         repair_source_candidates = tuple(decoded_source_candidates.items())
     if (
         version not in {"1", "2"}
-        or (kind != "unknown" and kind not in PHASE_KINDS)
+        or (kind != "unknown" and kind not in PHASE_KINDS and refresh_provenance is None)
         or (result is not None and result not in PHASE_RESULTS)
         or not attempt_text.isdigit()
         or (version == "2" and int(attempt_text) > 3)
@@ -3059,6 +3161,7 @@ def _phase_snapshot(
         assignee_id=str(issue["assignee_id"]),
         assignee_type=str(issue["assignee_type"]),
         workflow_version=int(version),
+        refresh_provenance=refresh_provenance,
     )
 
 
@@ -3195,6 +3298,8 @@ def load_parent_snapshot(
     runner: MulticaRunner,
     github: GitHubRunner,
     parent_key: str,
+    *,
+    refresh_api=None,
 ) -> ParentSnapshot:
     """Read parent phase metadata and current GitHub heads without mutation."""
 
@@ -3211,6 +3316,11 @@ def load_parent_snapshot(
             )
         )
     )
+    refresh_state = None
+    if metadata["refresh_feature"] is not None:
+        if refresh_api is None:
+            raise RuntimeError("refresh requires an explicitly configured authoritative reader")
+        refresh_state = refresh_api.snapshot(parent_key)
     authorizing_comment = None
     authorization_comment_uuid = str(metadata["authorization_comment_uuid"])
     if authorization_comment_uuid:
@@ -3546,11 +3656,18 @@ def load_parent_snapshot(
         delivery_lead_id=assignment_authority_before[3],
         delivery_squad_leader_id=assignment_authority_before[4],
         delivery_squad_members=assignment_authority_before[5],
+        refresh_state=refresh_state,
     )
     if snapshot.workflow_version == 2:
         authority_problem = _parent_assignment_authority_problem(snapshot)
         if authority_problem is not None:
             raise RuntimeError(authority_problem)
+    if refresh_state is not None:
+        if refresh_api.snapshot(parent_key) != refresh_state:
+            raise RuntimeError("refresh authority changed during parent read")
+        decision = _refresh_workflow_decision(snapshot)
+        if decision is not None and decision.kind == "block_parent":
+            raise RuntimeError(decision.reason)
     if quarantined:
         if snapshot.repair_reservation is None:
             raise RuntimeError("quarantined repair child lacks a reservation")
@@ -5802,6 +5919,15 @@ def execute_parent_smoke(
 
 
 def _has_phase_completion(metadata: dict[str, str]) -> bool:
+    if metadata.get("eventra.phase.kind") == "refresh":
+        try:
+            _refresh_phase_provenance(metadata)
+        except RuntimeError:
+            return False
+        return (metadata.get("eventra.phase.result") in PHASE_RESULTS
+                and _is_uuid(metadata.get("eventra.phase.evidence_comment"))
+                and SHA_PATTERN.fullmatch(metadata.get("eventra.phase.sha.frontend", "")) is not None
+                and metadata.get("eventra.phase.failure_repositories", "[]") == "[]")
     version = metadata.get("eventra.workflow.version")
     if version not in {"1", "2"}:
         return False
