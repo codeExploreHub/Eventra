@@ -523,6 +523,16 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(state["prerequisite"]["base_sha"], "d" * 40)
         self.assertEqual(state["prerequisite"]["ancestor_sha"], "d" * 40)
 
+    def test_freezer_binds_observed_optional_status_name(self):
+        self.runner.parent["status_name"] = ""
+        self.runner.child["status_name"] = ""
+
+        snapshot = self.snapshot()
+        projection = contracts.authority_projection(snapshot)
+
+        self.assertEqual(projection["parent"]["status_name"], "")
+        self.assertEqual(projection["source"]["detail"]["status_name"], "")
+
     def test_parent_or_comment_change_between_reads_blocks_freeze(self):
         reads = 0
         def mutate(args):

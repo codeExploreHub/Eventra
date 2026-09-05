@@ -509,22 +509,31 @@ _ISSUE_DETAIL_FIELDS = frozenset({
     "properties", "revision", "stage", "start_date", "status", "status_category",
     "title", "updated_at", "workspace_id",
 })
+_OPTIONAL_ISSUE_DETAIL_FIELDS = frozenset({"status_name"})
 _VOLATILE_DETAIL_FIELDS = frozenset({"metadata", "updated_at", "last_activity_at"})
+
+
+def _issue_detail(value: object, reason: str) -> dict[str, object]:
+    _require(type(value) is dict, reason)
+    detail = value
+    fields = set(detail)
+    _require(_ISSUE_DETAIL_FIELDS <= fields <=
+             _ISSUE_DETAIL_FIELDS | _OPTIONAL_ISSUE_DETAIL_FIELDS, reason)
+    if "status_name" in detail:
+        _require(type(detail["status_name"]) is str, "invalid issue status name")
+    return detail
 
 
 def authority_projection(snapshot: RefreshSnapshot) -> dict[str, object]:
     """Return the complete stable authority that a new refresh request freezes."""
     state = _snapshot(snapshot)
-    parent = state["parent"]
-    _require(set(parent) == _ISSUE_DETAIL_FIELDS, "unknown parent authority field")
+    parent = _issue_detail(state["parent"], "unknown parent authority field")
     _require(parent["metadata"] == state["metadata"], "parent metadata echo conflict")
     _require(parent["parent_issue_id"] is None and parent["status"] == "blocked",
              "refresh freeze requires blocked parent")
     _require(len(state["children"]) == 1, "refresh freeze requires one source child")
     source = _object(state["children"][0], "detail metadata evidence")
-    detail = source["detail"]
-    _require(type(detail) is dict and set(detail) == _ISSUE_DETAIL_FIELDS,
-             "unknown source authority field")
+    detail = _issue_detail(source["detail"], "unknown source authority field")
     _require(detail["metadata"] == source["metadata"], "source metadata echo conflict")
     _require(detail["parent_issue_id"] == parent["id"] and detail["stage"] == 1
              and detail["status"] == "done", "invalid source freeze state")

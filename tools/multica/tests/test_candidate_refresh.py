@@ -605,6 +605,12 @@ class BaselineContractTests(ContractCase):
         cases = []
         echo = self.authority_state(); echo["parent"]["metadata"] = {}; cases.append(echo)
         unknown = self.authority_state(); unknown["parent"]["future_semantic"] = "x"; cases.append(unknown)
+        invalid_status_name = self.authority_state()
+        invalid_status_name["parent"]["status_name"] = []
+        cases.append(invalid_status_name)
+        invalid_source_status_name = self.authority_state()
+        invalid_source_status_name["children"][0]["detail"]["status_name"] = {}
+        cases.append(invalid_source_status_name)
         active = self.authority_state(); active["parent"]["status"] = "in_progress"; cases.append(active)
         later = self.authority_state(); later["children"].append(copy.deepcopy(later["children"][0])); cases.append(later)
         for state in cases:
