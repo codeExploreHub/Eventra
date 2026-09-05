@@ -63,6 +63,102 @@ separate `pass|fail|blocked` value is the verdict. A mandatory build blocked by
 Google Fonts `ECONNRESET` is `blocked`, never PASS. Verify `done` and metadata;
 never leave completed work in `in_review`.
 
+## Controlled candidate refresh
+
+This controlled flow is executable only after Delivery Lead supplies a
+parser-backed refresh handoff produced by the approved control plane. The
+handoff must name four independently verified values: `runtime_workspace`, the
+untouched Multica runtime checkout; `inspection_workspace`, a dedicated
+task-owned integration worktree; `candidate_sha`, the immutable source commit;
+and `control_tool_sha`, the approved commit that provides the workflow helper.
+Reject a handoff that omits or aliases any value. Never detach the runtime
+workspace; all fetch, merge preparation, and verification happen only inside
+the inspection workspace while the helper runs from the control-tool checkout.
+
+Treat a Stage 2 child whose authoritative metadata says
+`eventra.phase.kind=refresh` as a separate preparation flow, never as an
+implementation, repair, review, or QA phase. Reread the child, its parent, the
+frozen refresh request and grant, reservation, current managed PR head, source
+SHA, prerequisite merge SHA, Git version, staging ref, and repository paths
+before doing any work. Stop if any value conflicts with the request or current
+authority.
+
+After that deployment gate is satisfied, use the dedicated task-owned
+integration worktree at the exact source SHA from its guarded handoff; include
+the child identifier and request digest in its name. Do not reuse the runtime
+workspace or any implementation/repair worktree. Require the handoff to reject
+replace objects, custom merge drivers, uncontrolled local/info attributes, and
+untrusted repository, system, or global Git configuration. Fetch the exact
+source and prerequisite objects, then run this hardened merge inside that
+preflighted worktree:
+
+```text
+GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null \
+  GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 \
+  git --no-replace-objects -c core.hooksPath=/dev/null \
+    -c core.attributesFile=/dev/null -c core.fsmonitor=false \
+    merge --no-ff --no-commit PREREQUISITE_SHA
+```
+
+Stop on any conflict. Before committing, use the controlled refresh verifier to
+confirm that the index tree equals the expected merge tree. Do not edit, add,
+delete, generate, or format any file. Commit only that unchanged tree, with
+parents ordered as source first and prerequisite second, then verify the
+resulting commit and tree again. A candidate with any manual content change is
+invalid.
+
+Run every required check against the committed target SHA. Record the actual
+argv and exit code under the fixed names `python local_contract footer
+hydration dashboard lint build knowledge`; do not substitute checks or hard-code
+historical test counts:
+
+```text
+python3 -B -m unittest discover -s tools/multica/tests -p test_*.py
+npm run test:local-contract
+npm run test:footer-meta
+npm run test:layout-hydration
+npm run test:dashboard-profile
+npm run lint
+npm run build
+python3 -B -m tools.multica.knowledge verify --frontend-root FRONTEND_ROOT --backend-root BACKEND_ROOT
+```
+
+For PASS, generate a fresh Context Receipt with
+`tools.multica.knowledge context`: task_id must equal the refresh child
+identifier, repository must be `frontend`, task type must be `implementation`,
+and candidate SHA must be `frontend=TARGET_SHA`. Pass each material fact you
+actually checked with `--verified-id`; never infer verified IDs, and stop rather
+than report PASS if the receipt contains a conflict. The frontend and backend
+roots may be task-owned absolute paths but must identify different repositories.
+
+After all checks pass, push only TARGET_SHA:STAGING_REF and read the remote ref
+back. Never update the managed PR branch, merge the PR, adopt the candidate,
+change the parent candidate SHA, or run a normal gate. Post exactly one evidence
+comment containing one `eventra-candidate-refresh-prepared-v1` block with the
+request, child, source, prerequisite, target, tree, staging ref, tool/Git
+identity, Context Receipt, and all eight command records. Retain the immutable
+comment UUID. Only after confirming that the deployed workflow help exposes the
+parser-backed command may you invoke:
+
+```text
+python3 -B -m tools.multica.workflow finish-refresh PRO-N --result pass --evidence-comment COMMENT_UUID
+```
+
+If a required command fails, post exactly one
+`eventra-candidate-refresh-outcome-v1` block. It must contain only
+schema_version, request_digest, child_id, source_sha, prerequisite_sha, the
+`fail` or `blocked` result, commands actually run (including each command's
+exit code), and a bounded reason. The commands map may be empty when
+preparation stopped before the fixed checks. It must not claim
+target/tree/staging or PASS. Then invoke the same `finish-refresh` command with
+the matching non-PASS result. Never use `finish-phase` for a refresh child.
+Verify the child becomes `done` with its refresh result and immutable evidence
+UUID while the managed PR and parent candidate remain at source.
+Return control to Delivery Lead. It must invoke the same bound
+`execute-parent-refresh` command again to publish and adopt the registered
+candidate before it can create fresh Stage 3 gates; your `finish-refresh` call
+does not perform adoption.
+
 ## Forbidden actions
 
 Do not modify another repository, review or QA your own change as the required
