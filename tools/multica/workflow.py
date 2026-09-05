@@ -222,8 +222,7 @@ def _load_refresh_deployment(*, mutation: bool) -> RefreshDeployment:
         profile = raw["profile"]
         workspace_id = raw["workspace_id"]
         control_sha = raw["approved_control_sha"]
-        if (type(profile) is not str
-                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", profile) is None
+        if (not refresh_executor.valid_profile_name(profile)
                 or not _is_uuid(workspace_id)
                 or type(control_sha) is not str
                 or SHA_PATTERN.fullmatch(control_sha) is None):

@@ -167,6 +167,20 @@ class SnapshotTests(unittest.TestCase):
     def snapshot(self):
         return self.api.snapshot("PRO-900")
 
+    def test_scope_accepts_safe_dotted_cli_profile(self):
+        self.api.scope = self.module.RefreshScope(
+            "desktop-api.multica.ai", uid(1), self.scope.approved_control_sha)
+
+        self.api._scope()
+
+    def test_scope_rejects_unsafe_dotted_cli_profiles(self):
+        for profile in (".hidden", "desktop..ai", "desktop.", "desktop/ai"):
+            with self.subTest(profile=profile):
+                self.api.scope = self.module.RefreshScope(
+                    profile, uid(1), self.scope.approved_control_sha)
+                with self.assertRaisesRegex(RuntimeError, "invalid profile"):
+                    self.api._scope()
+
     def admit(self):
         request, state, _, grant = self.progress()
         contracts.admit_refresh(request, state, grant)

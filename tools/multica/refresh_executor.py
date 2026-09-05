@@ -23,6 +23,11 @@ from .contracts import parse_agent_list, parse_project_list, parse_squad_list, p
 from .issue_contracts import parse_issue_detail, parse_issue_children, parse_issue_metadata, parse_issue_runs
 
 
+_PROFILE = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9_-]|\.(?=[A-Za-z0-9])){0,63}\Z"
+)
+
+
 @dataclass(frozen=True)
 class RefreshScope:
     profile: str
@@ -43,6 +48,10 @@ def _need(condition, reason):
         raise RuntimeError("refresh authority: " + reason)
 
 
+def valid_profile_name(value: object) -> bool:
+    return type(value) is str and _PROFILE.fullmatch(value) is not None
+
+
 class RefreshAPI:
     def __init__(self, runner, github, control_root, *, scope=None, prerequisite_pr=None):
         self.runner, self.github = runner, github
@@ -51,7 +60,7 @@ class RefreshAPI:
 
     def _scope(self):
         _need(type(self.scope) is RefreshScope, "explicit approved scope required")
-        _need(type(self.scope.profile) is str and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", self.scope.profile),
+        _need(valid_profile_name(self.scope.profile),
               "invalid profile")
         c._uuid(self.scope.workspace_id)
         c._match(self.scope.approved_control_sha, c._SHA)

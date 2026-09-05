@@ -2567,6 +2567,56 @@ class PhaseCompletionTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "deployment file"):
                     workflow_module._load_refresh_deployment(mutation=False)
 
+    def test_refresh_deployment_accepts_safe_dotted_cli_profile(self):
+        with tempfile.TemporaryDirectory(prefix="eventra-refresh-config-") as directory:
+            root = Path(directory)
+            control = root / "control"
+            frontend = root / "frontend"
+            control.mkdir()
+            frontend.mkdir()
+            deployment = root / "deployment.json"
+            deployment.write_text(json.dumps({
+                "schema_version": 1,
+                "profile": "desktop-api.multica.ai",
+                "workspace_id": PARENT_ID,
+                "control_root": str(control),
+                "frontend_root": str(frontend),
+                "approved_control_sha": "e" * 40,
+                "mutation_contract": None,
+            }), encoding="utf-8")
+
+            with patch.dict(os.environ, {
+                    "EVENTRA_REFRESH_DEPLOYMENT_FILE": str(deployment)}, clear=True):
+                loaded = workflow_module._load_refresh_deployment(mutation=False)
+
+            self.assertEqual(loaded.profile, "desktop-api.multica.ai")
+
+    def test_refresh_deployment_rejects_unsafe_dotted_cli_profiles(self):
+        with tempfile.TemporaryDirectory(prefix="eventra-refresh-config-") as directory:
+            root = Path(directory)
+            control = root / "control"
+            frontend = root / "frontend"
+            control.mkdir()
+            frontend.mkdir()
+            deployment = root / "deployment.json"
+            record = {
+                "schema_version": 1,
+                "profile": "pro-1",
+                "workspace_id": PARENT_ID,
+                "control_root": str(control),
+                "frontend_root": str(frontend),
+                "approved_control_sha": "e" * 40,
+                "mutation_contract": None,
+            }
+            with patch.dict(os.environ, {
+                    "EVENTRA_REFRESH_DEPLOYMENT_FILE": str(deployment)}, clear=True):
+                for profile in (".hidden", "desktop..ai", "desktop.", "desktop/ai"):
+                    with self.subTest(profile=profile):
+                        deployment.write_text(json.dumps(
+                            record | {"profile": profile}), encoding="utf-8")
+                        with self.assertRaisesRegex(RuntimeError, "deployment file"):
+                            workflow_module._load_refresh_deployment(mutation=False)
+
     def test_refresh_deployment_rejects_extra_fields_and_contract_drift(self):
         contract = dict(workflow_module.REFRESH_MUTATION_CONTRACT)
         with tempfile.TemporaryDirectory(prefix="eventra-refresh-config-") as directory:

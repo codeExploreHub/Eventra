@@ -706,11 +706,17 @@ Candidate refresh uses an explicit deployment record and an independent
 control-plane checkout. Set `EVENTRA_REFRESH_DEPLOYMENT_FILE` to the fixed
 operator-managed path `~/.config/eventra/refresh-deployment.json`; mutating
 commands reject any other path, symlinks, checkout-local records, and
-group/world-writable files. The record contains the exact profile, workspace
-ID, absolute control/runtime and frontend roots, approved `control_tool_sha`,
-and mutation-contract values. The CLI also requires its loaded Python modules
-to come from that exact control root. It does not infer authority from the
-current directory, ambient Multica configuration, or a moving branch.
+group/world-writable files. The record contains the exact CLI configuration
+profile, workspace ID, absolute control/runtime and frontend roots, approved
+`control_tool_sha`, and mutation-contract values. The CLI also requires its
+loaded Python modules to come from that exact control root. It does not infer
+authority from the current directory, ambient Multica configuration, or a
+moving branch.
+
+The profile is the CLI configuration profile, not the Multica workspace name.
+Safe dot-separated profile names such as `desktop-api.multica.ai` are accepted;
+empty segments, leading/trailing dots, and path separators are rejected. Bind
+the separately resolved workspace UUID in `workspace_id`.
 
 Provision the record with an operator-controlled editor, never from an agent
 checkout. Its parent directory must be owned by the current user with mode
@@ -721,7 +727,7 @@ roots, and full 40-character approved SHA):
 ```json
 {
   "schema_version": 1,
-  "profile": "pro-1",
+  "profile": "desktop-api.multica.ai",
   "workspace_id": "00000000-0000-4000-8000-000000000001",
   "control_root": "/Users/operator/Eventra-control",
   "frontend_root": "/Users/operator/Eventra-runtime",
