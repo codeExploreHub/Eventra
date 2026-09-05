@@ -665,6 +665,9 @@ class MemoryRefreshAPI:
     def create_child(self, *, parent, stage, title, project_id, assignee_id, description):
         if self.fail_operation == "create_child":
             raise RuntimeError("injected create before effect")
+        self.write_index += 1
+        if self.fail_at == self.write_index and not self.fail_after:
+            raise RuntimeError("injected before effect")
         if parent != "PRO-900" or stage != 2:
             raise RuntimeError("invalid child scope")
         child = issue_detail(id=uid(90), identifier="PRO-902", parent_issue_id=uid(2), stage=stage,
@@ -674,6 +677,8 @@ class MemoryRefreshAPI:
         self.state["children"].append({"detail": child, "metadata": {}, "evidence": None})
         self.create_effects += 1
         self.writes.append(("create_child", parent, "PRO-902"))
+        if self.fail_at == self.write_index and self.fail_after:
+            raise RuntimeError("injected after effect")
         if self.fail_operation == "create_child_after":
             raise RuntimeError("injected create after effect")
         return "PRO-902"
@@ -1481,6 +1486,111 @@ class PublishRefreshTests(unittest.TestCase):
 
         self.assertEqual(git.managed_push_effects, 1)
         self.assertNotIn("eventra.refresh.reservation", api.state["metadata"])
+
+
+class FullRefreshDeliveryTests(unittest.TestCase):
+    @staticmethod
+    def _retry_injected(api, call):
+        try:
+            return call()
+        except RuntimeError:
+            # The executor may deliberately translate an injected transport
+            # failure into a closed authority error. One fresh retry is the
+            # recovery contract; a genuine conflict will fail again.
+            if api.fail_at is None or api.write_index < api.fail_at:
+                raise
+            return call()
+
+    def _run_delivery(self, *, fail_at=None, fail_after=False):
+        from tools.multica.tests.test_candidate_refresh import prepared_payload
+
+        api = MemoryRefreshAPI()
+        module = importlib.import_module("tools.multica.refresh_executor")
+        api.fail_at, api.fail_after = fail_at, fail_after
+        self._retry_injected(
+            api,
+            lambda: module.stage_refresh_request(api, "PRO-900", api.request)
+        )
+        api.publish_authorization()
+        self._retry_injected(api, lambda: module.execute_refresh(
+            api,
+            None,
+            "PRO-900",
+            uid(12),
+            uid(13),
+            contracts.refresh_action(api.request),
+        ))
+        child = api.state["children"][1]
+        payload = prepared_payload(api.request)
+        payload["child_id"] = child["detail"]["id"]
+        evidence_uuid = uid(93)
+        api.add_comment(
+            "PRO-902",
+            contracts.RefreshComment(
+                child["detail"]["id"],
+                evidence_uuid,
+                api.request.payload()["assignment"]["engineer_id"],
+                "agent",
+                1,
+                "Preparation only; no PR publication.\n"
+                + block("prepared", payload),
+            ),
+        )
+        verifier = MemoryRefreshGit(api.request)
+        self._retry_injected(api, lambda: module.finish_refresh(
+            api, verifier, "PRO-902", evidence_uuid, "pass"
+        ))
+        publisher = MemoryRefreshGit(api.request, api)
+        self._retry_injected(api, lambda: module.execute_refresh(
+            api,
+            publisher,
+            "PRO-900",
+            uid(12),
+            uid(13),
+            contracts.refresh_action(api.request),
+        ))
+        return api, publisher
+
+    def test_every_recorded_write_boundary_converges_to_full_delivery(self):
+        baseline_api, baseline_git = self._run_delivery()
+        expected_state = copy.deepcopy(baseline_api.state)
+        expected_writes = copy.deepcopy(baseline_api.writes)
+        total_writes = baseline_api.write_index
+
+        self.assertGreater(total_writes, 0)
+        self.assertEqual(total_writes, len(expected_writes))
+        self.assertEqual(baseline_git.managed_push_effects, 1)
+        for fail_at in range(1, total_writes + 1):
+            for fail_after in (False, True):
+                with self.subTest(fail_at=fail_at, fail_after=fail_after):
+                    api, git = self._run_delivery(
+                        fail_at=fail_at,
+                        fail_after=fail_after,
+                    )
+                    self.assertEqual(api.state, expected_state)
+                    self.assertEqual(api.writes, expected_writes)
+                    self.assertEqual(git.managed_push_effects, 1)
+
+    def test_incompatible_external_write_blocks_without_followup_effect(self):
+        api, module, git, child, _ = PublishRefreshTests.prepared_case()
+        api.state["children"][0]["evidence"]["content"] = (
+            "externally rewritten source evidence"
+        )
+        before_writes = copy.deepcopy(api.writes)
+
+        with self.assertRaises((RuntimeError, ValueError)):
+            module.execute_refresh(
+                api,
+                git,
+                "PRO-900",
+                uid(12),
+                uid(13),
+                contracts.refresh_action(api.request),
+            )
+
+        self.assertEqual(api.writes, before_writes)
+        self.assertEqual(git.managed_push_effects, 0)
+        self.assertEqual(child["detail"]["status"], "done")
 
 
 if __name__ == "__main__":

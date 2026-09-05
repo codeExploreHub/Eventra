@@ -1,5 +1,6 @@
 """Exercise Git guards against real local object graphs and bare remotes."""
 
+import copy
 import importlib
 import importlib.util
 import os
@@ -210,6 +211,370 @@ class GitTests(unittest.TestCase):
         self.assertEqual(self.git.read_ref("refs/heads/master"), self.prerequisite)
         for call in self.transport.calls:
             self.assertFalse(any(arg.startswith(("--force", "+")) for arg in call))
+
+    def test_full_refresh_delivery_uses_real_git_and_stops_at_merge_hold(self):
+        from tools.multica import candidate_refresh as contracts
+        from tools.multica import refresh_executor
+        from tools.multica import workflow
+        from tools.multica.tests.test_candidate_refresh import block, prepared_payload
+        from tools.multica.tests.test_issue_contracts import issue_detail
+        from tools.multica.tests.test_refresh_executor import MemoryRefreshAPI
+
+        api = MemoryRefreshAPI()
+        state = api.state
+        source_child = state["children"][0]
+        source_child["metadata"]["eventra.phase.sha.frontend"] = self.source
+        source_child["detail"]["metadata"] = copy.deepcopy(
+            source_child["metadata"]
+        )
+        source_child["evidence"]["content"] = (
+            "Original Stage 1 PASS for " + self.source
+        )
+        state["metadata"]["eventra.workflow.frontend_sha"] = self.source
+        state["parent"]["metadata"] = copy.deepcopy(state["metadata"])
+        state["pr"]["head_sha"] = self.source
+        state["prerequisite"].update(
+            merge_sha=self.prerequisite,
+            base_sha=self.prerequisite,
+            ancestor_sha=self.prerequisite,
+        )
+        state["tool"]["git_version"] = self.version
+        api.request = contracts.freeze_refresh_request(
+            contracts.RefreshSnapshot(contracts.canonical_json(state))
+        )
+        request = api.request
+        source_before = copy.deepcopy(source_child)
+        base_before = self.git.read_ref("refs/heads/master")
+        head_ref = "refs/heads/" + request.payload()["pr"]["head_ref"]
+        self.run_git("push", "origin", self.source + ":" + head_ref)
+        real_git = self.module.RefreshGit(self.repo, run=self.transport)
+
+        class SyncedGit:
+            def verify_candidate(_, current_request, target_sha):
+                return real_git.verify_candidate(current_request, target_sha)
+
+            def publish_candidate(_, current_request, prepared):
+                changed = real_git.publish_candidate(current_request, prepared)
+                state["pr"]["head_sha"] = real_git.read_ref(head_ref)
+                return changed
+
+        refresh_executor.stage_refresh_request(api, "PRO-900", request)
+        api.publish_authorization()
+        refresh_executor.execute_refresh(
+            api,
+            None,
+            "PRO-900",
+            uid(12),
+            uid(13),
+            contracts.refresh_action(request),
+        )
+        real_git.publish_staging(request, self.target)
+        refresh_child = state["children"][1]
+        evidence_payload = prepared_payload(request)
+        evidence_payload.update(
+            child_id=refresh_child["detail"]["id"],
+            source_sha=self.source,
+            prerequisite_sha=self.prerequisite,
+            target_sha=self.target,
+            tree_sha=self.tree,
+            git_version=self.version,
+        )
+        evidence_payload["context_receipt"]["candidate_shas"] = {
+            "frontend": self.target
+        }
+        evidence_uuid = uid(93)
+        api.add_comment(
+            "PRO-902",
+            contracts.RefreshComment(
+                refresh_child["detail"]["id"],
+                evidence_uuid,
+                request.payload()["assignment"]["engineer_id"],
+                "agent",
+                1,
+                "Preparation only; no PR publication.\n"
+                + block("prepared", evidence_payload),
+            ),
+        )
+        refresh_executor.finish_refresh(
+            api, SyncedGit(), "PRO-902", evidence_uuid, "pass"
+        )
+        result = refresh_executor.execute_refresh(
+            api,
+            SyncedGit(),
+            "PRO-900",
+            uid(12),
+            uid(13),
+            contracts.refresh_action(request),
+        )
+
+        self.assertEqual(result.status, "adopted")
+        self.assertEqual(state["children"][0], source_before)
+        self.assertEqual(real_git.read_ref("refs/heads/master"), base_before)
+        self.assertEqual(real_git.read_ref(head_ref), self.target)
+        for write in api.writes:
+            self.assertNotIn(source_before["detail"]["id"], write)
+            self.assertNotIn(source_before["detail"]["identifier"], write)
+        push_calls = [
+            call for call in self.transport.calls if "push" in call
+        ]
+        self.assertFalse(any(
+            "refs/heads/master" in argument
+            for call in push_calls
+            for argument in call
+        ))
+        self.assertEqual(
+            contracts.plan_refresh(request, api.snapshot("PRO-900")).kind,
+            "create_gate_stage",
+        )
+
+        action = (
+            "2:PRO-900:create_gate_stage:0:frontend:"
+            + self.target
+            + ":-:next-stage:3"
+        )
+        state["metadata"].update(
+            {
+                "eventra.workflow.next_stage": "4",
+                "eventra.workflow.last_action": action,
+            }
+        )
+        gate_comments = {}
+        for index, (kind, role) in enumerate(
+            (("review", "independent_reviewer"),
+             ("qa", "integration_qa"))
+        ):
+            metadata = {
+                "eventra.workflow.version": "2",
+                "eventra.phase.kind": kind,
+                "eventra.phase.attempt": "0",
+                "eventra.phase.sha.frontend": self.target,
+                "eventra.phase.creation_action": action,
+                "eventra.phase.target": "repository:frontend",
+                "eventra.phase.role": role,
+            }
+            identifier = f"PRO-{940 + index}"
+            detail = issue_detail(
+                id=uid(40 + index),
+                identifier=identifier,
+                parent_issue_id=uid(2),
+                stage=3,
+                project_id=uid(5),
+                assignee_id=state["assignment"]["roles"][role],
+                status="in_review",
+                workspace_id=uid(1),
+            )
+            detail["metadata"] = copy.deepcopy(metadata)
+            state["children"].append(
+                {
+                    "detail": detail,
+                    "metadata": metadata,
+                    "evidence": None,
+                }
+            )
+            evidence_uuid = uid(42 + index)
+            gate_comments[identifier] = [{
+                "id": evidence_uuid,
+                "issue_id": detail["id"],
+                "author_id": detail["assignee_id"],
+                "author_type": "agent",
+                "content": kind + " PASS for " + self.target,
+            }]
+        state["parent"]["metadata"] = copy.deepcopy(state["metadata"])
+
+        class GateRunner:
+            def __init__(self):
+                self.calls = []
+                self.agents = [
+                    {
+                        "id": state["assignment"]["roles"][role],
+                        "name": name,
+                    }
+                    for role, name in (
+                        ("delivery_lead", "Eventra Delivery Lead"),
+                        ("frontend_engineer", "Eventra Frontend Engineer"),
+                        ("backend_engineer", "Eventra Backend Engineer"),
+                        ("integration_qa", "Eventra Integration QA"),
+                        ("independent_reviewer", "Eventra Independent Reviewer"),
+                    )
+                ]
+
+            @staticmethod
+            def _child(identifier):
+                return next(
+                    child for child in state["children"]
+                    if child["detail"]["identifier"] == identifier
+                )
+
+            def run(self, args, *, stdin_json=None):
+                if stdin_json is not None:
+                    raise AssertionError("Gate runner never accepts stdin")
+                call = tuple(args)
+                self.calls.append(call)
+                if call == ("agent", "list", "--output", "json"):
+                    return copy.deepcopy(self.agents)
+                if call == ("project", "list", "--output", "json"):
+                    return [
+                        {"id": state["assignment"]["projects"]["frontend"],
+                         "title": "Eventra Local Development"},
+                        {"id": state["assignment"]["projects"]["backend"],
+                         "title": "Eventra Backend Local Development"},
+                    ]
+                if call == ("squad", "list", "--output", "json"):
+                    return [{
+                        "id": state["assignment"]["squad_id"],
+                        "name": "Eventra Local Delivery",
+                        "leader_id": state["assignment"]["lead_id"],
+                    }]
+                if call == (
+                    "squad", "get", state["assignment"]["squad_id"],
+                    "--output", "json",
+                ):
+                    return {
+                        "id": state["assignment"]["squad_id"],
+                        "name": "Eventra Local Delivery",
+                        "leader_id": state["assignment"]["lead_id"],
+                        "description": "Fixture",
+                        "instructions": "Fixture",
+                    }
+                if call == (
+                    "squad", "member", "list",
+                    state["assignment"]["squad_id"], "--output", "json",
+                ):
+                    return [
+                        {
+                            "id": uid(100 + index),
+                            "squad_id": state["assignment"]["squad_id"],
+                            **copy.deepcopy(member),
+                        }
+                        for index, member in enumerate(
+                            state["assignment"]["members"]
+                        )
+                    ]
+                if call[:2] == ("issue", "get"):
+                    identifier = call[2]
+                    if identifier in {
+                        state["parent"]["id"], state["parent"]["identifier"]
+                    }:
+                        return copy.deepcopy(state["parent"])
+                    return copy.deepcopy(self._child(identifier)["detail"])
+                if call == (
+                    "issue", "children", state["parent"]["identifier"],
+                    "--output", "json",
+                ):
+                    stages = []
+                    for stage in sorted({
+                        child["detail"]["stage"] for child in state["children"]
+                    }):
+                        issues = [
+                            copy.deepcopy(child["detail"])
+                            for child in state["children"]
+                            if child["detail"]["stage"] == stage
+                        ]
+                        stages.append({
+                            "stage": stage,
+                            "total": len(issues),
+                            "done": sum(
+                                issue["status"] == "done" for issue in issues
+                            ),
+                            "issues": issues,
+                        })
+                    return {
+                        "stages": stages,
+                        "total": len(state["children"]),
+                        "unstaged": [],
+                    }
+                if call[:3] == ("issue", "metadata", "list"):
+                    identifier = call[3]
+                    if identifier in {
+                        state["parent"]["id"], state["parent"]["identifier"]
+                    }:
+                        return copy.deepcopy(state["metadata"])
+                    return copy.deepcopy(self._child(identifier)["metadata"])
+                if call[:3] == ("issue", "comment", "list"):
+                    return copy.deepcopy(gate_comments.get(call[3], []))
+                if call[:3] == ("issue", "runs"):
+                    return copy.deepcopy([
+                        run for run in state["runs"]
+                        if run["issue_id"] == self._child(call[2])["detail"]["id"]
+                    ])
+                if call[:3] == ("issue", "metadata", "set"):
+                    child = self._child(call[3])
+                    key = args[args.index("--key") + 1]
+                    value = args[args.index("--value") + 1]
+                    if child["metadata"].get(key) != value:
+                        child["metadata"][key] = value
+                        child["detail"]["metadata"] = copy.deepcopy(
+                            child["metadata"]
+                        )
+                        child["detail"]["revision"] += 1
+                    return {"ok": True}
+                if call[:2] == ("issue", "status"):
+                    child = self._child(call[2])
+                    child["detail"]["status"] = call[3]
+                    child["detail"]["status_category"] = call[3]
+                    child["detail"]["revision"] += 1
+                    return copy.deepcopy(child["detail"])
+                raise AssertionError(f"unexpected Gate argv: {call!r}")
+
+        class RefreshReader:
+            def snapshot(_, parent):
+                if parent != "PRO-900":
+                    raise AssertionError("cross-parent refresh read")
+                return contracts.RefreshSnapshot(
+                    contracts.canonical_json(state)
+                )
+
+        class GateGitHub:
+            def run(_, args):
+                return {
+                    "url": state["pr"]["url"],
+                    "headRefOid": self.target,
+                    "state": "OPEN",
+                    "mergeable": "MERGEABLE",
+                    "mergeStateStatus": "CLEAN",
+                    "statusCheckRollup": [],
+                }
+
+        gate_runner = GateRunner()
+        refresh_reader = RefreshReader()
+        for index, (identifier, kind) in enumerate(
+            (("PRO-940", "review"), ("PRO-941", "qa"))
+        ):
+            result = workflow.finish_phase(
+                gate_runner,
+                identifier,
+                workflow.PhaseCompletion(
+                    kind=kind,
+                    result="pass",
+                    attempt=0,
+                    evidence_comment=uid(42 + index),
+                    frontend_sha=self.target,
+                    backend_sha=None,
+                    pr_url=None,
+                ),
+                refresh_api=refresh_reader,
+            )
+            self.assertEqual((result.status, result.result), ("done", "pass"))
+        parent = workflow.load_parent_snapshot(
+            gate_runner,
+            GateGitHub(),
+            "PRO-900",
+            refresh_api=refresh_reader,
+        )
+        decision = workflow.decide_parent_action(parent)
+
+        self.assertEqual(
+            (decision.kind, decision.reason),
+            ("noop", "human merge approval required"),
+        )
+        mutation_trace = repr(api.writes).lower()
+        self.assertNotIn("deploy", mutation_trace)
+        self.assertNotIn("smoke", mutation_trace)
+        self.assertEqual(
+            [child["metadata"]["eventra.phase.kind"]
+             for child in state["children"]],
+            ["implementation", "refresh", "review", "qa"],
+        )
 
     def test_base_drift_blocks_publication(self):
         self.stage()

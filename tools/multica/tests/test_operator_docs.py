@@ -956,6 +956,26 @@ class OperatorDocsTests(unittest.TestCase):
             with self.subTest(pattern=pattern):
                 self.assertIsNone(re.search(pattern, command_text))
 
+    def test_candidate_refresh_verification_receipt_preserves_human_boundary(self):
+        readme = " ".join(Path("tools/multica/README.md").read_text().split())
+        pilot = " ".join(Path("docs/multica/pilot-issues.md").read_text().split())
+
+        for rendered in (readme, pilot):
+            for fragment in (
+                "658 tests",
+                "real temporary Git",
+                "Stage 3",
+                "human merge",
+                "34",
+                "12",
+                "no live",
+            ):
+                with self.subTest(fragment=fragment):
+                    self.assertIn(fragment, rendered)
+        self.assertIn("every `1..N` boundary", readme)
+        self.assertIn("zero errors", pilot)
+        self.assertIn("push, merge PR #14, or deploy", pilot)
+
 
 if __name__ == "__main__":
     unittest.main()

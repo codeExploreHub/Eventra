@@ -302,6 +302,25 @@ Independent Reviewer (exact SHA pair) and Integration QA (same exact SHA pair)
 → Delivery Lead coordinated merge decision. Any changed SHA invalidates the
 corresponding review or QA result and returns to its owning child.
 
+## Candidate refresh control-plane verification
+
+The 2026-09-06 isolated control-plane run is evidence for the helper code only;
+it is not a live refresh approval. Python discovery passed 658 tests. The new
+combined tests cover every baseline-recorded mutation boundary before and after
+its effect, reject incompatible external writes without later effects, and use
+a real temporary Git repository plus bare remote for the complete refresh path.
+That path preserves Stage 1, leaves remote `master` unchanged, adopts only the
+staged candidate, requires fresh Stage 3 Reviewer and QA gates, and ends at
+`human merge approval required` without deployment or Smoke.
+
+The serial frontend receipt is: local contract 4 PASS, footer metadata 14 PASS,
+layout hydration 1 PASS, dashboard profile 11 PASS, lint PASS with 34 existing
+warnings and zero errors, and production build PASS. The first sandboxed build
+could not reach its local font proxy; the unchanged build command passed under
+host execution. Knowledge verification returned the 12 existing indexed
+entries. Preserve the final full commit SHA and Context Receipt in the handoff;
+the receipt authorizes no live configuration, push, merge PR #14, or deploy.
+
 ## Parent closure checklist
 
 ### PRO-116 infrastructure-blocked Smoke recovery

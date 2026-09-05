@@ -787,3 +787,23 @@ control-plane commit before enabling its live deployment record. Run the Python
 workflow tests before serial frontend `lint` and `build`; if a required host
 fixture or network-bound build dependency is unavailable, record BLOCKED rather
 than treating an earlier result as current evidence.
+
+### Control-plane verification receipt (2026-09-06)
+
+The isolated candidate-refresh branch completed a local, non-live verification
+run. The Python discovery suite passed 658 tests, including a real temporary Git
+object graph and bare remote that exercised Stage 1 evidence, Stage 2 prepare,
+staged publication/adoption, fresh Stage 3 Review and QA PASS, and the final
+human merge hold. The recorded mutation-boundary test derives its write count
+from the baseline execution and exercises every `1..N` boundary both before and
+after the effect; incompatible external state stops with no later write.
+
+The frontend checks also passed: local contract 4, footer metadata 14, layout
+hydration 1, dashboard profile 11, scoped lint, and production build. Lint
+reported 34 pre-existing warnings and zero errors. The sandboxed build was
+initially blocked from its local font-fetch proxy, then the identical command
+passed under host execution; no source or builder setting was changed to make it
+pass. Repository knowledge verification found all 12 indexed entries. This
+receipt authorizes no live configuration, GitHub push or merge, production
+deployment, or Smoke execution; the final commit SHA and full-SHA Context
+Receipt belong in the independent handoff.
