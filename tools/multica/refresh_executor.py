@@ -339,7 +339,7 @@ class RefreshAPI:
               and type(base.get("object")) is dict and base["object"].get("type") == "commit", "invalid base ref")
         base_sha = base["object"].get("sha")
         c._match(base_sha, c._SHA)
-        _need(base_sha == pr["base"]["sha"] and prerequisite["base"]["ref"] == base_ref, "base drift")
+        _need(prerequisite["base"]["ref"] == base_ref, "base drift")
         compare = self.github.run(["api", "--method", "GET", f"repos/codeExploreHub/Eventra/compare/{merge}...{base_sha}"])
         _need(type(compare) is dict and compare.get("status") in {"ahead", "identical"}
               and type(compare.get("merge_base_commit")) is dict

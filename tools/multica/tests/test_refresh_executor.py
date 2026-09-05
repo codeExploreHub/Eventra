@@ -514,6 +514,15 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaises((ValueError, RuntimeError)):
             self.admit()
 
+    def test_stale_managed_pr_base_sha_uses_current_base_ref_authority(self):
+        self.github.pr["base"]["sha"] = "c" * 40
+
+        state = self.snapshot().state()
+
+        self.assertEqual(state["pr"]["base_ref"], "master")
+        self.assertEqual(state["prerequisite"]["base_sha"], "d" * 40)
+        self.assertEqual(state["prerequisite"]["ancestor_sha"], "d" * 40)
+
     def test_parent_or_comment_change_between_reads_blocks_freeze(self):
         reads = 0
         def mutate(args):
