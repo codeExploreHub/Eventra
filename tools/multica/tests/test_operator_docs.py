@@ -467,6 +467,37 @@ class OperatorDocsTests(unittest.TestCase):
                 self.assertIn("done means phase execution finished", rendered)
                 self.assertIn("pass|fail|blocked", rendered)
 
+    def test_frontend_engineer_documents_candidate_refresh_as_a_separate_flow(self):
+        raw = Path("tools/multica/instructions/frontend_engineer.md").read_text()
+        rendered = " ".join(raw.split())
+        command_action = next(
+            action
+            for action in build_workflow_parser()._actions
+            if action.dest == "command"
+        )
+        self.assertNotIn("finish-refresh", command_action.choices)
+        self.assertIn("not yet an executable handoff", rendered)
+        self.assertIn("Until Task 8 deploys the parser-backed", rendered)
+        self.assertNotIn("\ngit merge --no-ff", raw)
+        for fragment in (
+            "dedicated task-owned integration worktree",
+            "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null",
+            "git --no-replace-objects",
+            "core.hooksPath=/dev/null",
+            "core.attributesFile=/dev/null",
+            "merge --no-ff --no-commit PREREQUISITE_SHA",
+            "python local_contract footer hydration dashboard lint build knowledge",
+            "task_id must equal the refresh child identifier",
+            "--verified-id",
+            "push only TARGET_SHA:STAGING_REF",
+            "eventra-candidate-refresh-prepared-v1",
+            "eventra-candidate-refresh-outcome-v1",
+            "tools.multica.workflow finish-refresh",
+            "Never update the managed PR branch",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, rendered)
+
     def test_delivery_lead_uses_native_stages_and_deterministic_parent_plan(self):
         rendered = Path(
             "tools/multica/instructions/delivery_lead.md"

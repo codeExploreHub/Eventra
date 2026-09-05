@@ -95,6 +95,7 @@ def refresh_snapshot_fixture(*, state="candidate_registered", adopted=False):
         reservation = {"version": 1, "request_digest": request.digest, "authorization_uuid": uid(10), "action_key": action,
                        "state": state, "child_id": None if state == "reserved" else uid(9),
                        "child_identifier": None if state == "reserved" else "PRO-902",
+                       "child_position": None if state == "reserved" else -8,
                        "prepared": prepared if state in {"candidate_registered", "published", "adopted"} else None,
                        "parent_status_category": boundary.parent["status_category"],
                        "parent_position": boundary.parent["position"],
@@ -630,6 +631,81 @@ class PreparedTests(ContractCase):
                         text.replace('"schema_version":1', '"schema_version":1,"schema_version":1')):
             with self.subTest(content_length=len(content)), self.assertRaises(ValueError):
                 self.api.parse_prepared(self.evidence(content=content), self.request, uid(9))
+
+
+class OutcomeTests(ContractCase):
+    def evidence(self, result="blocked", **changes):
+        payload = {
+            "schema_version": 1,
+            "request_digest": self.request.digest,
+            "child_id": uid(9),
+            "source_sha": "b" * 40,
+            "prerequisite_sha": "d" * 40,
+            "result": result,
+            "commands": {
+                "build": {"argv": ["npm", "run", "build"], "exit_code": 1},
+            },
+            "reason": "required build could not complete",
+        }
+        payload.update(changes)
+        return self.api.RefreshComment(
+            uid(9), uid(12), uid(8), "agent", 1,
+            "Preparation did not pass.\n" + block("outcome", payload),
+        )
+
+    def test_non_pass_outcome_binds_identity_without_target(self):
+        for result in ("fail", "blocked"):
+            with self.subTest(result=result):
+                parsed = self.api.parse_outcome(
+                    self.evidence(result), self.request, uid(9), result,
+                )
+                self.assertEqual(parsed.result, result)
+                self.assertEqual(parsed.source_sha, "b" * 40)
+                self.assertEqual(parsed.evidence_uuid, uid(12))
+
+    def test_non_pass_records_only_checks_actually_run(self):
+        cases = (
+            {},
+            {
+                "knowledge": {
+                    "argv": [
+                        "python3", "-B", "-m", "tools.multica.knowledge", "verify",
+                        "--frontend-root", "/tmp/frontend",
+                        "--backend-root", "/tmp/backend",
+                    ],
+                    "exit_code": 1,
+                },
+            },
+            {
+                "python": {
+                    "argv": [
+                        "python3", "-B", "-m", "unittest", "discover", "-s",
+                        "tools/multica/tests", "-p", "test_*.py",
+                    ],
+                    "exit_code": 0,
+                },
+            },
+        )
+        for commands in cases:
+            with self.subTest(commands=commands):
+                parsed = self.api.parse_outcome(
+                    self.evidence(commands=commands), self.request, uid(9), "blocked",
+                )
+                self.assertEqual(parsed.result, "blocked")
+
+    def test_outcome_rejects_pass_target_and_identity_drift(self):
+        for changes in (
+                {"result": "pass"}, {"target_sha": "f" * 40},
+                {"request_digest": "0" * 64}, {"child_id": uid(3)},
+                {"source_sha": "a" * 40}, {"prerequisite_sha": "a" * 40},
+                {"schema_version": True}, {"reason": ""},
+                {"commands": {"build": {"argv": ["true"], "exit_code": 1}}},
+                {"commands": {"build": {"argv": ["npm", "run", "build"], "exit_code": False}}},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.api.parse_outcome(
+                    self.evidence(**changes), self.request, uid(9), "blocked",
+                )
 
 
 if __name__ == "__main__":

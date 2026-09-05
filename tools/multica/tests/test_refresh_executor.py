@@ -521,6 +521,7 @@ class MemoryRefreshAPI:
         self.fail_operation = None
         self.create_effects = 0
         self.complete_started_run = False
+        self.issue_comments = {}
 
     def _mutate(self, operation, args, apply):
         self.write_index += 1
@@ -543,6 +544,25 @@ class MemoryRefreshAPI:
             raise RuntimeError("unknown parent")
         return contracts.RefreshSnapshot(contracts.canonical_json(copy.deepcopy(self.state)))
 
+    def parent_for_child(self, child):
+        matches = [item for item in self.state["children"]
+                   if item["detail"]["identifier"] == child]
+        if len(matches) != 1 or matches[0]["detail"]["parent_issue_id"] != self.state["parent"]["id"]:
+            raise RuntimeError("unknown child")
+        return self.state["parent"]["identifier"]
+
+    def add_comment(self, issue, comment):
+        if comment.issue_id != next(item["detail"]["id"] for item in self.state["children"]
+                                    if item["detail"]["identifier"] == issue):
+            raise RuntimeError("wrong comment scope")
+        self.issue_comments[(issue, comment.comment_uuid)] = comment
+
+    def comment(self, issue, comment_uuid):
+        try:
+            return self.issue_comments[(issue, comment_uuid)]
+        except KeyError:
+            raise RuntimeError("missing scoped comment") from None
+
     def set_metadata(self, issue, key, value):
         if issue == self.state["parent"]["identifier"]:
             detail, metadata = self.state["parent"], self.state["metadata"]
@@ -559,6 +579,8 @@ class MemoryRefreshAPI:
             metadata[key] = value
             detail["metadata"] = copy.deepcopy(metadata)
             detail["revision"] += 1
+            if issue != self.state["parent"]["identifier"] and key == "eventra.phase.evidence_comment":
+                matches[0]["evidence"] = asdict(self.comment(issue, value))
             return True
 
         self._mutate("set_metadata", (issue, key, value), apply)
@@ -574,8 +596,8 @@ class MemoryRefreshAPI:
             if len(matches) != 1:
                 raise RuntimeError("unknown issue")
             detail = matches[0]["detail"]
-            if position is not None:
-                raise RuntimeError("child position must not be supplied")
+            if position is not None and (start or position != detail["position"]):
+                raise RuntimeError("child position contract mismatch")
 
         def apply():
             changed = detail["status"] != status
@@ -598,6 +620,13 @@ class MemoryRefreshAPI:
                         run["completed_at"] = "2026-09-05T02:00:00Z"
                     self.state["runs"].append(run)
                     changed = True
+            elif status == "done":
+                for run in self.state["runs"]:
+                    if run["issue_id"] == detail["id"] and run["status"] in {
+                            "queued", "dispatched", "running", "waiting_local_directory"}:
+                        run["status"] = "completed"
+                        run["completed_at"] = "2026-09-05T02:30:00Z"
+                        changed = True
             return changed
 
         self._mutate("set_status", (issue, status, start, position), apply)
@@ -901,6 +930,265 @@ class ExecuteRefreshTests(unittest.TestCase):
                         contracts.refresh_action(api.request),
                     )
                 self.assertEqual(len(api.writes), before)
+
+
+class MemoryRefreshGit:
+    def __init__(self, request):
+        self.request = request
+        self.target = "f" * 40
+        self.tree = "1" * 40
+        self.verify_calls = []
+        self.fail_verify = False
+
+    def verify_candidate(self, request, target_sha):
+        if self.fail_verify:
+            raise RuntimeError("staging candidate unavailable")
+        if request != self.request or target_sha != self.target:
+            raise RuntimeError("wrong candidate")
+        self.verify_calls.append((request.digest, target_sha))
+        return self.tree
+
+
+class FinishRefreshTests(unittest.TestCase):
+    @staticmethod
+    def pass_case():
+        from tools.multica.tests.test_candidate_refresh import prepared_payload
+
+        api = MemoryRefreshAPI()
+        module = importlib.import_module("tools.multica.refresh_executor")
+        module.stage_refresh_request(api, "PRO-900", api.request)
+        api.publish_authorization()
+        module.execute_refresh(
+            api, None, "PRO-900", uid(12), uid(13),
+            contracts.refresh_action(api.request),
+        )
+        child = api.state["children"][1]
+        payload = prepared_payload(api.request)
+        payload["child_id"] = child["detail"]["id"]
+        evidence_uuid = uid(93)
+        evidence = contracts.RefreshComment(
+            child["detail"]["id"], evidence_uuid,
+            api.request.payload()["assignment"]["engineer_id"], "agent", 1,
+            "Preparation only; no PR publication.\n" + block("prepared", payload),
+        )
+        api.add_comment("PRO-902", evidence)
+        git = MemoryRefreshGit(api.request)
+        return api, module, git, child, evidence_uuid
+
+    @staticmethod
+    def nonpass_case(outcome):
+        api = MemoryRefreshAPI()
+        module = importlib.import_module("tools.multica.refresh_executor")
+        module.stage_refresh_request(api, "PRO-900", api.request)
+        api.publish_authorization()
+        module.execute_refresh(
+            api, None, "PRO-900", uid(12), uid(13),
+            contracts.refresh_action(api.request),
+        )
+        child = api.state["children"][1]
+        payload = {
+            "schema_version": 1,
+            "request_digest": api.request.digest,
+            "child_id": child["detail"]["id"],
+            "source_sha": "b" * 40,
+            "prerequisite_sha": "d" * 40,
+            "result": outcome,
+            "commands": {
+                "build": {"argv": ["npm", "run", "build"], "exit_code": 1},
+            },
+            "reason": "required build could not complete",
+        }
+        evidence_uuid = uid(94)
+        evidence = contracts.RefreshComment(
+            child["detail"]["id"], evidence_uuid,
+            api.request.payload()["assignment"]["engineer_id"], "agent", 1,
+            "Preparation did not pass.\n" + block("outcome", payload),
+        )
+        api.add_comment("PRO-902", evidence)
+        git = MemoryRefreshGit(api.request)
+        return api, module, git, child, evidence_uuid
+
+    def test_prepared_pass_does_not_publish_managed_pr(self):
+        api, module, git, child, evidence_uuid = self.pass_case()
+        managed_before = api.state["pr"]["head_sha"]
+        source_before = copy.deepcopy(api.state["children"][0])
+        api.writes.clear()
+
+        result = module.finish_refresh(
+            api, git, "PRO-902", evidence_uuid, "pass",
+        )
+
+        self.assertEqual((result.status, result.child_identifier), ("prepared", "PRO-902"))
+        self.assertEqual(api.state["pr"]["head_sha"], managed_before)
+        self.assertEqual(api.state["metadata"]["eventra.workflow.frontend_sha"], "b" * 40)
+        self.assertNotIn("eventra.refresh.adoption", api.state["metadata"])
+        self.assertNotIn("eventra.refresh.consumed", api.state["metadata"])
+        self.assertEqual(api.state["children"][0], source_before)
+        self.assertEqual(child["metadata"]["eventra.phase.kind"], "refresh")
+        self.assertEqual(child["metadata"]["eventra.phase.sha.frontend"], "f" * 40)
+        self.assertEqual(child["metadata"]["eventra.phase.result"], "pass")
+        self.assertEqual(child["metadata"]["eventra.phase.evidence_comment"], evidence_uuid)
+        self.assertEqual(child["detail"]["status"], "done")
+        self.assertEqual(git.verify_calls, [(api.request.digest, "f" * 40)])
+
+    def test_finish_pass_recovers_every_write_boundary_and_replays_as_noop(self):
+        for fail_at in range(1, 6):
+            for fail_after in (False, True):
+                with self.subTest(fail_at=fail_at, fail_after=fail_after):
+                    api, module, git, child, evidence_uuid = self.pass_case()
+                    api.writes.clear()
+                    api.write_index = 0
+                    api.fail_at, api.fail_after = fail_at, fail_after
+
+                    if fail_after:
+                        result = module.finish_refresh(
+                            api, git, "PRO-902", evidence_uuid, "pass",
+                        )
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "before effect"):
+                            module.finish_refresh(
+                                api, git, "PRO-902", evidence_uuid, "pass",
+                            )
+                        result = module.finish_refresh(
+                            api, git, "PRO-902", evidence_uuid, "pass",
+                        )
+
+                    self.assertEqual(result.status, "prepared")
+                    self.assertEqual(child["detail"]["status"], "done")
+                    self.assertEqual(len(api.writes), 5)
+                    replay = module.finish_refresh(
+                        api, git, "PRO-902", evidence_uuid, "pass",
+                    )
+                    self.assertEqual((replay.status, replay.mutation_count),
+                                     ("prepared", 0))
+                    self.assertEqual(len(api.writes), 5)
+                    git.fail_verify = True
+                    replay = module.finish_refresh(
+                        api, git, "PRO-902", evidence_uuid, "pass",
+                    )
+                    self.assertEqual((replay.status, replay.mutation_count),
+                                     ("prepared", 0))
+                    self.assertEqual(len(api.writes), 5)
+
+    def test_finish_pass_rejects_unverified_or_changed_authority_without_writes(self):
+        cases = {
+            "missing staging proof": lambda api, git, child: setattr(git, "fail_verify", True),
+            "candidate tree mismatch": lambda api, git, child: setattr(git, "tree", "3" * 40),
+            "managed head drift": lambda api, git, child: api.state["pr"].__setitem__("head_sha", "a" * 40),
+            "unknown child metadata": lambda api, git, child: child["metadata"].__setitem__(
+                "eventra.phase.unbound", "forged"),
+            "child position drift": lambda api, git, child: child["detail"].__setitem__("position", -999),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                api, module, git, child, evidence_uuid = self.pass_case()
+                api.writes.clear()
+                mutate(api, git, child)
+                child["detail"]["metadata"] = copy.deepcopy(child["metadata"])
+
+                with self.assertRaises((RuntimeError, ValueError)):
+                    module.finish_refresh(
+                        api, git, "PRO-902", evidence_uuid, "pass",
+                    )
+                self.assertEqual(api.writes, [])
+
+    def test_wrong_or_rebound_prepared_evidence_never_completes_refresh(self):
+        from dataclasses import replace
+
+        changes = {
+            "wrong author": lambda evidence: replace(evidence, author_id=uid(7)),
+            "edited revision": lambda evidence: replace(evidence, revision=2),
+            "wrong task receipt": lambda evidence: replace(
+                evidence, content=evidence.content.replace('"task_id":"PRO-902"',
+                                                           '"task_id":"PRO-903"')),
+            "ordinary gate body": lambda evidence: replace(
+                evidence, content="QA PASS for an unrelated normal phase"),
+        }
+        for label, mutate in changes.items():
+            with self.subTest(label=label):
+                api, module, git, _, evidence_uuid = self.pass_case()
+                api.issue_comments[("PRO-902", evidence_uuid)] = mutate(
+                    api.issue_comments[("PRO-902", evidence_uuid)])
+                api.writes.clear()
+
+                with self.assertRaises((RuntimeError, ValueError)):
+                    module.finish_refresh(
+                        api, git, "PRO-902", evidence_uuid, "pass",
+                    )
+                self.assertEqual(api.writes, [])
+
+        api, module, git, child, evidence_uuid = self.pass_case()
+        module.finish_refresh(api, git, "PRO-902", evidence_uuid, "pass")
+        before = len(api.writes)
+        replacement_uuid = uid(95)
+        old = api.issue_comments[("PRO-902", evidence_uuid)]
+        api.add_comment("PRO-902", replace(old, comment_uuid=replacement_uuid))
+        with self.assertRaises((RuntimeError, ValueError)):
+            module.finish_refresh(
+                api, git, "PRO-902", replacement_uuid, "pass",
+            )
+        self.assertEqual(len(api.writes), before)
+        self.assertEqual(child["metadata"]["eventra.phase.evidence_comment"], evidence_uuid)
+
+    def test_non_pass_outcome_finishes_child_without_candidate_or_git_publication(self):
+        for outcome in ("fail", "blocked"):
+            with self.subTest(outcome=outcome):
+                api, module, git, child, evidence_uuid = self.nonpass_case(outcome)
+                managed_before = api.state["pr"]["head_sha"]
+                api.writes.clear()
+
+                result = module.finish_refresh(
+                    api, git, "PRO-902", evidence_uuid, outcome,
+                )
+
+                self.assertEqual((result.status, result.child_identifier),
+                                 (outcome, "PRO-902"))
+                self.assertEqual(child["metadata"]["eventra.phase.sha.frontend"], "b" * 40)
+                self.assertEqual(child["metadata"]["eventra.phase.result"], outcome)
+                self.assertEqual(child["metadata"]["eventra.phase.evidence_comment"], evidence_uuid)
+                self.assertEqual(child["metadata"]["eventra.phase.failure_repositories"],
+                                 '["frontend"]')
+                self.assertEqual(child["detail"]["status"], "done")
+                self.assertEqual(api.state["pr"]["head_sha"], managed_before)
+                self.assertEqual(git.verify_calls, [])
+                writes = len(api.writes)
+                replay = module.finish_refresh(
+                    api, git, "PRO-902", evidence_uuid, outcome,
+                )
+                self.assertEqual((replay.status, replay.mutation_count),
+                                 (outcome, 0))
+                self.assertEqual(len(api.writes), writes)
+                decision = contracts.plan_refresh(api.request, api.snapshot("PRO-900"))
+                self.assertEqual(decision.kind, "block")
+
+    def test_non_pass_recovers_every_write_boundary(self):
+        for outcome in ("fail", "blocked"):
+            for fail_at in range(1, 5):
+                for fail_after in (False, True):
+                    with self.subTest(outcome=outcome, fail_at=fail_at,
+                                      fail_after=fail_after):
+                        api, module, git, child, evidence_uuid = self.nonpass_case(outcome)
+                        api.writes.clear()
+                        api.write_index = 0
+                        api.fail_at, api.fail_after = fail_at, fail_after
+
+                        if fail_after:
+                            result = module.finish_refresh(
+                                api, git, "PRO-902", evidence_uuid, outcome,
+                            )
+                        else:
+                            with self.assertRaisesRegex(RuntimeError, "before effect"):
+                                module.finish_refresh(
+                                    api, git, "PRO-902", evidence_uuid, outcome,
+                                )
+                            result = module.finish_refresh(
+                                api, git, "PRO-902", evidence_uuid, outcome,
+                            )
+
+                        self.assertEqual((result.status, len(api.writes)),
+                                         (outcome, 4))
+                        self.assertEqual(child["detail"]["status"], "done")
+                        self.assertEqual(git.verify_calls, [])
 
 
 if __name__ == "__main__":

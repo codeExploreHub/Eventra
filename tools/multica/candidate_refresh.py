@@ -61,6 +61,17 @@ class PreparedCandidate:
 
 
 @dataclass(frozen=True)
+class RefreshOutcome:
+    request_digest: str
+    child_id: str
+    source_sha: str
+    prerequisite_sha: str
+    result: str
+    evidence_uuid: str
+    evidence_digest: str
+
+
+@dataclass(frozen=True)
 class InitialRefreshProgress:
     request: RefreshRequest
     metadata_writes: int
@@ -346,28 +357,42 @@ _COMMANDS = {
 }
 
 
+def _command_argv(name: str, argv: object) -> None:
+    _require(type(argv) is list and all(type(arg) is str for arg in argv))
+    if name == "knowledge":
+        prefix = ["python3", "-B", "-m", "tools.multica.knowledge", "verify"]
+        _require(len(argv) == 9 and argv[:5] == prefix and
+                 argv[5] == "--frontend-root" and argv[7] == "--backend-root")
+        for root in (argv[6], argv[8]):
+            _require(root.startswith("/") and root != "/" and ".." not in PurePosixPath(root).parts
+                     and not any(ord(char) < 32 for char in root))
+        _require(argv[6] != argv[8])
+        return
+    allowed = [_COMMANDS[name]]
+    if name == "lint":
+        allowed.append(_COMMANDS[name] + ["--", "--ignore-pattern", ".worktrees/**"])
+    if name == "python":
+        allowed.append(_COMMANDS[name] + ["-v"])
+    _require(argv in allowed, "required refresh check substituted")
+
+
 def _commands(raw: object) -> None:
     commands = _object(raw, " ".join((*_COMMANDS, "knowledge")))
     for name, result in commands.items():
         result = _object(result, "argv exit_code")
         _integer(result["exit_code"], 0)
-        argv = result["argv"]
-        _require(type(argv) is list and all(type(arg) is str for arg in argv))
-        if name == "knowledge":
-            prefix = ["python3", "-B", "-m", "tools.multica.knowledge", "verify"]
-            _require(len(argv) == 9 and argv[:5] == prefix and
-                     argv[5] == "--frontend-root" and argv[7] == "--backend-root")
-            for root in (argv[6], argv[8]):
-                _require(root.startswith("/") and root != "/" and ".." not in PurePosixPath(root).parts
-                         and not any(ord(char) < 32 for char in root))
-            _require(argv[6] != argv[8])
-        else:
-            allowed = [_COMMANDS[name]]
-            if name == "lint":
-                allowed.append(_COMMANDS[name] + ["--", "--ignore-pattern", ".worktrees/**"])
-            if name == "python":
-                allowed.append(_COMMANDS[name] + ["-v"])
-            _require(argv in allowed, "required refresh check substituted")
+        _command_argv(name, result["argv"])
+
+
+def _outcome_commands(raw: object) -> None:
+    _require(type(raw) is dict and set(raw) <= set((*_COMMANDS, "knowledge")),
+             "invalid refresh outcome commands")
+    for name, result in raw.items():
+        result = _object(result, "argv exit_code")
+        code = result["exit_code"]
+        _require(type(code) is int and 0 <= code <= 255,
+                 "invalid refresh outcome exit code")
+        _command_argv(name, result["argv"])
 
 
 def _context(raw: object, payload: dict[str, Any], target: str) -> None:
@@ -421,6 +446,31 @@ def parse_prepared(comment: RefreshComment, request: RefreshRequest, child_id: s
     return PreparedCandidate(request.digest, child_id, value["source_sha"], value["prerequisite_sha"],
                              value["target_sha"], value["tree_sha"], comment.comment_uuid,
                              hashlib.sha256(comment.content.encode("utf-8")).hexdigest(), request.staging_ref)
+
+
+def parse_outcome(comment: RefreshComment, request: RefreshRequest, child_id: str,
+                  expected_result: str) -> RefreshOutcome:
+    payload = _request(request)
+    _uuid(child_id)
+    _require(child_id not in (payload["parent"]["id"], payload["source"]["child_id"]))
+    _require(expected_result in {"fail", "blocked"}, "invalid refresh outcome result")
+    _comment(comment, child_id, "agent")
+    _require(comment.author_id == payload["assignment"]["engineer_id"])
+    value = _object(_block(comment.content, "outcome"),
+                    "schema_version request_digest child_id source_sha prerequisite_sha result commands reason")
+    _integer(value["schema_version"], 1)
+    _require(value["request_digest"] == request.digest and value["child_id"] == child_id
+             and value["source_sha"] == payload["source"]["sha"]
+             and value["prerequisite_sha"] == payload["prerequisite"]["merge_sha"]
+             and value["result"] == expected_result,
+             "refresh outcome identity mismatch")
+    _outcome_commands(value["commands"])
+    reason = _size(value["reason"], 2048)
+    _require(bool(reason.strip()), "refresh outcome reason is empty")
+    return RefreshOutcome(request.digest, child_id, value["source_sha"],
+                          value["prerequisite_sha"], expected_result,
+                          comment.comment_uuid,
+                          hashlib.sha256(comment.content.encode("utf-8")).hexdigest())
 
 
 @dataclass(frozen=True)
@@ -1047,7 +1097,7 @@ def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> Refresh
                  and state["pr"]["head_sha"] == prepared.target_sha, "adopted candidate mismatch")
         return RefreshDecision("create_gate_stage", None, "adopted refresh requires fresh Stage 3 gates")
     reservation = _object(reservation, "version request_digest authorization_uuid action_key state child_id "
-                          "child_identifier prepared parent_status_category parent_position "
+                          "child_identifier child_position prepared parent_status_category parent_position "
                           "parent_projection_digest")
     _integer(reservation["version"], 1)
     _require(type(reservation["parent_status_category"]) is str
@@ -1069,7 +1119,8 @@ def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> Refresh
     if reservation["state"] == "reserved":
         _reserved_refresh_child(request, state)
         _require(reservation["child_id"] is None
-                 and reservation["child_identifier"] is None and reservation["prepared"] is None
+                 and reservation["child_identifier"] is None and reservation["child_position"] is None
+                 and reservation["prepared"] is None
                  and not {"adoption", "consumed"} & set(feature)
                  and metadata.get("eventra.workflow.next_stage") == "2"
                  and metadata.get("eventra.workflow.last_action") == payload["parent"]["last_action"]
@@ -1080,6 +1131,7 @@ def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> Refresh
     child, prepared = _refresh_child(request, state)
     _require(len(state["children"]) == 2 and reservation["child_id"] == child["detail"]["id"]
              and reservation["child_identifier"] == child["detail"]["identifier"]
+             and reservation["child_position"] == child["detail"]["position"]
              and metadata.get("eventra.workflow.next_stage") == "3" and metadata.get("eventra.workflow.last_action") == key,
              "reservation child mismatch")
     child_runs = [run for run in active if run not in parent_runs]

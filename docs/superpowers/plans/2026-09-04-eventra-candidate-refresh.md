@@ -372,12 +372,22 @@ def mutate(self, operation, args, apply):
 
 ## Task 6: Engineer 准备与专用完成证据
 
+**执行状态（2026-09-05）：本地准备完成协议已闭合。** `finish_refresh` 只接受
+精确 Stage 2 refresh child 的 prepared PASS 或严格 FAIL/BLOCKED outcome；PASS
+重新核验固定检查、显式 Context Receipt、远端 staging ref、双父顺序与完整树，
+仅完成 child 而不更新 managed PR/父候选。FAIL/BLOCKED 保留 source 并进入
+planner block，不消费 repair。PASS 五笔、非 PASS 四笔写入的 before/after 中断均
+可恢复；相同不可变终态重放不依赖后续 staging 可用性。Frontend Engineer 契约
+已冻结未来操作顺序，但在 Task 8 提供 parser-backed CLI、guarded worktree handoff
+和 expected-tree verifier 前明确禁止执行。证据见
+`2026-09-05-eventra-candidate-refresh-batch-3f.md`；本批次仍未接 CLI、未触碰 live。
+
 **Files:** Modify `candidate_refresh.py`, `refresh_executor.py`, `workflow.py`, `tests/test_refresh_executor.py`, `instructions/frontend_engineer.md`。
 
 **Interfaces:** `finish_refresh(api: RefreshAPI, git: RefreshGit, child: str, evidence_uuid: str, result: str) -> RefreshExecutionResult`，result=pass/fail/blocked。
 失败封套 `eventra-candidate-refresh-outcome-v1` 固定 schema_version/request_digest/child_id/source_sha/prerequisite_sha/result/commands/reason，不允许 target 或 PASS；作者和 comment 身份检查与 prepared 相同。
 
-- [ ] 新测：准备 PASS 在原 PR head 仍为 source、staging ref 为 target 时允许完成；若误用现有 finish-phase 或提交普通 QA PASS 必须失败。
+- [x] 新测：准备 PASS 在原 PR head 仍为 source、staging ref 为 target 时允许完成；若误用现有 finish-phase 或提交普通 QA PASS 必须失败。
 
 ```python
 def test_prepared_pass_does_not_publish_managed_pr(self):
@@ -389,12 +399,12 @@ def test_prepared_pass_does_not_publish_managed_pr(self):
     self.assertNotIn("eventra.refresh.adoption", self.api.parent_metadata)
 ```
 
-- [ ] Run `python3 -B -m unittest tools.multica.tests.test_refresh_executor -v` RED。
-- [ ] 指令给出真实操作顺序：专属命名 integration worktree 基于 source；禁用不受信任配置；`git merge --no-ff --no-commit PREREQUISITE`；先确认无冲突与 expected tree、再 commit（两父顺序如设计）；任何手改内容拒绝。commit 后 exact SHA 上重跑必需检查，读取知识与生成 receipt，再推唯一 staging ref。
-- [ ] 必需检查名固定 python/local_contract/footer/hydration/dashboard/lint/build/knowledge；argv 对应 Task9 的真实命令，knowledge/context 的显式 repo 路径允许 task-owned roots。测试数量记录实际值不硬编码 496。Context Receipt 必须 task_id=child、candidate frontend=target，material verified_ids 由 agent 实际核验，解析器不能自动填入。
-- [ ] prepared 正文只证明准备和测试。`finish_refresh` 重新验证 request、child assignment、grant、reservation、staging SHA/Git tree、evidence 内容；PASS 只改当前 refresh 的完成字段并 done，不改 parent candidate/PR。FAIL/BLOCKED 保留 source SHA 和原 PR，合法结果写 done/non-PASS，父任务后续阻断，不强造 target。
-- [ ] 普通 phase 完成的旧终态冲突保护保持；refresh 同一 immutable evidence 重放为 noop，换证据/换 SHA 终态重放拒绝。登记前 source 漂移、暂存不存在、错作者、缺命令、被改评论全部拒绝且 writes=0。
-- [ ] Run GREEN；Commit：`feat(multica): record refresh preparation without publishing the candidate`。
+- [x] Run `python3 -B -m unittest tools.multica.tests.test_refresh_executor -v` RED。
+- [x] 指令给出真实操作顺序：专属命名 integration worktree 基于 source；禁用不受信任配置；`git merge --no-ff --no-commit PREREQUISITE`；先确认无冲突与 expected tree、再 commit（两父顺序如设计）；任何手改内容拒绝。commit 后 exact SHA 上重跑必需检查，读取知识与生成 receipt，再推唯一 staging ref。
+- [x] 必需检查名固定 python/local_contract/footer/hydration/dashboard/lint/build/knowledge；argv 对应 Task9 的真实命令，knowledge/context 的显式 repo 路径允许 task-owned roots。测试数量记录实际值不硬编码 496。Context Receipt 必须 task_id=child、candidate frontend=target，material verified_ids 由 agent 实际核验，解析器不能自动填入。
+- [x] prepared 正文只证明准备和测试。`finish_refresh` 重新验证 request、child assignment、grant、reservation、staging SHA/Git tree、evidence 内容；PASS 只改当前 refresh 的完成字段并 done，不改 parent candidate/PR。FAIL/BLOCKED 保留 source SHA 和原 PR，合法结果写 done/non-PASS，父任务后续阻断，不强造 target。
+- [x] 普通 phase 完成的旧终态冲突保护保持；refresh 同一 immutable evidence 重放为 noop，换证据/换 SHA 终态重放拒绝。登记前 source 漂移、暂存不存在、错作者、缺命令、被改评论全部拒绝且 writes=0。
+- [x] Run GREEN；Commit：`feat(multica): record refresh preparation without publishing the candidate`。
 
 ## Task 7: 登记、发布与采纳恢复
 

@@ -118,7 +118,7 @@ class RefreshAPI:
 
     def set_status(self, issue, status, *, start, position=None):
         c._match(issue, c._ISSUE)
-        _need(status in {"todo", "in_progress"} and type(start) is bool,
+        _need(status in {"todo", "in_progress", "done"} and type(start) is bool,
               "invalid refresh status transition")
         _need(position is None or (type(position) is int and not start),
               "invalid refresh position preservation")
@@ -221,6 +221,20 @@ class RefreshAPI:
         matches = [comment for comment in first if comment.comment_uuid == comment_uuid]
         _need(len(matches) == 1, "missing scoped comment")
         return matches[0]
+
+    def parent_for_child(self, child):
+        detail = self._detail(child)
+        parent_id = detail.get("parent_issue_id")
+        _need(type(parent_id) is str, "refresh completion requires a child issue")
+        c._uuid(parent_id)
+        raw = self._read(["issue", "get", parent_id])
+        _need(type(raw) is dict, "invalid parent lookup")
+        parent = raw.get("identifier")
+        c._match(parent, c._ISSUE)
+        verified = self._detail(parent)
+        _need(verified["id"] == parent_id and verified["parent_issue_id"] is None,
+              "child parent lookup changed")
+        return parent
 
     def _assignment(self):
         blueprint = build_multi_repo_blueprint("Eventra")
@@ -408,7 +422,7 @@ def _initialization_progress(request: c.RefreshRequest, state: dict, reservation
     reservation_fields = {
         "version", "request_digest", "authorization_uuid", "action_key", "state",
         "child_id", "child_identifier", "prepared", "parent_status_category",
-        "parent_position", "parent_projection_digest",
+        "parent_position", "child_position", "parent_projection_digest",
     }
     _need(type(reservation) is dict and set(reservation) == reservation_fields,
           "invalid initialization checkpoint shape")
@@ -476,6 +490,8 @@ def _initialization_progress(request: c.RefreshRequest, state: dict, reservation
     if reservation["state"] == "reserved":
         _need(reservation["child_id"] is None and reservation["child_identifier"] is None,
               "reserved child binding is premature")
+        _need(reservation["child_position"] is None,
+              "reserved child position is premature")
         restored = c._load_json(c.canonical_json(state), 4_194_304)
         restored["metadata"]["eventra.workflow.next_stage"] = base_next
         restored["metadata"]["eventra.workflow.last_action"] = base_action
@@ -488,6 +504,7 @@ def _initialization_progress(request: c.RefreshRequest, state: dict, reservation
     else:
         _need(child is not None and reservation["child_id"] == child["detail"]["id"]
               and reservation["child_identifier"] == child["detail"]["identifier"]
+              and reservation["child_position"] == child["detail"]["position"]
               and child_prefix == len(_refresh_child_prefix(request)) and parent_prefix == 3
               and reservation["parent_projection_digest"] == c.parent_projection_digest(state),
               "initialized checkpoint projection mismatch")
@@ -526,12 +543,68 @@ def _checkpoint_value(request: c.RefreshRequest, authorization_uuid: str, state:
         "state": checkpoint,
         "child_id": None if child is None else child["detail"]["id"],
         "child_identifier": None if child is None else child["detail"]["identifier"],
+        "child_position": None if child is None else child["detail"]["position"],
         "prepared": None,
         "parent_status_category": previous["parent_status_category"],
         "parent_position": previous["parent_position"],
         "parent_projection_digest": c.parent_projection_digest(projected),
     }
     return c.canonical_json(reservation)
+
+
+def _finish_progress(request: c.RefreshRequest, state: dict, reservation: dict,
+                     child_identifier: str, evidence: c.RefreshComment,
+                     result: str, target_sha: str) -> tuple[int, dict, list[tuple[str, str]]]:
+    payload = c._request(request)
+    matches = [item for item in state["children"]
+               if item["detail"]["identifier"] == child_identifier]
+    _need(len(matches) == 1, "refresh completion child changed")
+    child = matches[0]
+    _need(reservation["state"] == "child_dispatched"
+          and reservation["child_id"] == child["detail"]["id"]
+          and reservation["child_identifier"] == child_identifier,
+          "refresh completion reservation mismatch")
+    base = dict(_refresh_child_prefix(request))
+    candidates = [dict(base)]
+    writes = []
+    if result == "pass":
+        writes.append(("eventra.phase.sha.frontend", target_sha))
+    writes.extend((
+        ("eventra.phase.result", result),
+        ("eventra.phase.evidence_comment", evidence.comment_uuid),
+        ("eventra.phase.failure_repositories", "[]" if result == "pass" else '["frontend"]'),
+    ))
+    for key, value in writes:
+        candidates.append({**candidates[-1], key: value})
+    _need(child["metadata"] in candidates, "refresh completion metadata is not an exact prefix")
+    progress = candidates.index(child["metadata"])
+    evidence_index = next(index for index, (key, _) in enumerate(writes, 1)
+                          if key == "eventra.phase.evidence_comment")
+    _need((progress < evidence_index and child["evidence"] is None)
+          or (progress >= evidence_index and child["evidence"] == asdict(evidence)),
+          "refresh completion evidence binding mismatch")
+    _need((progress < len(writes) and child["detail"]["status"] in {"todo", "in_progress", "in_review"})
+          or (progress == len(writes)
+              and child["detail"]["status"] in {"todo", "in_progress", "in_review", "done"}),
+          "refresh completion status is not recoverable")
+
+    restored = c._load_json(c.canonical_json(state), 4_194_304)
+    restored_child = next(item for item in restored["children"]
+                          if item["detail"]["identifier"] == child_identifier)
+    restored_child["metadata"] = base
+    restored_child["detail"]["metadata"] = base
+    restored_child["evidence"] = None
+    restored_child["detail"]["revision"] -= progress
+    if restored_child["detail"]["status"] == "done":
+        restored_child["detail"]["status"] = "todo"
+        restored_child["detail"]["status_category"] = "todo"
+        restored_child["detail"]["revision"] -= 1
+    _initialization_progress(request, restored, reservation)
+    _need(state["pr"]["head_sha"] == payload["source"]["sha"]
+          and state["metadata"].get("eventra.workflow.frontend_sha") == payload["source"]["sha"]
+          and not {c.REFRESH_PREFIX + "adoption", c.REFRESH_PREFIX + "consumed"} & set(state["metadata"]),
+          "refresh preparation cannot publish or adopt the candidate")
+    return progress, child, writes
 
 
 def execute_refresh(api, git, parent: str, request_uuid: str, grant_uuid: str,
@@ -581,7 +654,8 @@ def execute_refresh(api, git, parent: str, request_uuid: str, grant_uuid: str,
                 "version": 1, "request_digest": request.digest,
                 "authorization_uuid": grant_uuid, "action_key": action_key,
                 "state": "reserved", "child_id": None, "child_identifier": None,
-                "prepared": None, "parent_status_category": state["parent"]["status_category"],
+                "child_position": None, "prepared": None,
+                "parent_status_category": state["parent"]["status_category"],
                 "parent_position": state["parent"]["position"],
                 "parent_projection_digest": c.parent_projection_digest(projected),
             }
@@ -743,3 +817,76 @@ def execute_refresh(api, git, parent: str, request_uuid: str, grant_uuid: str,
             raise failure
         return RefreshExecutionResult(action_key, "child_dispatched", mutations,
                                       progress["child"]["detail"]["identifier"])
+
+
+def finish_refresh(api, git, child: str, evidence_uuid: str,
+                   result: str) -> RefreshExecutionResult:
+    """Record one verified preparation outcome without publishing the managed PR."""
+    c._match(child, c._ISSUE)
+    c._uuid(evidence_uuid)
+    _need(result in {"pass", "fail", "blocked"}, "invalid refresh completion result")
+    parent = api.parent_for_child(child)
+    mutations = 0
+    with api.parent_lock(parent):
+        state = api.snapshot(parent).state()
+        request = c.parse_request(state["metadata"].get(c.REFRESH_PREFIX + "request"))
+        feature = c.refresh_metadata(state["metadata"])
+        _need(feature is not None and type(feature.get("reservation")) is dict,
+              "missing refresh completion reservation")
+        reservation = feature["reservation"]
+        evidence = api.comment(child, evidence_uuid)
+        prepared = None
+        if result == "pass":
+            prepared = c.parse_prepared(evidence, request, reservation.get("child_id"))
+            body = c._block(evidence.content, "prepared")
+            _need(body["context_receipt"]["task_id"] == child,
+                  "prepared context is not scoped to the authoritative child")
+            target_sha = prepared.target_sha
+            status = "prepared"
+        else:
+            outcome = c.parse_outcome(evidence, request, reservation.get("child_id"), result)
+            target_sha = outcome.source_sha
+            status = result
+        progress, current_child, writes = _finish_progress(
+            request, state, reservation, child, evidence, result, target_sha)
+        if progress == len(writes) and current_child["detail"]["status"] == "done":
+            return RefreshExecutionResult(c.refresh_action(request), status, 0, child)
+        if prepared is not None:
+            tree = git.verify_candidate(request, prepared.target_sha)
+            _need(tree == prepared.tree_sha, "prepared candidate tree mismatch")
+
+        while progress < len(writes):
+            key, value = writes[progress]
+            failure = None
+            try:
+                api.set_metadata(child, key, value)
+            except RuntimeError as exc:
+                failure = exc
+            after = api.snapshot(parent).state()
+            observed, current_child, _ = _finish_progress(
+                request, after, reservation, child, evidence, result, target_sha)
+            if observed == progress + 1:
+                mutations += 1
+                state, progress = after, observed
+                continue
+            _need(observed == progress and failure is not None,
+                  "refresh completion metadata effect was not uniquely observed")
+            raise failure
+
+        if current_child["detail"]["status"] != "done":
+            failure = None
+            try:
+                api.set_status(child, "done", start=False,
+                               position=current_child["detail"]["position"])
+            except RuntimeError as exc:
+                failure = exc
+            after = api.snapshot(parent).state()
+            observed, completed_child, _ = _finish_progress(
+                request, after, reservation, child, evidence, result, target_sha)
+            if observed == len(writes) and completed_child["detail"]["status"] == "done":
+                mutations += 1
+            else:
+                _need(current_child["detail"]["status"] != "done" and failure is not None,
+                      "refresh completion status effect was not uniquely observed")
+                raise failure
+        return RefreshExecutionResult(c.refresh_action(request), status, mutations, child)
