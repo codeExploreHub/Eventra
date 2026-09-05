@@ -25,6 +25,14 @@ _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _ISSUE = re.compile(r"PRO-[1-9][0-9]*\Z")
 _PR = re.compile(r"https://github\.com/codeExploreHub/Eventra/pull/[1-9][0-9]*\Z")
+_SYSTEM_AUTHOR_ID = "00000000-0000-0000-0000-000000000000"
+_HISTORY_IDENTITIES = frozenset({
+    ("member", "comment"),
+    ("agent", "comment"),
+    ("agent", "system"),
+    ("system", "system"),
+    ("system", "progress_update"),
+})
 
 
 @dataclass(frozen=True)
@@ -144,6 +152,17 @@ def _integer(value: object, expected: int | None = None) -> None:
     _require(type(value) is int and (value >= 1 if expected is None else value == expected))
 
 
+def _history_identity(author_id: object, author_type: object,
+                      record_type: object) -> None:
+    _require((author_type, record_type) in _HISTORY_IDENTITIES,
+             "invalid refresh comment identity")
+    if author_type == "system":
+        _require(author_id == _SYSTEM_AUTHOR_ID,
+                 "invalid refresh comment identity")
+    else:
+        _uuid(author_id)
+
+
 def _branch(value: object) -> None:
     _require(type(value) is str and len(value) <= 255)
     _require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", value) is not None)
@@ -167,10 +186,9 @@ def comment_manifest(records: object, issue_id: str) -> list[dict[str, object]]:
         comment_id, parent_id = record["id"], record.get("parent_id")
         _uuid(comment_id)
         _require(comment_id not in seen, "duplicate refresh comment")
-        _uuid(record["author_id"])
+        _history_identity(record["author_id"], record["author_type"],
+                          record["type"])
         _require(record.get("issue_id", issue_id) == issue_id, "cross-scope refresh comment")
-        _require(record["author_type"] in {"member", "agent"} and record["type"] == "comment",
-                 "invalid refresh comment identity")
         _integer(record["revision"])
         if parent_id is not None:
             _uuid(parent_id)
@@ -189,7 +207,7 @@ def comment_manifest(records: object, issue_id: str) -> list[dict[str, object]]:
         seen.add(comment_id)
         result.append({"issue_id": issue_id, "comment_uuid": comment_id,
                        "author_id": record["author_id"], "author_type": record["author_type"],
-                       "type": "comment", "revision": record["revision"], "parent_id": parent_id,
+                       "type": record["type"], "revision": record["revision"], "parent_id": parent_id,
                        "created_at": created_at,
                        "content_digest": hashlib.sha256(content.encode("utf-8")).hexdigest()})
     for record in records:
@@ -550,7 +568,7 @@ def _snapshot(snapshot: RefreshSnapshot) -> dict[str, Any]:
                  "child metadata echo conflict")
     manifest_fields = {"issue_id", "comment_uuid", "author_id", "author_type", "type",
                        "revision", "parent_id", "created_at", "content_digest"}
-    parent_id, seen = state["parent"].get("id"), set()
+    parent_id, seen, manifest_comment_ids = state["parent"].get("id"), set(), set()
     normalized = {}
     for raw in state["comments"]:
         try:
@@ -563,9 +581,10 @@ def _snapshot(snapshot: RefreshSnapshot) -> dict[str, Any]:
     for item in state["comment_manifest"]:
         _require(type(item) is dict and set(item) == manifest_fields,
                  "invalid refresh comment manifest")
-        _uuid(item["issue_id"]); _uuid(item["comment_uuid"]); _uuid(item["author_id"])
-        _require(item["issue_id"] == parent_id and item["author_type"] in {"member", "agent"}
-                 and item["type"] == "comment", "invalid refresh comment manifest identity")
+        _uuid(item["issue_id"]); _uuid(item["comment_uuid"])
+        _history_identity(item["author_id"], item["author_type"], item["type"])
+        _require(item["issue_id"] == parent_id,
+                 "invalid refresh comment manifest identity")
         _integer(item["revision"])
         if item["parent_id"] is not None:
             _uuid(item["parent_id"])
@@ -579,11 +598,18 @@ def _snapshot(snapshot: RefreshSnapshot) -> dict[str, Any]:
         _require(item["comment_uuid"] not in seen, "duplicate refresh comment manifest")
         seen.add(item["comment_uuid"])
         comment = normalized.get(item["comment_uuid"])
-        _require(comment is not None and item["author_id"] == comment.author_id
-                 and item["author_type"] == comment.author_type and item["revision"] == comment.revision
-                 and item["content_digest"] == hashlib.sha256(comment.content.encode("utf-8")).hexdigest(),
-                 "refresh comment manifest mismatch")
-    _require(seen == set(normalized), "refresh comment manifest mismatch")
+        if item["type"] == "comment":
+            manifest_comment_ids.add(item["comment_uuid"])
+            _require(comment is not None and item["author_id"] == comment.author_id
+                     and item["author_type"] == comment.author_type
+                     and item["revision"] == comment.revision
+                     and item["content_digest"] == hashlib.sha256(
+                         comment.content.encode("utf-8")).hexdigest(),
+                     "refresh comment manifest mismatch")
+        else:
+            _require(comment is None, "system history became an authorizing comment")
+    _require(manifest_comment_ids == set(normalized),
+             "refresh comment manifest mismatch")
     _require(state["comment_manifest"] == sorted(state["comment_manifest"],
                                                   key=lambda item: item["comment_uuid"]),
              "noncanonical refresh comment manifest")

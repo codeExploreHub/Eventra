@@ -177,14 +177,17 @@ class RefreshAPI:
     def _comments(records, issue_id):
         c._uuid(issue_id)
         try:
-            c.comment_manifest(records, issue_id)
+            manifest = c.comment_manifest(records, issue_id)
         except ValueError as exc:
             raise RuntimeError("refresh authority: " + str(exc)) from None
         _need(type(records) is list, "incomplete comment pagination")
+        manifest_ids = {item["comment_uuid"] for item in manifest}
         result, seen = [], set()
         required = {"id", "author_id", "author_type", "content", "revision", "type", "created_at"}
         auxiliary = {"issue_id", "parent_id", "updated_at", "reply_count", "last_activity_at"}
         for record in records:
+            if record["type"] != "comment":
+                continue
             _need(type(record) is dict and "revision" in record, "missing comment revision")
             _need(required <= set(record) <= required | auxiliary, "unknown or folded comment fields")
             _need(record.get("issue_id", issue_id) == issue_id, "cross-scope comment")
@@ -195,7 +198,7 @@ class RefreshAPI:
             _need(type(record["revision"]) is int and record["revision"] >= 1, "comment revision")
             c._size(record["content"], c.MAX_COMMENT_BYTES)
             if record.get("parent_id") is not None:
-                _need(record["parent_id"] in seen, "incomplete comment thread")
+                _need(record["parent_id"] in manifest_ids, "incomplete comment thread")
             if "reply_count" in record:
                 _need(type(record["reply_count"]) is int and record["reply_count"] >= 0, "reply count")
             seen.add(record["id"])

@@ -239,6 +239,61 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(state["comment_manifest"], expected)
         self.assertNotIn("content", state["comment_manifest"][0])
 
+    def test_system_history_is_bound_but_cannot_become_authorizing_comment(self):
+        records = [
+            {"id": uid(40), "author_id": "00000000-0000-0000-0000-000000000000",
+             "author_type": "system", "type": "progress_update", "revision": 1,
+             "created_at": "2026-09-04T01:00:00Z", "content": "progress"},
+            {"id": uid(41), "parent_id": uid(40), "author_id": uid(7),
+             "author_type": "agent", "type": "comment", "revision": 1,
+             "created_at": "2026-09-04T01:01:00Z", "content": "reply"},
+            {"id": uid(42), "author_id": "00000000-0000-0000-0000-000000000000",
+             "author_type": "system", "type": "system", "revision": 1,
+             "created_at": "2026-09-04T01:02:00Z", "content": "transition"},
+            {"id": uid(43), "author_id": uid(8), "author_type": "agent",
+             "type": "system", "revision": 1,
+             "created_at": "2026-09-04T01:03:00Z", "content": "run marker"},
+        ]
+
+        comments = self.api._comments(records, uid(2))
+
+        self.assertEqual([comment.comment_uuid for comment in comments], [uid(41)])
+        self.assertEqual(
+            [item["comment_uuid"] for item in contracts.comment_manifest(records, uid(2))],
+            [uid(40), uid(41), uid(42), uid(43)],
+        )
+
+    def test_freezer_accepts_complete_bound_system_history(self):
+        system_history = [
+            {"id": uid(40), "author_id": "00000000-0000-0000-0000-000000000000",
+             "author_type": "system", "type": "progress_update", "revision": 1,
+             "created_at": "2026-09-04T01:00:00Z", "content": "progress"},
+            {"id": uid(41), "parent_id": uid(40), "author_id": uid(7),
+             "author_type": "agent", "type": "comment", "revision": 1,
+             "created_at": "2026-09-04T01:01:00Z", "content": "reply"},
+            {"id": uid(42), "author_id": "00000000-0000-0000-0000-000000000000",
+             "author_type": "system", "type": "system", "revision": 1,
+             "created_at": "2026-09-04T01:02:00Z", "content": "transition"},
+            {"id": uid(43), "author_id": uid(8), "author_type": "agent",
+             "type": "system", "revision": 1,
+             "created_at": "2026-09-04T01:03:00Z", "content": "run marker"},
+        ]
+        self.runner.comments["PRO-900"] = [
+            *system_history, *self.runner.comments["PRO-900"]]
+
+        snapshot = self.snapshot()
+        request = contracts.freeze_refresh_request(snapshot)
+
+        manifest = snapshot.state()["comment_manifest"]
+        self.assertEqual(
+            request.payload()["baseline"]["comments_digest"],
+            hashlib.sha256(contracts.canonical_json(manifest).encode()).hexdigest(),
+        )
+        self.assertEqual(
+            {item["comment_uuid"] for item in manifest},
+            {uid(10), uid(40), uid(41), uid(42), uid(43)},
+        )
+
     def test_trusted_freezer_derives_both_baselines_from_one_snapshot(self):
         snapshot = self.snapshot()
         request = contracts.freeze_refresh_request(snapshot)

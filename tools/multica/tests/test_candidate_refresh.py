@@ -515,6 +515,52 @@ class BaselineContractTests(ContractCase):
         self.assertEqual(self.api.comment_manifest_digest(self.records(), uid(2)),
                          hashlib.sha256(encode(expected).encode()).hexdigest())
 
+    def test_comment_manifest_binds_known_system_history_shapes(self):
+        records = [
+            {"id": uid(40), "author_id": "00000000-0000-0000-0000-000000000000",
+             "author_type": "system", "type": "progress_update", "revision": 1,
+             "created_at": "2026-09-04T01:00:00Z", "content": "progress"},
+            {"id": uid(41), "parent_id": uid(40), "author_id": uid(7),
+             "author_type": "agent", "type": "comment", "revision": 1,
+             "created_at": "2026-09-04T01:01:00Z", "content": "reply"},
+            {"id": uid(42), "author_id": "00000000-0000-0000-0000-000000000000",
+             "author_type": "system", "type": "system", "revision": 1,
+             "created_at": "2026-09-04T01:02:00Z", "content": "transition"},
+            {"id": uid(43), "author_id": uid(8), "author_type": "agent",
+             "type": "system", "revision": 1,
+             "created_at": "2026-09-04T01:03:00Z", "content": "run marker"},
+        ]
+
+        manifest = self.api.comment_manifest(records, uid(2))
+
+        self.assertEqual(
+            [(item["comment_uuid"], item["author_type"], item["type"],
+              item["parent_id"]) for item in manifest],
+            [
+                (uid(40), "system", "progress_update", None),
+                (uid(41), "agent", "comment", uid(40)),
+                (uid(42), "system", "system", None),
+                (uid(43), "agent", "system", None),
+            ],
+        )
+
+    def test_comment_manifest_rejects_system_identity_confusion(self):
+        base = {"id": uid(40), "author_id": uid(8), "author_type": "agent",
+                "type": "system", "revision": 1,
+                "created_at": "2026-09-04T01:00:00Z", "content": "event"}
+        cases = (
+            base | {"author_type": "member"},
+            base | {"type": "progress_update"},
+            base | {"author_type": "system", "type": "comment",
+                    "author_id": "00000000-0000-0000-0000-000000000000"},
+            base | {"author_type": "system", "author_id": uid(8)},
+            base | {"type": "unknown"},
+        )
+        for record in cases:
+            with self.subTest(author=record["author_type"], kind=record["type"]), \
+                    self.assertRaises(ValueError):
+                self.api.comment_manifest([record], uid(2))
+
     def test_comment_manifest_rejects_incomplete_or_ambiguous_history(self):
         cases = []
         cases.append(self.records() + [copy.deepcopy(self.records()[0])])
