@@ -218,6 +218,18 @@ class GitTests(unittest.TestCase):
             self.git.publish_candidate(self.request, self.prepared)
         self.assertEqual(self.git.read_ref("refs/heads/candidate"), self.source)
 
+    def test_base_drift_during_publication_is_detected_after_managed_push(self):
+        self.stage()
+
+        def concurrent_base_push():
+            self.run_git("push", "origin", self.target + ":refs/heads/master")
+
+        self.transport.race = concurrent_base_push
+        with self.assertRaisesRegex(RuntimeError, "base drift after publication"):
+            self.git.publish_candidate(self.request, self.prepared)
+        self.assertEqual(self.git.read_ref("refs/heads/candidate"), self.target)
+        self.assertEqual(self.git.read_ref("refs/heads/master"), self.target)
+
     def test_divergent_concurrent_push_is_not_overwritten(self):
         self.stage()
         other = self.run_git("commit-tree", self.tree, "-p", self.source, "-m", "other writer")

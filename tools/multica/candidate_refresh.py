@@ -1065,6 +1065,9 @@ def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> Refresh
         _require(prepared is not None, "refresh has no completed preparation")
         _receipt_match(feature, request, prepared)
         _require(metadata.get("eventra.workflow.attempt") in {"0", "1", "2", "3"}, "refresh attempt mismatch")
+        _require(state["parent"].get("status") == "in_progress"
+                 and state["parent"].get("status_category") == "in_progress",
+                 "adopted parent status changed")
         # Later exact gates/repairs are checked by the existing workflow planner.
         # The adoption stays tied to Stage 2, never rewritten to a later repair SHA.
         if len(state["children"]) > 2:
@@ -1095,6 +1098,14 @@ def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> Refresh
                  and metadata.get("eventra.workflow.frontend_sha") == prepared.target_sha
                  and metadata.get("eventra.workflow.merge_state") == "not_ready"
                  and state["pr"]["head_sha"] == prepared.target_sha, "adopted candidate mismatch")
+        active = [run for run in state["runs"] if run.get("status") in {
+            "queued", "dispatched", "running", "waiting_local_directory"
+        }]
+        _require(len(active) <= 1 and all(
+            run.get("issue_id") == payload["parent"]["id"]
+            and run.get("agent_id") == payload["assignment"]["lead_id"]
+            for run in active
+        ), "adopted refresh has an unexpected active writer")
         return RefreshDecision("create_gate_stage", None, "adopted refresh requires fresh Stage 3 gates")
     reservation = _object(reservation, "version request_digest authorization_uuid action_key state child_id "
                           "child_identifier child_position prepared parent_status_category parent_position "

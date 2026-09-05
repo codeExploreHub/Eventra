@@ -408,11 +408,13 @@ def test_prepared_pass_does_not_publish_managed_pr(self):
 
 ## Task 7: 登记、发布与采纳恢复
 
+**执行状态（2026-09-05）：本地实现、回归与提交完成。** 受控候选先登记再发布，发布与采纳的每个写边界均可精确恢复；最终删除边界的并发漂移回归与独立复核已通过。实测执行细节见同目录 `2026-09-05-eventra-candidate-refresh-batch-3g.md`。
+
 **Files:** Modify `refresh_executor.py`, `candidate_refresh.py`, `tests/test_refresh_executor.py`, `tests/test_refresh_git.py`。
 
 **Interfaces:** 复用 `execute_refresh(...)`，增加 child_dispatched 后的分支；`register_candidate(api, request, prepared) -> None` 和 `adopt_candidate(api, request, prepared) -> None` 是模块内函数，不对 agent 暴露绕过前置校验的 CLI。
 
-- [ ] 首测 publication ACK 丢失后再次执行，只读回相同 target、采纳一次、child 总数仍=1；第二个测试在 adoption 半写时重启必须只补齐凭证而不再次 push。
+- [x] 首测 publication ACK 丢失后再次执行，只读回相同 target、采纳一次、child 总数仍=1；第二个测试在 adoption 半写时重启必须只补齐凭证而不再次 push。
 
 ```python
 def test_publish_ack_loss_does_not_duplicate_delivery(self):
@@ -430,12 +432,12 @@ def test_publish_ack_loss_does_not_duplicate_delivery(self):
 
 测试替身本任务增加 managed_push_effects 与发布后抛错开关；`execute_until_interruption()` 调用 execute_refresh 并容许预期 RuntimeError；`execute_again()` 使用完全相同 request/grant/action。
 
-- [ ] Run executor 模块 RED。
-- [ ] 先重新验证 source历史、current PR/base、prepared身份与 full Git tree；把 prepared 全部字段写 reservation state=candidate_registered 并读回后才可 publish。未登记的任何 head=target 也按 drift 拒绝，不自动追认。
-- [ ] 推送前再次检查 source/登记target、base tip 和 grant/证据；正常快进，随后读 GitHub PR 身份及 head。source 不变代表未发生可恢复；target 精确相同代表效果已发生；其他 SHA 冲突。不得只根据 git exit0 判定业务发布成功。
-- [ ] 状态 published 后持久化 adoption、父 frontend SHA=target、merge_state=not_ready、consumed、hold，逐个读回；最后 state=adopted 后删除 reservation。初始化 last_action 和 next_stage=3 保留，planner 以 adoption 解释旧实现不再是最新候选。
-- [ ] 每个边界的故障注入都比较原 child/evidence 深拷贝与最终状态；同时验证跨 parent/grant复用、不同 prepared、父候选半写非法组合、base 漂移、评论被编辑、重复 child 等情况绝不继续。完成后重放返回 adopted/noop，不再次消费。
-- [ ] Run executor + Git 模块 GREEN；Commit：`feat(multica): publish and adopt refresh candidates idempotently`。
+- [x] Run executor 模块 RED。
+- [x] 先重新验证 source历史、current PR/base、prepared身份与 full Git tree；把 prepared 全部字段写 reservation state=candidate_registered 并读回后才可 publish。未登记的任何 head=target 也按 drift 拒绝，不自动追认。
+- [x] 推送前再次检查 source/登记target、base tip 和 grant/证据；正常快进，随后读 GitHub PR 身份及 head。source 不变代表未发生可恢复；target 精确相同代表效果已发生；其他 SHA 冲突。不得只根据 git exit0 判定业务发布成功。
+- [x] 状态 published 后持久化 adoption、父 frontend SHA=target、merge_state=not_ready、consumed、hold，逐个读回；最后 state=adopted 后删除 reservation。初始化 last_action 和 next_stage=3 保留，planner 以 adoption 解释旧实现不再是最新候选。
+- [x] 每个边界的故障注入都比较原 child/evidence 深拷贝与最终状态；同时验证跨 parent/grant复用、不同 prepared、父候选半写非法组合、base 漂移、评论被编辑、重复 child 等情况绝不继续。完成后重放返回 adopted/noop，不再次消费。
+- [x] Run executor + Git 模块 GREEN；Commit：`feat(multica): publish and adopt refresh candidates idempotently`。
 
 ## Task 8: CLI、Watcher 互斥与精确工作区 handoff
 

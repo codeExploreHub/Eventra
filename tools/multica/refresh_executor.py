@@ -1,4 +1,4 @@
-"""Read-only refresh authority adapter. No live mutation entry exists here yet.
+"""Guarded refresh authority adapter. No live CLI mutation entry exists here yet.
 
 Scope is supplied by trusted operator configuration, never by a request payload.
 CLI wiring and validation against an approved deployment record belong to release
@@ -98,6 +98,12 @@ class RefreshAPI:
         c._size(value, c.MAX_COMMENT_BYTES)
         return self._read(["issue", "metadata", "set", issue, "--key", key,
                            "--value", value, "--type", "string"])
+
+    def delete_metadata(self, issue, key):
+        c._match(issue, c._ISSUE)
+        _need(key == c.REFRESH_PREFIX + "reservation",
+              "invalid refresh metadata deletion")
+        return self._read(["issue", "metadata", "delete", issue, "--key", key])
 
     def create_child(self, *, parent, stage, title, project_id, assignee_id, description):
         c._match(parent, c._ISSUE)
@@ -607,6 +613,331 @@ def _finish_progress(request: c.RefreshRequest, state: dict, reservation: dict,
     return progress, child, writes
 
 
+_RESERVATION_FIELDS = {
+    "version", "request_digest", "authorization_uuid", "action_key", "state",
+    "child_id", "child_identifier", "child_position", "prepared",
+    "parent_status_category", "parent_position", "parent_projection_digest",
+}
+
+
+def _adoption_receipts(request: c.RefreshRequest, prepared: c.PreparedCandidate,
+                       authorization_uuid: str) -> tuple[str, str]:
+    common = {
+        "version": 1, "request_digest": request.digest,
+        "authorization_uuid": authorization_uuid,
+        "child_id": prepared.child_id, "target_sha": prepared.target_sha,
+    }
+    consumed = c.canonical_json(common)
+    adoption = c.canonical_json({
+        **common, "source_sha": prepared.source_sha,
+        "prerequisite_sha": prepared.prerequisite_sha,
+        "evidence_uuid": prepared.evidence_uuid,
+        "evidence_digest": prepared.evidence_digest,
+        "stage": 2, "control_tool_sha": request.payload()["control_tool_sha"],
+    })
+    return adoption, consumed
+
+
+def _adoption_progress(request: c.RefreshRequest, state: dict, reservation: dict,
+                       prepared: c.PreparedCandidate) -> int:
+    metadata = state["metadata"]
+    adoption, consumed = _adoption_receipts(
+        request, prepared, reservation["authorization_uuid"])
+    cases = [
+        (None, prepared.source_sha, None),
+        (adoption, prepared.source_sha, None),
+        (adoption, prepared.target_sha, None),
+        (adoption, prepared.target_sha, consumed),
+    ]
+    observed = (
+        metadata.get(c.REFRESH_PREFIX + "adoption"),
+        metadata.get("eventra.workflow.frontend_sha"),
+        metadata.get(c.REFRESH_PREFIX + "consumed"),
+    )
+    _need(observed in cases, "adoption metadata is not an exact write prefix")
+    progress = cases.index(observed)
+    feature = c.refresh_metadata(metadata)
+    c._receipt_match(feature, request, prepared, partial=True)
+    if reservation["state"] == "published":
+        restored = c._load_json(c.canonical_json(state), 4_194_304)
+        restored_metadata = restored["metadata"]
+        if progress >= 1:
+            del restored_metadata[c.REFRESH_PREFIX + "adoption"]
+        if progress >= 2:
+            restored_metadata["eventra.workflow.frontend_sha"] = prepared.source_sha
+        if progress >= 3:
+            del restored_metadata[c.REFRESH_PREFIX + "consumed"]
+        restored["parent"]["metadata"] = restored_metadata
+        _need(type(restored["parent"].get("revision")) is int
+              and restored["parent"]["revision"] > progress,
+              "adoption revision is not recoverable")
+        restored["parent"]["revision"] -= progress
+        _need(c.parent_projection_digest(restored) ==
+              reservation["parent_projection_digest"],
+              "published checkpoint cannot explain adoption prefix")
+    else:
+        _need(reservation["state"] == "adopted" and progress == len(cases) - 1
+              and c.parent_projection_digest(state) ==
+                  reservation["parent_projection_digest"],
+              "adopted checkpoint is incomplete")
+        c._receipt_match(feature, request, prepared)
+    return progress
+
+
+def _publication_authority(request: c.RefreshRequest, state: dict,
+                           reservation: dict) -> tuple[dict, c.PreparedCandidate, int]:
+    payload = c._request(request)
+    _need(type(reservation) is dict and set(reservation) == _RESERVATION_FIELDS,
+          "invalid publication checkpoint shape")
+    feature = c.refresh_metadata(state["metadata"])
+    _need(feature is not None and feature.get("reservation") == reservation
+          and feature.get("request_comment") is not None
+          and feature.get("authorization_comment") ==
+              reservation["authorization_uuid"],
+          "publication checkpoint identity changed")
+    _need(reservation["version"] == 1
+          and reservation["request_digest"] == request.digest
+          and reservation["action_key"] == c.refresh_action(request)
+          and reservation["state"] in {
+              "child_dispatched", "candidate_registered", "published", "adopted"
+          }
+          and type(reservation["parent_status_category"]) is str
+          and type(reservation["parent_position"]) is int
+          and state["parent"].get("position") == reservation["parent_position"],
+          "invalid publication checkpoint")
+    c._shared_authority(payload, state)
+    c._request_comment(request, state, feature)
+    grants = [item for item in state["comments"]
+              if item.get("comment_uuid") == reservation["authorization_uuid"]]
+    _need(len(grants) == 1, "missing publication grant")
+    c._grant_in_state(request, state, c.RefreshComment(**grants[0]))
+    child, prepared = c._refresh_child(request, state)
+    _need(prepared is not None
+          and reservation["child_id"] == child["detail"]["id"]
+          and reservation["child_identifier"] == child["detail"]["identifier"]
+          and reservation["child_position"] == child["detail"]["position"]
+          and state["metadata"].get("eventra.workflow.next_stage") == "3"
+          and state["metadata"].get("eventra.workflow.last_action") ==
+              c.refresh_action(request)
+          and state["metadata"].get("eventra.workflow.attempt") == "0"
+          and state["metadata"].get("eventra.workflow.merge_state") == "not_ready"
+          and feature.get("merge_permission") == "hold"
+          and state["parent"].get("status") == "in_progress"
+          and state["parent"].get("status_category") == "in_progress",
+          "completed preparation authority changed")
+    active = [run for run in state["runs"] if run["status"] in _ACTIVE_RUN_STATUSES]
+    _need(len(active) <= 1 and all(
+        run["issue_id"] == payload["parent"]["id"]
+        and run["agent_id"] == payload["assignment"]["lead_id"]
+        for run in active
+    ), "publication has an unexpected active writer")
+
+    if reservation["state"] == "child_dispatched":
+        _need(reservation["prepared"] is None
+              and not {"adoption", "consumed"} & set(feature)
+              and state["pr"]["head_sha"] == prepared.source_sha
+              and state["metadata"].get("eventra.workflow.frontend_sha") ==
+                  prepared.source_sha
+              and c.parent_projection_digest(state) ==
+                  reservation["parent_projection_digest"],
+              "preparation is not ready for registration")
+        return child, prepared, 0
+
+    _need(reservation["prepared"] == asdict(prepared)
+          and state["pr"]["head_sha"] in {
+              prepared.source_sha, prepared.target_sha
+          }, "registered preparation changed")
+    if reservation["state"] == "candidate_registered":
+        _need(not {"adoption", "consumed"} & set(feature)
+              and state["metadata"].get("eventra.workflow.frontend_sha") ==
+                  prepared.source_sha
+              and c.parent_projection_digest(state) ==
+                  reservation["parent_projection_digest"],
+              "candidate registration drift")
+        return child, prepared, 0
+    _need(state["pr"]["head_sha"] == prepared.target_sha,
+          "published managed head mismatch")
+    return child, prepared, _adoption_progress(request, state, reservation, prepared)
+
+
+def _reservation_value(request: c.RefreshRequest, state: dict, reservation: dict,
+                       checkpoint: str, prepared: c.PreparedCandidate) -> str:
+    _need(checkpoint in {"candidate_registered", "published", "adopted"},
+          "invalid publication checkpoint")
+    projected = c._load_json(c.canonical_json(state), 4_194_304)
+    projected["parent"]["revision"] += 1
+    updated = {
+        **reservation, "state": checkpoint, "prepared": asdict(prepared),
+        "parent_projection_digest": c.parent_projection_digest(projected),
+    }
+    value = c.canonical_json(updated)
+    prospective = dict(state["metadata"])
+    prospective[c.REFRESH_PREFIX + "reservation"] = value
+    c.validate_metadata_budget(prospective, request=request)
+    return value
+
+
+def _write_publication_checkpoint(api, request: c.RefreshRequest,
+                                  prepared: c.PreparedCandidate,
+                                  expected: str, checkpoint: str) -> bool:
+    parent = request.payload()["parent"]["identifier"]
+    state = api.snapshot(parent).state()
+    feature = c.refresh_metadata(state["metadata"])
+    reservation = feature["reservation"]
+    _, observed_prepared, _ = _publication_authority(request, state, reservation)
+    _need(observed_prepared == prepared, "publication evidence changed")
+    if reservation["state"] == checkpoint:
+        return False
+    _need(reservation["state"] == expected, "publication checkpoint order changed")
+    value = _reservation_value(request, state, reservation, checkpoint, prepared)
+    failure = None
+    try:
+        api.set_metadata(parent, c.REFRESH_PREFIX + "reservation", value)
+    except RuntimeError as exc:
+        failure = exc
+    after = api.snapshot(parent).state()
+    after_feature = c.refresh_metadata(after["metadata"])
+    after_reservation = after_feature["reservation"]
+    _, after_prepared, _ = _publication_authority(
+        request, after, after_reservation)
+    if after_reservation["state"] == checkpoint and after_prepared == prepared:
+        return True
+    _need(after_reservation == reservation and failure is not None,
+          "publication checkpoint effect was not uniquely observed")
+    raise failure
+
+
+def register_candidate(api, request: c.RefreshRequest,
+                       prepared: c.PreparedCandidate) -> None:
+    """Persist immutable preparation identity before any managed-branch push."""
+    _write_publication_checkpoint(
+        api, request, prepared, "child_dispatched", "candidate_registered")
+
+
+def adopt_candidate(api, request: c.RefreshRequest,
+                    prepared: c.PreparedCandidate) -> None:
+    """Recover the fixed adoption prefix, checkpoint it, then clear reservation."""
+    parent = request.payload()["parent"]["identifier"]
+    while True:
+        state = api.snapshot(parent).state()
+        feature = c.refresh_metadata(state["metadata"])
+        if feature is not None and "reservation" not in feature:
+            decision = c.plan_refresh(request, c.RefreshSnapshot(c.canonical_json(state)))
+            _need(decision.kind in {"create_gate_stage", "wait"},
+                  "cleared adoption is not a valid workflow state")
+            return
+        reservation = feature["reservation"]
+        _, observed_prepared, progress = _publication_authority(
+            request, state, reservation)
+        _need(observed_prepared == prepared
+              and reservation["state"] in {"published", "adopted"},
+              "adoption checkpoint changed")
+        adoption, consumed = _adoption_receipts(
+            request, prepared, reservation["authorization_uuid"])
+        writes = [
+            (c.REFRESH_PREFIX + "adoption", adoption),
+            ("eventra.workflow.frontend_sha", prepared.target_sha),
+            (c.REFRESH_PREFIX + "consumed", consumed),
+        ]
+        if reservation["state"] == "published" and progress < len(writes):
+            key, value = writes[progress]
+            failure = None
+            try:
+                api.set_metadata(parent, key, value)
+            except RuntimeError as exc:
+                failure = exc
+            after = api.snapshot(parent).state()
+            after_feature = c.refresh_metadata(after["metadata"])
+            _, after_prepared, observed = _publication_authority(
+                request, after, after_feature["reservation"])
+            if after_prepared == prepared and observed == progress + 1:
+                continue
+            _need(observed == progress and failure is not None,
+                  "adoption metadata effect was not uniquely observed")
+            raise failure
+        if reservation["state"] == "published":
+            _write_publication_checkpoint(
+                api, request, prepared, "published", "adopted")
+            continue
+
+        before_delete = state
+        failure = None
+        try:
+            api.delete_metadata(parent, c.REFRESH_PREFIX + "reservation")
+        except RuntimeError as exc:
+            failure = exc
+        after = api.snapshot(parent)
+        after_state = after.state()
+        after_feature = c.refresh_metadata(after_state["metadata"])
+        if after_feature is not None and "reservation" not in after_feature:
+            expected = c._load_json(c.canonical_json(before_delete), 4_194_304)
+            del expected["metadata"][c.REFRESH_PREFIX + "reservation"]
+            expected["parent"]["metadata"] = expected["metadata"]
+            expected["parent"]["revision"] += 1
+            for key in ("updated_at", "last_activity_at"):
+                expected["parent"][key] = after_state["parent"][key]
+            _need(after_state == expected,
+                  "reservation deletion observed concurrent authority drift")
+            decision = c.plan_refresh(request, after)
+            _need(decision.kind in {"create_gate_stage", "wait"},
+                  "adoption clearance did not expose a valid next state")
+            return
+        _need(after_feature.get("reservation") == reservation and failure is not None,
+              "reservation deletion effect was not uniquely observed")
+        raise failure
+
+
+def _resume_publication(api, git, request: c.RefreshRequest,
+                        reservation: dict) -> RefreshExecutionResult:
+    parent = request.payload()["parent"]["identifier"]
+    mutations = 0
+    state = api.snapshot(parent).state()
+    child, prepared, _ = _publication_authority(request, state, reservation)
+    if reservation["state"] == "child_dispatched":
+        tree = git.verify_candidate(request, prepared.target_sha)
+        _need(tree == prepared.tree_sha, "registered candidate tree mismatch")
+        revision = state["parent"]["revision"]
+        register_candidate(api, request, prepared)
+        state = api.snapshot(parent).state()
+        mutations += state["parent"]["revision"] - revision
+        reservation = c.refresh_metadata(state["metadata"])["reservation"]
+
+    if reservation["state"] == "candidate_registered":
+        tree = git.verify_candidate(request, prepared.target_sha)
+        _need(tree == prepared.tree_sha, "published candidate tree mismatch")
+        state = api.snapshot(parent).state()
+        _, current_prepared, _ = _publication_authority(
+            request, state, c.refresh_metadata(state["metadata"])["reservation"])
+        _need(current_prepared == prepared, "publication authority changed before push")
+        if git.publish_candidate(request, prepared):
+            mutations += 1
+        after_push = api.snapshot(parent).state()
+        after_reservation = c.refresh_metadata(after_push["metadata"])["reservation"]
+        _, after_prepared, _ = _publication_authority(
+            request, after_push, after_reservation)
+        _need(after_prepared == prepared
+              and after_push["pr"]["head_sha"] == prepared.target_sha,
+              "managed publication was not authoritatively observed")
+        revision = after_push["parent"]["revision"]
+        _write_publication_checkpoint(
+            api, request, prepared, "candidate_registered", "published")
+        state = api.snapshot(parent).state()
+        mutations += state["parent"]["revision"] - revision
+        reservation = c.refresh_metadata(state["metadata"])["reservation"]
+
+    _need(reservation["state"] in {"published", "adopted"},
+          "publication did not reach adoption")
+    before = api.snapshot(parent).state()["parent"]["revision"]
+    adopt_candidate(api, request, prepared)
+    after = api.snapshot(parent)
+    mutations += after.state()["parent"]["revision"] - before
+    decision = c.plan_refresh(request, after)
+    _need(decision.kind in {"create_gate_stage", "wait"},
+          "adopted candidate did not expose the next workflow state")
+    return RefreshExecutionResult(c.refresh_action(request), "adopted", mutations,
+                                  child["detail"]["identifier"])
+
+
 def execute_refresh(api, git, parent: str, request_uuid: str, grant_uuid: str,
                     expected_action_key: str) -> RefreshExecutionResult:
     """Initialize an authorized refresh under the durable parent reservation."""
@@ -622,6 +953,19 @@ def execute_refresh(api, git, parent: str, request_uuid: str, grant_uuid: str,
         _need(parent == payload["parent"]["identifier"] and expected_action_key == action_key,
               "refresh execution identity mismatch")
         feature = c.refresh_metadata(initial_snapshot.state()["metadata"])
+        if (feature is not None and "reservation" not in feature
+                and {"adoption", "consumed"} <= set(feature)):
+            _need(feature.get("request_comment") == request_uuid
+                  and feature.get("authorization_comment") == grant_uuid,
+                  "completed refresh authorization changed")
+            decision = c.plan_refresh(request, initial_snapshot)
+            _need(decision.kind in {"create_gate_stage", "wait"},
+                  "completed refresh state is inconsistent")
+            matches = [item for item in initial_snapshot.state()["children"]
+                       if item["detail"].get("stage") == 2]
+            _need(len(matches) == 1, "completed refresh child changed")
+            return RefreshExecutionResult(action_key, "adopted", 0,
+                                          matches[0]["detail"]["identifier"])
         if feature is None or "reservation" not in feature:
             progress = c.validate_initial_refresh_progress(request, initial_snapshot)
             _need(progress.metadata_writes >= 4 and progress.comment_writes == 2
@@ -682,6 +1026,15 @@ def execute_refresh(api, git, parent: str, request_uuid: str, grant_uuid: str,
                   and reservation.get("authorization_uuid") == grant_uuid
                   and reservation.get("action_key") == action_key,
                   "invalid refresh initialization checkpoint")
+            if reservation.get("state") in {
+                    "candidate_registered", "published", "adopted"}:
+                return _resume_publication(api, git, request, reservation)
+            if reservation.get("state") == "child_dispatched":
+                matches = [item for item in state["children"]
+                           if item["detail"].get("identifier") ==
+                               reservation.get("child_identifier")]
+                if len(matches) == 1 and matches[0]["detail"].get("status") == "done":
+                    return _resume_publication(api, git, request, reservation)
             _initialization_progress(request, state, reservation)
 
         state = api.snapshot(parent).state()

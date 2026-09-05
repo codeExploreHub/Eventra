@@ -71,6 +71,7 @@ def refresh_snapshot_fixture(*, state="candidate_registered", adopted=False):
                 "staging_ref": request.staging_ref}
     if state != "reserved":
         data["parent"]["status"] = "in_progress"
+        data["parent"]["status_category"] = "in_progress"
         data["metadata"].update({"eventra.workflow.next_stage": "3", "eventra.workflow.last_action": action})
         metadata = {"eventra.workflow.version": "2", "eventra.phase.kind": "refresh", "eventra.phase.attempt": "0",
                     "eventra.phase.target": "repository:frontend", "eventra.phase.role": "frontend_engineer",
@@ -154,6 +155,32 @@ class RefreshDecisionTests(unittest.TestCase):
         self.assertEqual(self.decision(request, data).kind, "create_gate_stage")
         self.assertEqual(data["children"][0], source)
         self.assertEqual(data["metadata"]["eventra.workflow.attempt"], "0")
+
+    def test_adopted_state_rejects_mutable_parent_or_unexpected_writer(self):
+        from tools.multica.tests.test_issue_contracts import issue_run
+
+        cases = (
+            lambda request, data: data["parent"].update(
+                status="blocked", status_category="blocked"),
+            lambda request, data: data["runs"].append(issue_run(
+                id=uid(98), issue_id=data["children"][1]["detail"]["id"],
+                agent_id=request.payload()["assignment"]["engineer_id"],
+                workspace_id=uid(1), status="running", completed_at=None,
+            )),
+            lambda request, data: data["runs"].extend([
+                issue_run(
+                    id=uid(number), issue_id=request.payload()["parent"]["id"],
+                    agent_id=request.payload()["assignment"]["lead_id"],
+                    workspace_id=uid(1), status="running", completed_at=None,
+                )
+                for number in (97, 98)
+            ]),
+        )
+        for mutate in cases:
+            request, data = refresh_snapshot_fixture(adopted=True)
+            mutate(request, data)
+            with self.subTest(mutate=mutate):
+                self.assertEqual(self.decision(request, data).kind, "block")
 
     def test_intent_without_grant_waits(self):
         request, data = refresh_snapshot_fixture(state="intent")

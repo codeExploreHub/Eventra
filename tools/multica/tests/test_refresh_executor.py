@@ -585,6 +585,20 @@ class MemoryRefreshAPI:
 
         self._mutate("set_metadata", (issue, key, value), apply)
 
+    def delete_metadata(self, issue, key):
+        if issue != self.state["parent"]["identifier"]:
+            raise RuntimeError("metadata deletion is parent-scoped")
+
+        def apply():
+            if key not in self.state["metadata"]:
+                return False
+            del self.state["metadata"][key]
+            self.state["parent"]["metadata"] = copy.deepcopy(self.state["metadata"])
+            self.state["parent"]["revision"] += 1
+            return True
+
+        self._mutate("delete_metadata", (issue, key), apply)
+
     def set_status(self, issue, status, *, start, position=None):
         if issue == self.state["parent"]["identifier"]:
             detail = self.state["parent"]
@@ -933,12 +947,15 @@ class ExecuteRefreshTests(unittest.TestCase):
 
 
 class MemoryRefreshGit:
-    def __init__(self, request):
+    def __init__(self, request, api=None):
         self.request = request
+        self.api = api
         self.target = "f" * 40
         self.tree = "1" * 40
         self.verify_calls = []
         self.fail_verify = False
+        self.fail_after_push = False
+        self.managed_push_effects = 0
 
     def verify_candidate(self, request, target_sha):
         if self.fail_verify:
@@ -947,6 +964,25 @@ class MemoryRefreshGit:
             raise RuntimeError("wrong candidate")
         self.verify_calls.append((request.digest, target_sha))
         return self.tree
+
+    def publish_candidate(self, request, prepared):
+        if self.api is None or request != self.request or prepared.target_sha != self.target:
+            raise RuntimeError("wrong candidate publication")
+        reservation = contracts.refresh_metadata(
+            self.api.state["metadata"])["reservation"]
+        if (reservation["state"] != "candidate_registered"
+                or reservation["prepared"] != asdict(prepared)):
+            raise RuntimeError("candidate was not registered before publication")
+        head = self.api.state["pr"]["head_sha"]
+        if head == prepared.target_sha:
+            return False
+        if head != prepared.source_sha:
+            raise RuntimeError("managed head drift")
+        self.api.state["pr"]["head_sha"] = prepared.target_sha
+        self.managed_push_effects += 1
+        if self.fail_after_push:
+            raise RuntimeError("managed push acknowledgement lost")
+        return True
 
 
 class FinishRefreshTests(unittest.TestCase):
@@ -1189,6 +1225,262 @@ class FinishRefreshTests(unittest.TestCase):
                                          (outcome, 4))
                         self.assertEqual(child["detail"]["status"], "done")
                         self.assertEqual(git.verify_calls, [])
+
+
+class PublishRefreshTests(unittest.TestCase):
+    @staticmethod
+    def prepared_case():
+        api, module, verifier, child, evidence_uuid = FinishRefreshTests.pass_case()
+        module.finish_refresh(api, verifier, "PRO-902", evidence_uuid, "pass")
+        api.writes.clear()
+        api.write_index = 0
+        publisher = MemoryRefreshGit(api.request, api)
+        return api, module, publisher, child, evidence_uuid
+
+    def test_publish_ack_loss_does_not_duplicate_delivery(self):
+        api, module, git, child, _ = self.prepared_case()
+        source = copy.deepcopy(api.state["children"][0])
+        evidence = copy.deepcopy(child["evidence"])
+        git.fail_after_push = True
+
+        with self.assertRaisesRegex(RuntimeError, "acknowledgement lost"):
+            module.execute_refresh(
+                api, git, "PRO-900", uid(12), uid(13),
+                contracts.refresh_action(api.request),
+            )
+
+        reservation = contracts.refresh_metadata(api.state["metadata"])["reservation"]
+        self.assertEqual(reservation["state"], "candidate_registered")
+        prepared = contracts.parse_prepared(
+            contracts.RefreshComment(**child["evidence"]), api.request,
+            child["detail"]["id"],
+        )
+        self.assertEqual(reservation["prepared"], asdict(prepared))
+        self.assertEqual(api.state["pr"]["head_sha"], git.target)
+        self.assertEqual(api.state["metadata"]["eventra.workflow.frontend_sha"], "b" * 40)
+        self.assertEqual(git.managed_push_effects, 1)
+        self.assertEqual(git.verify_calls,
+                         [(api.request.digest, git.target)] * 2)
+        git.fail_after_push = False
+
+        result = module.execute_refresh(
+            api, git, "PRO-900", uid(12), uid(13),
+            contracts.refresh_action(api.request),
+        )
+
+        self.assertEqual(result.status, "adopted")
+        self.assertEqual(git.managed_push_effects, 1)
+        self.assertEqual(api.create_effects, 1)
+        self.assertEqual(len(api.state["children"]), 2)
+        self.assertEqual(api.state["children"][0], source)
+        self.assertEqual(child["evidence"], evidence)
+        self.assertEqual(api.state["metadata"]["eventra.workflow.frontend_sha"], git.target)
+        self.assertNotIn("eventra.refresh.reservation", api.state["metadata"])
+        feature = contracts.refresh_metadata(api.state["metadata"])
+        self.assertEqual(feature["consumed"], {
+            "version": 1, "request_digest": api.request.digest,
+            "authorization_uuid": uid(13), "child_id": child["detail"]["id"],
+            "target_sha": git.target,
+        })
+        self.assertEqual(feature["adoption"]["evidence_uuid"], uid(93))
+        self.assertEqual(feature["adoption"]["target_sha"], git.target)
+        self.assertEqual(feature["merge_permission"], "hold")
+        self.assertEqual(api.state["metadata"]["eventra.workflow.merge_state"],
+                         "not_ready")
+        self.assertEqual(api.state["metadata"]["eventra.workflow.next_stage"], "3")
+        self.assertEqual(api.state["metadata"]["eventra.workflow.last_action"],
+                         contracts.refresh_action(api.request))
+
+        replay = module.execute_refresh(
+            api, git, "PRO-900", uid(12), uid(13),
+            contracts.refresh_action(api.request),
+        )
+        self.assertEqual((replay.status, replay.mutation_count), ("adopted", 0))
+        self.assertEqual(git.managed_push_effects, 1)
+
+    def test_adoption_half_write_resumes_without_second_push(self):
+        api, module, git, _, _ = self.prepared_case()
+        api.fail_at = 4
+
+        with self.assertRaisesRegex(RuntimeError, "before effect"):
+            module.execute_refresh(
+                api, git, "PRO-900", uid(12), uid(13),
+                contracts.refresh_action(api.request),
+            )
+
+        feature = contracts.refresh_metadata(api.state["metadata"])
+        self.assertEqual(feature["reservation"]["state"], "published")
+        self.assertIn("adoption", feature)
+        self.assertNotIn("consumed", feature)
+        self.assertEqual(api.state["metadata"]["eventra.workflow.frontend_sha"],
+                         "b" * 40)
+        self.assertEqual(git.managed_push_effects, 1)
+
+        result = module.execute_refresh(
+            api, git, "PRO-900", uid(12), uid(13),
+            contracts.refresh_action(api.request),
+        )
+
+        self.assertEqual(result.status, "adopted")
+        self.assertEqual(git.managed_push_effects, 1)
+        self.assertNotIn("eventra.refresh.reservation", api.state["metadata"])
+
+    def test_every_publication_write_boundary_converges_to_the_same_state(self):
+        baseline_api, baseline_module, baseline_git, _, _ = self.prepared_case()
+        baseline_module.execute_refresh(
+            baseline_api, baseline_git, "PRO-900", uid(12), uid(13),
+            contracts.refresh_action(baseline_api.request),
+        )
+        baseline = copy.deepcopy(baseline_api.state)
+        self.assertEqual(len(baseline_api.writes), 7)
+
+        for fail_at in range(1, 8):
+            for fail_after in (False, True):
+                with self.subTest(fail_at=fail_at, fail_after=fail_after):
+                    api, module, git, child, _ = self.prepared_case()
+                    source = copy.deepcopy(api.state["children"][0])
+                    evidence = copy.deepcopy(child["evidence"])
+                    api.fail_at, api.fail_after = fail_at, fail_after
+
+                    if fail_after:
+                        result = module.execute_refresh(
+                            api, git, "PRO-900", uid(12), uid(13),
+                            contracts.refresh_action(api.request),
+                        )
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "before effect"):
+                            module.execute_refresh(
+                                api, git, "PRO-900", uid(12), uid(13),
+                                contracts.refresh_action(api.request),
+                            )
+                        result = module.execute_refresh(
+                            api, git, "PRO-900", uid(12), uid(13),
+                            contracts.refresh_action(api.request),
+                        )
+
+                    self.assertEqual(result.status, "adopted")
+                    self.assertEqual(api.state, baseline)
+                    self.assertEqual(len(api.writes), 7)
+                    self.assertEqual(api.state["children"][0], source)
+                    self.assertEqual(child["evidence"], evidence)
+                    self.assertEqual(git.managed_push_effects, 1)
+                    replay = module.execute_refresh(
+                        api, git, "PRO-900", uid(12), uid(13),
+                        contracts.refresh_action(api.request),
+                    )
+                    self.assertEqual((replay.status, replay.mutation_count),
+                                     ("adopted", 0))
+                    self.assertEqual(git.managed_push_effects, 1)
+
+    def test_publication_drift_fails_before_new_write_or_push(self):
+        def edit_prepared(api, child):
+            child["evidence"]["revision"] = 2
+
+        def duplicate_child(api, child):
+            duplicate = copy.deepcopy(child)
+            duplicate["detail"]["id"] = uid(96)
+            duplicate["detail"]["identifier"] = "PRO-906"
+            api.state["children"].append(duplicate)
+
+        cases = {
+            "wrong grant": (lambda api, child: None, uid(99)),
+            "source evidence drift": (
+                lambda api, child: api.state["children"][0]["evidence"].__setitem__(
+                    "content", "rewritten source PASS"), uid(13)),
+            "base drift": (
+                lambda api, child: api.state["prerequisite"].__setitem__(
+                    "base_sha", "a" * 40), uid(13)),
+            "control tool drift": (
+                lambda api, child: api.state["tool"].__setitem__("sha", "a" * 40),
+                uid(13)),
+            "edited prepared": (edit_prepared, uid(13)),
+            "duplicate child": (duplicate_child, uid(13)),
+            "unregistered target head": (
+                lambda api, child: api.state["pr"].__setitem__(
+                    "head_sha", "f" * 40), uid(13)),
+        }
+        for label, (mutate, grant_uuid) in cases.items():
+            with self.subTest(label=label):
+                api, module, git, child, _ = self.prepared_case()
+                mutate(api, child)
+                before = len(api.writes)
+
+                with self.assertRaises((RuntimeError, ValueError)):
+                    module.execute_refresh(
+                        api, git, "PRO-900", uid(12), grant_uuid,
+                        contracts.refresh_action(api.request),
+                    )
+
+                self.assertEqual(len(api.writes), before)
+                self.assertEqual(git.managed_push_effects, 0)
+
+    def test_illegal_partial_adoption_is_not_recovered(self):
+        api, module, git, _, _ = self.prepared_case()
+        api.fail_at = 3
+        with self.assertRaisesRegex(RuntimeError, "before effect"):
+            module.execute_refresh(
+                api, git, "PRO-900", uid(12), uid(13),
+                contracts.refresh_action(api.request),
+            )
+        feature = contracts.refresh_metadata(api.state["metadata"])
+        self.assertEqual(feature["reservation"]["state"], "published")
+        consumed = encode({
+            "version": 1, "request_digest": api.request.digest,
+            "authorization_uuid": uid(13),
+            "child_id": api.state["children"][1]["detail"]["id"],
+            "target_sha": "f" * 40,
+        })
+        api.state["metadata"]["eventra.refresh.consumed"] = consumed
+        api.state["parent"]["metadata"] = copy.deepcopy(api.state["metadata"])
+        api.state["parent"]["revision"] += 1
+        before = len(api.writes)
+
+        with self.assertRaises(RuntimeError):
+            module.execute_refresh(
+                api, git, "PRO-900", uid(12), uid(13),
+                contracts.refresh_action(api.request),
+            )
+
+        self.assertEqual(len(api.writes), before)
+        self.assertEqual(git.managed_push_effects, 1)
+
+    def test_final_reservation_delete_rejects_concurrent_parent_write(self):
+        api, module, git, _, _ = self.prepared_case()
+        original_delete = api.delete_metadata
+
+        def delete_then_race(issue, key):
+            original_delete(issue, key)
+            record = comment_record(
+                96, "unrelated concurrent parent comment", author=96,
+                issue=api.state["parent"]["id"],
+            )
+            api.state["comments"].append(asdict(contracts.RefreshComment(
+                record["issue_id"], record["id"], record["author_id"],
+                record["author_type"], record["revision"], record["content"],
+            )))
+            api.state["comment_manifest"].append({
+                "issue_id": record["issue_id"], "comment_uuid": record["id"],
+                "author_id": record["author_id"],
+                "author_type": record["author_type"], "type": "comment",
+                "revision": record["revision"], "parent_id": None,
+                "created_at": record["created_at"],
+                "content_digest": hashlib.sha256(
+                    record["content"].encode("utf-8")).hexdigest(),
+            })
+            api.state["comment_manifest"].sort(
+                key=lambda item: item["comment_uuid"])
+            api.state["parent"]["revision"] += 1
+
+        api.delete_metadata = delete_then_race
+
+        with self.assertRaisesRegex(RuntimeError, "deletion.*drift"):
+            module.execute_refresh(
+                api, git, "PRO-900", uid(12), uid(13),
+                contracts.refresh_action(api.request),
+            )
+
+        self.assertEqual(git.managed_push_effects, 1)
+        self.assertNotIn("eventra.refresh.reservation", api.state["metadata"])
 
 
 if __name__ == "__main__":
