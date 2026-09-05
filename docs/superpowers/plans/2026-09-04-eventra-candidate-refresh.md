@@ -340,13 +340,15 @@ self.assertNotIn("content", manifest[0])
 
 **分批执行状态（2026-09-05，Task 5B1）：授权绑定、reserved 与 child 创建恢复已完成。** executor 从已登记 request 重新读取请求，绑定精确 request/grant UUID，写后验证 revision=16 的 reserved checkpoint；child 创建 ACK 丢失后只接受唯一精确匹配的 Stage 2 backlog child，不按标题模糊追认。当前停在内部 `child_created`，尚未写 child provenance、父 next_stage/status 或启动 run；Task 5 整体仍未完成且不可上线。
 
+**分批执行状态（2026-09-05，Task 5B2）：本地初始化与派发闭环完成。** executor 只接受固定 child metadata 前缀，完整初始化后依次推进父 `next_stage`、`last_action` 和显式保留 position 的 `in_progress --no-start`，写入 `child_initialized` 后才启动唯一 Engineer run，最后写 `child_dispatched`。reservation 新增冻结的 `parent_status_category` / `parent_position`，用于状态写 ACK 丢失后的精确逆向证明；快速终止的唯一 owner run 也可收敛，不会重复启动。planner 同时接受 `reserved + 精确 child 前缀`，Watcher 不会把 create ACK 丢失误判为不可恢复。证据见 `2026-09-05-eventra-candidate-refresh-batch-3e.md`。Task 5 的本地状态机已闭合，但 CLI/Watcher 入口和 pro-1 mutation contract 仍属于 Task 8；未验证前不可 live 执行。
+
 另定义 `stage_refresh_request(api: RefreshAPI, parent: str, request: RefreshRequest) -> RefreshExecutionResult`，仅用于显式获准的暂停登记：父任务保持 blocked，写入 version/merge_permission=hold/request_digest 与规范 request envelope，不创建 child、消费 grant 或更新 PR。新增持久键 `eventra.refresh.request` 保存 envelope；这是待授权意图，不是 reservation。写入前提必须验证 source/assignment/Stage1 状态及无其他运行；缺 grant 只允许此暂停登记，不允许执行刷新。Core 对完整等待授权意图返回 wait，对登记半途字段组合保持 fail-closed，不能回退旧 gate 路径。
 
 新增 API 写方法：`set_metadata(issue,key,value)`, `set_status(issue,status)`,
 `create_child(parent,stage,title,project_id,assignee_id,description) -> str`。
 它们只封装已支持 Multica CLI，无隐式重试；每次外部写都由 executor 明确读回。
 
-- [ ] 定义严格 `MemoryRefreshAPI` 测试替身（仅在 test_refresh_executor）：字典保存 parent/child metadata、comments、run；`writes` 记录 `(operation,args)`；`fail_at: int | None` 和 `fail_after: bool` 控制第 N 次写前/写后抛 RuntimeError；写后失败保留真实效果；snapshot 返回深拷贝且读取未知 ID 拒绝。
+- [x] 定义严格 `MemoryRefreshAPI` 测试替身（仅在 test_refresh_executor）：字典保存 parent/child metadata、comments、run；`writes` 记录 `(operation,args)`；`fail_at: int | None` 和 `fail_after: bool` 控制第 N 次写前/写后抛 RuntimeError；写后失败保留真实效果；snapshot 返回深拷贝且读取未知 ID 拒绝。
 
 ```python
 def mutate(self, operation, args, apply):
@@ -359,14 +361,14 @@ def mutate(self, operation, args, apply):
         raise RuntimeError("injected after effect")
 ```
 
-- [ ] 首测 `test_duplicate_create_ack_loss_recovers_same_child`：create 成功后抛错，第二次执行必须找到原 child 且 create 总数=1；旧 source evidence JSON 与原值完全相等。Run `python3 -B -m unittest tools.multica.tests.test_refresh_executor -v` 记录 RED。
+- [x] 首测 `test_duplicate_create_ack_loss_recovers_same_child`：create 成功后抛错，第二次执行必须找到原 child 且 create 总数=1；旧 source evidence JSON 与原值完全相等。Run `python3 -B -m unittest tools.multica.tests.test_refresh_executor -v` 记录 RED。
 - [x] 执行本机锁用 `fcntl.flock(LOCK_EX|LOCK_NB)`，锁文件放 Git common-dir 的刷新专用目录，key 为 workspace+parent 的摘要；锁覆盖整个外部写序列，不依赖未合并 runtime_guard。不同 action 同 parent 也互斥。锁描述符随进程退出释放；不可由清理文件伪造 stale 解锁。
-- [ ] 先测试暂停登记和缺 grant 时的唤醒：Core/Watcher 不能创建普通 gate 或恢复普通 Lead 动作。暂停登记各写入前缀只能由相同 request 恢复；不同 digest 不可覆盖。request/grant 评论 UUID 后续由实际读回绑定，不能预先猜测。
-- [ ] 先校验精确 request/grant 与单一 Lead，再写并读回 reserved；初始化 feature/request/grant/hold 字段仅允许已知写入前缀。无活动 child 前提只用于首次入口，恢复时改为检查恰好一个当前 child/允许的 run，而非拒绝自身已创建的 child。
-- [ ] child 必须 `--status backlog --stage 2` 并赋 Engineer/Frontend Project；写 kind=refresh、attempt=0、target=repository:frontend、role=frontend_engineer、creation_action、source SHA、managed PR 与 request digest。每个字段读回；未知额外 phase/refresh 字段阻断。完整初始化后写父 next_stage=3/last_action 和 in_progress，最后才启动 child。
-- [ ] 恢复时不能使用“仅标题相同”的 child。按 parent/stage/project/assignee/request/action/body digest/初始化字段前缀比对；重复或未知活跃 run 阻断。写入步骤维护上次已读回 authority projection；状态预期变化之外的 metadata、assignment、PR 或 evidence 漂移均终止。
-- [ ] 增加循环故障注入，覆盖每一写入前后；写后读回失败时保持 reservation，第二次只补合法前缀。测试不得改原 implementation metadata/evidence，不能提前登记 consumption。
-- [ ] Run GREEN；Commit：`feat(multica): initialize refresh stages with durable recovery`。
+- [x] 先测试暂停登记和缺 grant 时的唤醒：Core/Watcher 不能创建普通 gate 或恢复普通 Lead 动作。暂停登记各写入前缀只能由相同 request 恢复；不同 digest 不可覆盖。request/grant 评论 UUID 后续由实际读回绑定，不能预先猜测。
+- [x] 先校验精确 request/grant 与单一 Lead，再写并读回 reserved；初始化 feature/request/grant/hold 字段仅允许已知写入前缀。无活动 child 前提只用于首次入口，恢复时改为检查恰好一个当前 child/允许的 run，而非拒绝自身已创建的 child。
+- [x] child 必须 `--status backlog --stage 2` 并赋 Engineer/Frontend Project；写 kind=refresh、attempt=0、target=repository:frontend、role=frontend_engineer、creation_action、source SHA、managed PR 与 request digest。每个字段读回；未知额外 phase/refresh 字段阻断。完整初始化后写父 next_stage=3/last_action 和 in_progress，最后才启动 child。
+- [x] 恢复时不能使用“仅标题相同”的 child。按 parent/stage/project/assignee/request/action/body digest/初始化字段前缀比对；重复或未知活跃 run 阻断。写入步骤维护上次已读回 authority projection；状态预期变化之外的 metadata、assignment、PR 或 evidence 漂移均终止。
+- [x] 增加循环故障注入，覆盖每一写入前后；写后读回失败时保持 reservation，第二次只补合法前缀。测试不得改原 implementation metadata/evidence，不能提前登记 consumption。
+- [x] Run GREEN；Commit：`feat(multica): initialize refresh stages with durable recovery`。
 
 ## Task 6: Engineer 准备与专用完成证据
 

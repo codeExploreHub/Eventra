@@ -520,6 +520,18 @@ class MemoryRefreshAPI:
         self.fail_at, self.fail_after = None, False
         self.fail_operation = None
         self.create_effects = 0
+        self.complete_started_run = False
+
+    def _mutate(self, operation, args, apply):
+        self.write_index += 1
+        if self.fail_at == self.write_index and not self.fail_after:
+            raise RuntimeError("injected before effect")
+        changed = apply()
+        if changed:
+            self.writes.append((operation, *args))
+        if self.fail_at == self.write_index and self.fail_after:
+            raise RuntimeError("injected after effect")
+        return changed
 
     def parent_lock(self, parent):
         if parent != self.state["parent"]["identifier"]:
@@ -532,18 +544,63 @@ class MemoryRefreshAPI:
         return contracts.RefreshSnapshot(contracts.canonical_json(copy.deepcopy(self.state)))
 
     def set_metadata(self, issue, key, value):
-        if issue != self.state["parent"]["identifier"]:
-            raise RuntimeError("unknown issue")
-        self.write_index += 1
-        if self.fail_at == self.write_index and not self.fail_after:
-            raise RuntimeError("injected before effect")
-        if self.state["metadata"].get(key) != value:
-            self.state["metadata"][key] = value
-            self.state["parent"]["metadata"] = copy.deepcopy(self.state["metadata"])
-            self.state["parent"]["revision"] += 1
-            self.writes.append(("set_metadata", issue, key, value))
-        if self.fail_at == self.write_index and self.fail_after:
-            raise RuntimeError("injected after effect")
+        if issue == self.state["parent"]["identifier"]:
+            detail, metadata = self.state["parent"], self.state["metadata"]
+        else:
+            matches = [item for item in self.state["children"]
+                       if item["detail"]["identifier"] == issue]
+            if len(matches) != 1:
+                raise RuntimeError("unknown issue")
+            detail, metadata = matches[0]["detail"], matches[0]["metadata"]
+
+        def apply():
+            if metadata.get(key) == value:
+                return False
+            metadata[key] = value
+            detail["metadata"] = copy.deepcopy(metadata)
+            detail["revision"] += 1
+            return True
+
+        self._mutate("set_metadata", (issue, key, value), apply)
+
+    def set_status(self, issue, status, *, start, position=None):
+        if issue == self.state["parent"]["identifier"]:
+            detail = self.state["parent"]
+            if position != detail["position"] or start:
+                raise RuntimeError("parent position/start contract mismatch")
+        else:
+            matches = [item for item in self.state["children"]
+                       if item["detail"]["identifier"] == issue]
+            if len(matches) != 1:
+                raise RuntimeError("unknown issue")
+            detail = matches[0]["detail"]
+            if position is not None:
+                raise RuntimeError("child position must not be supplied")
+
+        def apply():
+            changed = detail["status"] != status
+            if changed:
+                detail["status"] = status
+                detail["status_category"] = status
+                detail["revision"] += 1
+            if start:
+                active = [run for run in self.state["runs"]
+                          if run["issue_id"] == detail["id"]
+                          and run["status"] in {"queued", "dispatched", "running", "waiting_local_directory"}]
+                if not active:
+                    run = issue_run(
+                        id=uid(91), issue_id=detail["id"], agent_id=detail["assignee_id"],
+                        workspace_id=detail["workspace_id"], status="queued",
+                        completed_at=None, started_at=None, dispatched_at=None,
+                    )
+                    if self.complete_started_run:
+                        run["status"] = "completed"
+                        run["completed_at"] = "2026-09-05T02:00:00Z"
+                    self.state["runs"].append(run)
+                    changed = True
+            return changed
+
+        self._mutate("set_status", (issue, status, start, position), apply)
 
     def publish_authorization(self):
         envelope = {"payload": self.request.payload(), "digest": self.request.digest,
@@ -569,7 +626,7 @@ class MemoryRefreshAPI:
             raise RuntimeError("invalid child scope")
         child = issue_detail(id=uid(90), identifier="PRO-902", parent_issue_id=uid(2), stage=stage,
                              status="backlog", project_id=project_id, assignee_id=assignee_id,
-                             workspace_id=uid(1), description=description, title=title)
+                             workspace_id=uid(1), description=description, title=title, revision=1)
         child["metadata"] = {}
         self.state["children"].append({"detail": child, "metadata": {}, "evidence": None})
         self.create_effects += 1
@@ -673,6 +730,8 @@ class ExecuteRefreshTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "create after effect"):
             module.execute_refresh(api, None, "PRO-900", uid(12), uid(13),
                                    contracts.refresh_action(api.request))
+        self.assertEqual(contracts.plan_refresh(api.request, api.snapshot("PRO-900")).kind,
+                         "resume_refresh")
         api.fail_operation = None
 
         result = module.execute_refresh(api, None, "PRO-900", uid(12), uid(13),
@@ -682,6 +741,166 @@ class ExecuteRefreshTests(unittest.TestCase):
         self.assertEqual(api.create_effects, 1)
         self.assertEqual(len(api.state["children"]), 2)
         self.assertEqual(api.state["children"][0], source)
+
+    def test_child_is_fully_initialized_before_single_dispatch(self):
+        api = MemoryRefreshAPI()
+        module = importlib.import_module("tools.multica.refresh_executor")
+        module.stage_refresh_request(api, "PRO-900", api.request)
+        api.publish_authorization()
+        api.writes.clear()
+
+        result = module.execute_refresh(
+            api, None, "PRO-900", uid(12), uid(13),
+            contracts.refresh_action(api.request),
+        )
+
+        action = contracts.refresh_action(api.request)
+        child = api.state["children"][1]
+        self.assertEqual(result.status, "child_dispatched")
+        self.assertEqual(child["metadata"], {
+            "eventra.workflow.version": "2",
+            "eventra.phase.kind": "refresh",
+            "eventra.phase.attempt": "0",
+            "eventra.phase.target": "repository:frontend",
+            "eventra.phase.role": "frontend_engineer",
+            "eventra.phase.creation_action": action,
+            "eventra.phase.pr": api.request.payload()["pr"]["url"],
+            "eventra.refresh.version": "1",
+            "eventra.refresh.request_digest": api.request.digest,
+            "eventra.refresh.source_sha": api.request.payload()["source"]["sha"],
+            "eventra.phase.sha.frontend": api.request.payload()["source"]["sha"],
+        })
+        self.assertEqual(api.state["metadata"]["eventra.workflow.next_stage"], "3")
+        self.assertEqual(api.state["metadata"]["eventra.workflow.last_action"], action)
+        self.assertEqual(api.state["parent"]["status"], "in_progress")
+        parent_status = next(write for write in api.writes
+                             if write[:3] == ("set_status", "PRO-900", "in_progress"))
+        self.assertEqual(parent_status,
+                         ("set_status", "PRO-900", "in_progress", False,
+                          api.state["parent"]["position"]))
+        reservation = contracts.refresh_metadata(api.state["metadata"])["reservation"]
+        self.assertEqual(reservation["state"], "child_dispatched")
+        self.assertEqual(reservation["child_id"], child["detail"]["id"])
+        self.assertEqual(reservation["child_identifier"], "PRO-902")
+        active = [run for run in api.state["runs"] if run["status"] in
+                  {"queued", "dispatched", "running", "waiting_local_directory"}]
+        self.assertEqual([(run["issue_id"], run["agent_id"]) for run in active],
+                         [(child["detail"]["id"], api.request.payload()["assignment"]["engineer_id"])])
+        start_index = next(index for index, write in enumerate(api.writes)
+                           if write[:3] == ("set_status", "PRO-902", "todo"))
+        self.assertTrue(all(write[0] == "set_metadata" for write in api.writes[4:start_index]
+                            if write[1] == "PRO-902"))
+        self.assertEqual(api.writes[start_index - 1][:3],
+                         ("set_metadata", "PRO-900", "eventra.refresh.reservation"))
+        self.assertEqual(api.writes[start_index + 1][:3],
+                         ("set_metadata", "PRO-900", "eventra.refresh.reservation"))
+        self.assertEqual(contracts.plan_refresh(api.request, api.snapshot("PRO-900")).kind,
+                         "wait")
+
+    def test_fast_completed_run_is_still_a_single_durable_dispatch(self):
+        api = MemoryRefreshAPI()
+        api.complete_started_run = True
+        module = importlib.import_module("tools.multica.refresh_executor")
+        module.stage_refresh_request(api, "PRO-900", api.request)
+        api.publish_authorization()
+
+        result = module.execute_refresh(
+            api, None, "PRO-900", uid(12), uid(13),
+            contracts.refresh_action(api.request),
+        )
+
+        self.assertEqual(result.status, "child_dispatched")
+        child_runs = [run for run in api.state["runs"]
+                      if run["issue_id"] == api.state["children"][1]["detail"]["id"]]
+        self.assertEqual([run["status"] for run in child_runs], ["completed"])
+        replay = module.execute_refresh(
+            api, None, "PRO-900", uid(12), uid(13),
+            contracts.refresh_action(api.request),
+        )
+        self.assertEqual((replay.status, replay.mutation_count),
+                         ("child_dispatched", 0))
+
+    def test_every_initialization_write_boundary_recovers_without_duplicate_dispatch(self):
+        for fail_at in range(1, 18):
+            for fail_after in (False, True):
+                with self.subTest(fail_at=fail_at, fail_after=fail_after):
+                    api = MemoryRefreshAPI()
+                    module = importlib.import_module("tools.multica.refresh_executor")
+                    module.stage_refresh_request(api, "PRO-900", api.request)
+                    api.publish_authorization()
+                    api.fail_operation = "create_child_after"
+                    with self.assertRaisesRegex(RuntimeError, "create after effect"):
+                        module.execute_refresh(
+                            api, None, "PRO-900", uid(12), uid(13),
+                            contracts.refresh_action(api.request),
+                        )
+                    api.fail_operation = None
+                    api.writes.clear()
+                    api.write_index = 0
+                    api.fail_at, api.fail_after = fail_at, fail_after
+
+                    if fail_after:
+                        result = module.execute_refresh(
+                            api, None, "PRO-900", uid(12), uid(13),
+                            contracts.refresh_action(api.request),
+                        )
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "before effect"):
+                            module.execute_refresh(
+                                api, None, "PRO-900", uid(12), uid(13),
+                                contracts.refresh_action(api.request),
+                            )
+                        result = module.execute_refresh(
+                            api, None, "PRO-900", uid(12), uid(13),
+                            contracts.refresh_action(api.request),
+                        )
+
+                    self.assertEqual(result.status, "child_dispatched")
+                    self.assertEqual(api.create_effects, 1)
+                    active = [run for run in api.state["runs"]
+                              if run["status"] in {"queued", "dispatched", "running", "waiting_local_directory"}]
+                    self.assertEqual(len(active), 1)
+                    self.assertEqual(len(api.writes), 17)
+                    replay = module.execute_refresh(
+                        api, None, "PRO-900", uid(12), uid(13),
+                        contracts.refresh_action(api.request),
+                    )
+                    self.assertEqual((replay.status, replay.mutation_count),
+                                     ("child_dispatched", 0))
+                    self.assertEqual(len(api.writes), 17)
+
+    def test_replay_rejects_unknown_child_authority_layout_drift_and_duplicate_run(self):
+        mutations = (
+            lambda api: api.state["children"][1]["metadata"].__setitem__(
+                "eventra.phase.unbound", "forged"),
+            lambda api: api.state["parent"].__setitem__("position", -999),
+            lambda api: api.state["runs"].append(issue_run(
+                id=uid(92), issue_id=api.state["children"][1]["detail"]["id"],
+                agent_id=api.request.payload()["assignment"]["engineer_id"],
+                workspace_id=uid(1), status="running", completed_at=None,
+            )),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                api = MemoryRefreshAPI()
+                module = importlib.import_module("tools.multica.refresh_executor")
+                module.stage_refresh_request(api, "PRO-900", api.request)
+                api.publish_authorization()
+                module.execute_refresh(
+                    api, None, "PRO-900", uid(12), uid(13),
+                    contracts.refresh_action(api.request),
+                )
+                before = len(api.writes)
+                mutate(api)
+                child = api.state["children"][1]
+                child["detail"]["metadata"] = copy.deepcopy(child["metadata"])
+
+                with self.assertRaises(RuntimeError):
+                    module.execute_refresh(
+                        api, None, "PRO-900", uid(12), uid(13),
+                        contracts.refresh_action(api.request),
+                    )
+                self.assertEqual(len(api.writes), before)
 
 
 if __name__ == "__main__":

@@ -96,6 +96,8 @@ def refresh_snapshot_fixture(*, state="candidate_registered", adopted=False):
                        "state": state, "child_id": None if state == "reserved" else uid(9),
                        "child_identifier": None if state == "reserved" else "PRO-902",
                        "prepared": prepared if state in {"candidate_registered", "published", "adopted"} else None,
+                       "parent_status_category": boundary.parent["status_category"],
+                       "parent_position": boundary.parent["position"],
                        "parent_projection_digest": hashlib.sha256(encode({"parent": {k: v for k, v in data["parent"].items()
                                                                                      if k not in {"metadata", "updated_at", "last_activity_at"}},
                                                                            "metadata": data["metadata"]}).encode()).hexdigest()}

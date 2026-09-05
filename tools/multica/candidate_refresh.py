@@ -913,6 +913,42 @@ def _refresh_child(request: RefreshRequest, state: dict) -> tuple[dict, Prepared
     return child, prepared
 
 
+def _reserved_refresh_child(request: RefreshRequest, state: dict) -> None:
+    """Accept only the exact child-create/metadata prefix recoverable by the executor."""
+    payload = request.payload()
+    if len(state["children"]) == 1:
+        return
+    _require(len(state["children"]) == 2, "reserved refresh child membership mismatch")
+    matches = [item for item in state["children"]
+               if item["detail"]["id"] != payload["source"]["child_id"]]
+    _require(len(matches) == 1, "reserved refresh child membership mismatch")
+    child = _object(matches[0], "detail metadata evidence")
+    detail, metadata = child["detail"], child["metadata"]
+    action = refresh_action(request)
+    expected_detail = {
+        "parent_issue_id": payload["parent"]["id"], "workspace_id": payload["workspace_id"],
+        "stage": 2, "status": "backlog", "project_id": payload["assignment"]["project_id"],
+        "assignee_type": "agent", "assignee_id": payload["assignment"]["engineer_id"],
+        "title": f"{payload['parent']['identifier']}: prepare candidate refresh",
+        "description": canonical_json({"schema_version": 1, "request_digest": request.digest,
+                                       "action_key": action}),
+    }
+    prefix = [
+        ("eventra.workflow.version", "2"), ("eventra.phase.kind", "refresh"),
+        ("eventra.phase.attempt", "0"), ("eventra.phase.target", "repository:frontend"),
+        ("eventra.phase.role", "frontend_engineer"), ("eventra.phase.creation_action", action),
+        ("eventra.phase.pr", payload["pr"]["url"]), (REFRESH_PREFIX + "version", "1"),
+        (REFRESH_PREFIX + "request_digest", request.digest),
+        (REFRESH_PREFIX + "source_sha", payload["source"]["sha"]),
+        ("eventra.phase.sha.frontend", payload["source"]["sha"]),
+    ]
+    _require(all(detail.get(key) == value for key, value in expected_detail.items())
+             and child["evidence"] is None and metadata == dict(prefix[:len(metadata)])
+             and detail.get("revision") == 1 + len(metadata)
+             and not any(run["issue_id"] == detail["id"] for run in state["runs"]),
+             "reserved refresh child is not an exact initialization prefix")
+
+
 def _receipt_match(feature: dict, request: RefreshRequest, prepared: PreparedCandidate, *, partial: bool = False) -> None:
     expected = {"version": 1, "request_digest": request.digest,
                 "authorization_uuid": feature["authorization_comment"], "child_id": prepared.child_id, "target_sha": prepared.target_sha}
@@ -1011,8 +1047,13 @@ def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> Refresh
                  and state["pr"]["head_sha"] == prepared.target_sha, "adopted candidate mismatch")
         return RefreshDecision("create_gate_stage", None, "adopted refresh requires fresh Stage 3 gates")
     reservation = _object(reservation, "version request_digest authorization_uuid action_key state child_id "
-                          "child_identifier prepared parent_projection_digest")
+                          "child_identifier prepared parent_status_category parent_position "
+                          "parent_projection_digest")
     _integer(reservation["version"], 1)
+    _require(type(reservation["parent_status_category"]) is str
+             and type(reservation["parent_position"]) is int
+             and state["parent"].get("position") == reservation["parent_position"],
+             "reservation parent layout mismatch")
     _require(reservation["request_digest"] == request.digest and reservation["authorization_uuid"] == feature["authorization_comment"]
              and reservation["action_key"] == key and reservation["state"] in RESERVATION_STATES,
              "reservation identity mismatch")
@@ -1026,7 +1067,8 @@ def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> Refresh
     _require(len(parent_runs) <= 1 and all(run["agent_id"] == payload["assignment"]["lead_id"] for run in parent_runs),
              "nonunique Lead writer")
     if reservation["state"] == "reserved":
-        _require(len(state["children"]) == 1 and reservation["child_id"] is None
+        _reserved_refresh_child(request, state)
+        _require(reservation["child_id"] is None
                  and reservation["child_identifier"] is None and reservation["prepared"] is None
                  and not {"adoption", "consumed"} & set(feature)
                  and metadata.get("eventra.workflow.next_stage") == "2"
