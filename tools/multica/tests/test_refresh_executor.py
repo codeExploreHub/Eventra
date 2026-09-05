@@ -518,6 +518,8 @@ class MemoryRefreshAPI:
         self.request, self.state = refresh_snapshot_fixture(state="entry")
         self.writes, self.write_index = [], 0
         self.fail_at, self.fail_after = None, False
+        self.fail_operation = None
+        self.create_effects = 0
 
     def parent_lock(self, parent):
         if parent != self.state["parent"]["identifier"]:
@@ -542,6 +544,39 @@ class MemoryRefreshAPI:
             self.writes.append(("set_metadata", issue, key, value))
         if self.fail_at == self.write_index and self.fail_after:
             raise RuntimeError("injected after effect")
+
+    def publish_authorization(self):
+        envelope = {"payload": self.request.payload(), "digest": self.request.digest,
+                    "staging_ref": self.request.staging_ref}
+        request_record = comment_record(12, block("request", envelope), author=7, issue=uid(2))
+        grant_record = comment_record(13, block("grant", {"schema_version": 1,
+                                      "request_digest": self.request.digest, "granted_refresh": 1}),
+                                      author=11, issue=uid(2))
+        grant_record["author_type"] = "member"
+        for record in (request_record, grant_record):
+            self.state["comments"].append(asdict(contracts.RefreshComment(
+                uid(2), record["id"], record["author_id"], record["author_type"],
+                record["revision"], record["content"])))
+            self.state["parent"]["revision"] += 1
+        self.state["comment_manifest"] = contracts.comment_manifest(
+            [request_record, grant_record], uid(2))
+        self.state["parent"]["metadata"] = copy.deepcopy(self.state["metadata"])
+
+    def create_child(self, *, parent, stage, title, project_id, assignee_id, description):
+        if self.fail_operation == "create_child":
+            raise RuntimeError("injected create before effect")
+        if parent != "PRO-900" or stage != 2:
+            raise RuntimeError("invalid child scope")
+        child = issue_detail(id=uid(90), identifier="PRO-902", parent_issue_id=uid(2), stage=stage,
+                             status="backlog", project_id=project_id, assignee_id=assignee_id,
+                             workspace_id=uid(1), description=description, title=title)
+        child["metadata"] = {}
+        self.state["children"].append({"detail": child, "metadata": {}, "evidence": None})
+        self.create_effects += 1
+        self.writes.append(("create_child", parent, "PRO-902"))
+        if self.fail_operation == "create_child_after":
+            raise RuntimeError("injected create after effect")
+        return "PRO-902"
 
 
 class StageRequestTests(unittest.TestCase):
@@ -602,6 +637,51 @@ class StageRequestTests(unittest.TestCase):
     @staticmethod
     def module():
         return importlib.import_module("tools.multica.refresh_executor")
+
+
+class ExecuteRefreshTests(unittest.TestCase):
+    def test_create_before_effect_failure_leaves_exact_reserved_checkpoint(self):
+        api = MemoryRefreshAPI()
+        module = importlib.import_module("tools.multica.refresh_executor")
+        module.stage_refresh_request(api, "PRO-900", api.request)
+        api.publish_authorization()
+        api.writes.clear()
+        source = copy.deepcopy(api.state["children"][0])
+        api.fail_operation = "create_child"
+
+        with self.assertRaisesRegex(RuntimeError, "create before effect"):
+            module.execute_refresh(api, None, "PRO-900", uid(12), uid(13),
+                                   contracts.refresh_action(api.request))
+
+        feature = contracts.refresh_metadata(api.state["metadata"])
+        self.assertEqual(feature["reservation"]["state"], "reserved")
+        self.assertEqual(feature["request_comment"], uid(12))
+        self.assertEqual(feature["authorization_comment"], uid(13))
+        self.assertEqual(api.state["parent"]["revision"], 16)
+        self.assertEqual(api.state["children"], [source])
+        self.assertEqual([write[2] for write in api.writes], [
+            "eventra.refresh.request_comment", "eventra.refresh.authorization_comment",
+            "eventra.refresh.reservation"])
+
+    def test_duplicate_create_ack_loss_recovers_same_child(self):
+        api = MemoryRefreshAPI()
+        module = importlib.import_module("tools.multica.refresh_executor")
+        module.stage_refresh_request(api, "PRO-900", api.request)
+        api.publish_authorization()
+        source = copy.deepcopy(api.state["children"][0])
+        api.fail_operation = "create_child_after"
+        with self.assertRaisesRegex(RuntimeError, "create after effect"):
+            module.execute_refresh(api, None, "PRO-900", uid(12), uid(13),
+                                   contracts.refresh_action(api.request))
+        api.fail_operation = None
+
+        result = module.execute_refresh(api, None, "PRO-900", uid(12), uid(13),
+                                        contracts.refresh_action(api.request))
+
+        self.assertEqual(result.child_identifier, "PRO-902")
+        self.assertEqual(api.create_effects, 1)
+        self.assertEqual(len(api.state["children"]), 2)
+        self.assertEqual(api.state["children"][0], source)
 
 
 if __name__ == "__main__":

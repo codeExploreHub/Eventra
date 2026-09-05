@@ -338,6 +338,8 @@ self.assertNotIn("content", manifest[0])
 
 **分批执行状态（2026-09-05，Task 5A）：本地暂停登记完成。** `stage_refresh_request` 在 workspace+parent 非阻塞锁内只写固定四键前缀，每次写入均以 4B 的 baseline/revision 证明前后读回；写前/写后失败可安全重试，同值重放为 no-op。生产适配器仅增加受限 `set_metadata` 封装，尚未增加 status/child/run 写入，未接 CLI、未触碰 live。证据见 `2026-09-05-eventra-candidate-refresh-batch-3c.md`。Task 5B 的 reserved、child 创建/初始化/启动仍未实现，因此 Task 5 整体保持未完成。
 
+**分批执行状态（2026-09-05，Task 5B1）：授权绑定、reserved 与 child 创建恢复已完成。** executor 从已登记 request 重新读取请求，绑定精确 request/grant UUID，写后验证 revision=16 的 reserved checkpoint；child 创建 ACK 丢失后只接受唯一精确匹配的 Stage 2 backlog child，不按标题模糊追认。当前停在内部 `child_created`，尚未写 child provenance、父 next_stage/status 或启动 run；Task 5 整体仍未完成且不可上线。
+
 另定义 `stage_refresh_request(api: RefreshAPI, parent: str, request: RefreshRequest) -> RefreshExecutionResult`，仅用于显式获准的暂停登记：父任务保持 blocked，写入 version/merge_permission=hold/request_digest 与规范 request envelope，不创建 child、消费 grant 或更新 PR。新增持久键 `eventra.refresh.request` 保存 envelope；这是待授权意图，不是 reservation。写入前提必须验证 source/assignment/Stage1 状态及无其他运行；缺 grant 只允许此暂停登记，不允许执行刷新。Core 对完整等待授权意图返回 wait，对登记半途字段组合保持 fail-closed，不能回退旧 gate 路径。
 
 新增 API 写方法：`set_metadata(issue,key,value)`, `set_status(issue,status)`,

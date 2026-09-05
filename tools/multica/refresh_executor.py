@@ -337,3 +337,115 @@ def stage_refresh_request(api, parent: str, request: c.RefreshRequest) -> Refres
                     before.metadata_writes, before.comment_writes) and failure is not None:
                 raise failure
             raise RuntimeError("refresh authority: metadata effect was not uniquely observed")
+
+
+def execute_refresh(api, git, parent: str, request_uuid: str, grant_uuid: str,
+                    expected_action_key: str) -> RefreshExecutionResult:
+    """Initialize an authorized refresh under the durable parent reservation."""
+    for value in (request_uuid, grant_uuid):
+        c._uuid(value)
+    mutations = 0
+    with api.parent_lock(parent):
+        initial_snapshot = api.snapshot(parent)
+        raw_request = initial_snapshot.state()["metadata"].get(c.REFRESH_PREFIX + "request")
+        request = c.parse_request(raw_request)
+        payload = c._request(request)
+        action_key = c.refresh_action(request)
+        _need(parent == payload["parent"]["identifier"] and expected_action_key == action_key,
+              "refresh execution identity mismatch")
+        feature = c.refresh_metadata(initial_snapshot.state()["metadata"])
+        if feature is None or "reservation" not in feature:
+            progress = c.validate_initial_refresh_progress(request, initial_snapshot)
+            _need(progress.metadata_writes >= 4 and progress.comment_writes == 2
+                  and progress.request_comment is not None and progress.grant_comment is not None
+                  and progress.request_comment.comment_uuid == request_uuid
+                  and progress.grant_comment.comment_uuid == grant_uuid,
+                  "refresh authorization comments mismatch")
+            bindings = [
+                (c.REFRESH_PREFIX + "request_comment", request_uuid),
+                (c.REFRESH_PREFIX + "authorization_comment", grant_uuid),
+            ]
+            while progress.metadata_writes < 6:
+                key, value = bindings[progress.metadata_writes - 4]
+                try:
+                    api.set_metadata(parent, key, value)
+                except RuntimeError:
+                    pass
+                after = c.validate_initial_refresh_progress(request, api.snapshot(parent))
+                _need((after.metadata_writes, after.comment_writes) ==
+                      (progress.metadata_writes + 1, progress.comment_writes),
+                      "authorization binding effect was not uniquely observed")
+                mutations += 1
+                progress = after
+            c.admit_refresh(request, api.snapshot(parent), progress.grant_comment)
+
+            state = api.snapshot(parent).state()
+            projected = c._load_json(c.canonical_json(state), 4_194_304)
+            projected["parent"]["revision"] += 1
+            reservation = {
+                "version": 1, "request_digest": request.digest,
+                "authorization_uuid": grant_uuid, "action_key": action_key,
+                "state": "reserved", "child_id": None, "child_identifier": None,
+                "prepared": None, "parent_projection_digest": c.parent_projection_digest(projected),
+            }
+            reservation_value = c.canonical_json(reservation)
+            prospective = dict(state["metadata"])
+            prospective[c.REFRESH_PREFIX + "reservation"] = reservation_value
+            c.validate_metadata_budget(prospective, request=request)
+            api.set_metadata(parent, c.REFRESH_PREFIX + "reservation", reservation_value)
+            mutations += 1
+            reserved_snapshot = api.snapshot(parent)
+            feature = c.refresh_metadata(reserved_snapshot.state()["metadata"])
+            _need(feature is not None and feature.get("reservation") == reservation
+                  and c.parent_projection_digest(reserved_snapshot.state()) ==
+                      reservation["parent_projection_digest"],
+                  "reserved checkpoint was not authoritatively observed")
+            decision = c.plan_refresh(request, reserved_snapshot)
+            _need(decision.kind == "resume_refresh", "reserved checkpoint is not recoverable")
+        else:
+            state = initial_snapshot.state()
+            reservation = feature["reservation"]
+            _need(feature.get("request_comment") == request_uuid
+                  and feature.get("authorization_comment") == grant_uuid
+                  and reservation == {
+                      "version": 1, "request_digest": request.digest,
+                      "authorization_uuid": grant_uuid, "action_key": action_key,
+                      "state": "reserved", "child_id": None, "child_identifier": None,
+                      "prepared": None,
+                      "parent_projection_digest": reservation.get("parent_projection_digest"),
+                  }
+                  and reservation["parent_projection_digest"] == c.parent_projection_digest(state),
+                  "invalid reserved checkpoint")
+            c._shared_authority(payload, state)
+            c._request_comment(request, state, feature)
+            grants = [item for item in state["comments"]
+                      if item.get("comment_uuid") == grant_uuid]
+            _need(len(grants) == 1, "missing refresh grant")
+            c._grant_in_state(request, state, c.RefreshComment(**grants[0]))
+
+        title = f"{parent}: prepare candidate refresh"
+        description = c.canonical_json({"schema_version": 1, "request_digest": request.digest,
+                                        "action_key": action_key})
+        current = api.snapshot(parent).state()
+        later = [item for item in current["children"]
+                 if item["detail"]["id"] != payload["source"]["child_id"]]
+        _need(len(later) <= 1, "duplicate refresh child")
+        if later:
+            detail, metadata = later[0]["detail"], later[0]["metadata"]
+            expected = {"parent_issue_id": payload["parent"]["id"], "workspace_id": payload["workspace_id"],
+                        "stage": 2, "status": "backlog", "project_id": payload["assignment"]["project_id"],
+                        "assignee_type": "agent", "assignee_id": payload["assignment"]["engineer_id"],
+                        "title": title, "description": description}
+            _need(all(detail.get(key) == value for key, value in expected.items())
+                  and metadata == {} and later[0]["evidence"] is None,
+                  "existing refresh child is not the reserved creation effect")
+            child = detail["identifier"]
+        else:
+            child = api.create_child(
+                parent=parent, stage=2, title=title,
+                project_id=payload["assignment"]["project_id"],
+                assignee_id=payload["assignment"]["engineer_id"], description=description,
+            )
+            mutations += 1
+        c._match(child, c._ISSUE)
+        return RefreshExecutionResult(action_key, "child_created", mutations, child)
