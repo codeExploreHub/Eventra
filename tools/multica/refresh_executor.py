@@ -1,8 +1,8 @@
-"""Guarded refresh authority adapter. No live CLI mutation entry exists here yet.
+"""Guarded refresh authority adapter.
 
 Scope is supplied by trusted operator configuration, never by a request payload.
-CLI wiring and validation against an approved deployment record belong to release
-integration; constructing RefreshScope is not itself human deployment approval.
+The CLI remains disabled unless it validates an explicit approved deployment
+record; constructing RefreshScope is not itself human deployment approval.
 """
 
 from __future__ import annotations
@@ -613,11 +613,11 @@ def _finish_progress(request: c.RefreshRequest, state: dict, reservation: dict,
     return progress, child, writes
 
 
-_RESERVATION_FIELDS = {
+RESERVATION_FIELDS = frozenset({
     "version", "request_digest", "authorization_uuid", "action_key", "state",
     "child_id", "child_identifier", "child_position", "prepared",
     "parent_status_category", "parent_position", "parent_projection_digest",
-}
+})
 
 
 def _adoption_receipts(request: c.RefreshRequest, prepared: c.PreparedCandidate,
@@ -687,7 +687,7 @@ def _adoption_progress(request: c.RefreshRequest, state: dict, reservation: dict
 def _publication_authority(request: c.RefreshRequest, state: dict,
                            reservation: dict) -> tuple[dict, c.PreparedCandidate, int]:
     payload = c._request(request)
-    _need(type(reservation) is dict and set(reservation) == _RESERVATION_FIELDS,
+    _need(type(reservation) is dict and set(reservation) == RESERVATION_FIELDS,
           "invalid publication checkpoint shape")
     feature = c.refresh_metadata(state["metadata"])
     _need(feature is not None and feature.get("reservation") == reservation

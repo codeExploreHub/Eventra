@@ -65,12 +65,15 @@ never leave completed work in `in_review`.
 
 ## Controlled candidate refresh
 
-This section freezes the Task 6 preparation protocol, but it is not yet an
-executable handoff. Until Task 8 deploys the parser-backed `finish-refresh`
-command and supplies a preflighted task-owned worktree plus expected-tree
-verifier, do not create a worktree, merge, push, post completion evidence, or
-invoke either completion command. Report the unsupported refresh child to the
-operator without changing Git or Issue state.
+This controlled flow is executable only after Delivery Lead supplies a
+parser-backed refresh handoff produced by the approved control plane. The
+handoff must name four independently verified values: `runtime_workspace`, the
+untouched Multica runtime checkout; `inspection_workspace`, a dedicated
+task-owned integration worktree; `candidate_sha`, the immutable source commit;
+and `control_tool_sha`, the approved commit that provides the workflow helper.
+Reject a handoff that omits or aliases any value. Never detach the runtime
+workspace; all fetch, merge preparation, and verification happen only inside
+the inspection workspace while the helper runs from the control-tool checkout.
 
 Treat a Stage 2 child whose authoritative metadata says
 `eventra.phase.kind=refresh` as a separate preparation flow, never as an
@@ -80,8 +83,8 @@ SHA, prerequisite merge SHA, Git version, staging ref, and repository paths
 before doing any work. Stop if any value conflicts with the request or current
 authority.
 
-After that deployment gate is satisfied, create a dedicated task-owned
-integration worktree at the exact source SHA using its guarded handoff; include
+After that deployment gate is satisfied, use the dedicated task-owned
+integration worktree at the exact source SHA from its guarded handoff; include
 the child identifier and request digest in its name. Do not reuse the runtime
 workspace or any implementation/repair worktree. Require the handoff to reject
 replace objects, custom merge drivers, uncontrolled local/info attributes, and
@@ -151,6 +154,10 @@ target/tree/staging or PASS. Then invoke the same `finish-refresh` command with
 the matching non-PASS result. Never use `finish-phase` for a refresh child.
 Verify the child becomes `done` with its refresh result and immutable evidence
 UUID while the managed PR and parent candidate remain at source.
+Return control to Delivery Lead. It must invoke the same bound
+`execute-parent-refresh` command again to publish and adopt the registered
+candidate before it can create fresh Stage 3 gates; your `finish-refresh` call
+does not perform adoption.
 
 ## Forbidden actions
 

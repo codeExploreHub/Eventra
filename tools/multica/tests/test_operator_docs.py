@@ -1,5 +1,7 @@
 import re
 import shlex
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -475,9 +477,9 @@ class OperatorDocsTests(unittest.TestCase):
             for action in build_workflow_parser()._actions
             if action.dest == "command"
         )
-        self.assertNotIn("finish-refresh", command_action.choices)
-        self.assertIn("not yet an executable handoff", rendered)
-        self.assertIn("Until Task 8 deploys the parser-backed", rendered)
+        self.assertIn("finish-refresh", command_action.choices)
+        self.assertNotIn("not yet an executable handoff", rendered)
+        self.assertNotIn("Until Task 8 deploys the parser-backed", rendered)
         self.assertNotIn("\ngit merge --no-ff", raw)
         for fragment in (
             "dedicated task-owned integration worktree",
@@ -494,9 +496,97 @@ class OperatorDocsTests(unittest.TestCase):
             "eventra-candidate-refresh-outcome-v1",
             "tools.multica.workflow finish-refresh",
             "Never update the managed PR branch",
+            "runtime_workspace",
+            "inspection_workspace",
+            "candidate_sha",
+            "control_tool_sha",
         ):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, rendered)
+
+    def test_gate_roles_separate_runtime_and_inspection_workspaces(self):
+        instructions = Path("tools/multica/instructions")
+        for name in ("integration_qa.md", "independent_reviewer.md"):
+            rendered = " ".join((instructions / name).read_text().split())
+            with self.subTest(role=name):
+                for required in (
+                    "runtime_workspace", "inspection_workspace",
+                    "candidate_sha", "control_tool_sha", "FETCH_HEAD",
+                ):
+                    self.assertIn(required, rendered)
+                self.assertIn("never detach the runtime workspace", rendered)
+                self.assertIn("task-owned inspection worktree", rendered)
+
+    def test_refresh_runbook_requires_explicit_deployment_and_fresh_gates(self):
+        lead = " ".join(
+            Path("tools/multica/instructions/delivery_lead.md").read_text().split())
+        readme = " ".join(Path("tools/multica/README.md").read_text().split())
+        pilot = " ".join(Path("docs/multica/pilot-issues.md").read_text().split())
+        for rendered in (lead, readme, pilot):
+            with self.subTest(document=rendered[:32]):
+                for fragment in (
+                    "EVENTRA_REFRESH_DEPLOYMENT_FILE",
+                    "plan-refresh", "stage-refresh-request",
+                    "execute-parent-refresh", "finish-refresh",
+                    "fresh Stage 3", "merge hold",
+                    "prepared PASS is not QA",
+                    "independent control-plane",
+                ):
+                    self.assertIn(fragment, rendered)
+                self.assertNotIn("OWNER/REPO#N", rendered)
+                self.assertIn("REFRESH_PLAN.json", rendered)
+                self.assertIn("action_key", rendered)
+                self.assertIn("returns `adopted`", rendered)
+                self.assertGreaterEqual(
+                    rendered.count("execute-parent-refresh"), 2)
+
+    def test_exact_sha_inspection_worktree_never_moves_runtime_checkout(self):
+        def git(*args, cwd):
+            return subprocess.run(
+                ["git", *args], cwd=cwd, check=True, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            ).stdout.strip()
+
+        with tempfile.TemporaryDirectory(prefix="eventra-dual-worktree-") as directory:
+            root = Path(directory)
+            control = root / "control"
+            runtime = root / "runtime"
+            inspection = root / "inspection"
+            control.mkdir()
+            git("init", "-b", "main", cwd=control)
+            git("config", "user.email", "eventra-test@example.invalid", cwd=control)
+            git("config", "user.name", "Eventra Test", cwd=control)
+            (control / "contract.txt").write_text("runtime\n", encoding="utf-8")
+            git("add", "contract.txt", cwd=control)
+            git("commit", "-m", "runtime baseline", cwd=control)
+            runtime_sha = git("rev-parse", "HEAD", cwd=control)
+            git("branch", "runtime-baseline", runtime_sha, cwd=control)
+            (control / "contract.txt").write_text("candidate\n", encoding="utf-8")
+            git("commit", "-am", "candidate", cwd=control)
+            candidate_sha = git("rev-parse", "HEAD", cwd=control)
+
+            git("worktree", "add", str(runtime), "runtime-baseline", cwd=control)
+            git("worktree", "add", "--detach", str(inspection), runtime_sha,
+                cwd=control)
+            git("fetch", "--no-tags", str(control), candidate_sha,
+                cwd=inspection)
+            self.assertEqual(git("rev-parse", "FETCH_HEAD", cwd=inspection),
+                             candidate_sha)
+            git("switch", "--detach", candidate_sha, cwd=inspection)
+
+            helper_args = build_workflow_parser().parse_args([
+                "finish-phase", "PRO-902", "--kind", "qa", "--result", "pass",
+                "--attempt", "0", "--frontend-sha", candidate_sha,
+                "--evidence-comment", "00000000-0000-4000-8000-000000000099",
+            ])
+            self.assertEqual((helper_args.command, helper_args.frontend_sha),
+                             ("finish-phase", candidate_sha))
+
+            self.assertEqual(git("rev-parse", "HEAD", cwd=inspection), candidate_sha)
+            self.assertEqual(git("rev-parse", "HEAD", cwd=runtime), runtime_sha)
+            self.assertEqual(git("branch", "--show-current", cwd=runtime),
+                             "runtime-baseline")
+            self.assertEqual(git("status", "--short", cwd=runtime), "")
 
     def test_delivery_lead_uses_native_stages_and_deterministic_parent_plan(self):
         rendered = Path(

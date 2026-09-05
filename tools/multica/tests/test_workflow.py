@@ -4,9 +4,12 @@ import copy
 import hashlib
 import io
 import json
+import os
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
 import tools.multica.workflow as workflow_module
@@ -2474,6 +2477,142 @@ class PhaseCompletionTests(unittest.TestCase):
                 ]
             )
 
+    def test_refresh_parsers_require_the_dedicated_command_arguments(self):
+        parser = build_workflow_parser()
+        cases = (
+            (
+                ["plan-refresh", "PRO-35", "--prerequisite-pr", FRONTEND_PR,
+                 "--control-tool-sha", "e" * 40],
+                {"command": "plan-refresh", "parent": "PRO-35",
+                 "prerequisite_pr": FRONTEND_PR,
+                 "control_tool_sha": "e" * 40},
+            ),
+            (
+                ["stage-refresh-request", "PRO-35", "--request-file", "/tmp/request.json"],
+                {"command": "stage-refresh-request", "parent": "PRO-35",
+                 "request_file": "/tmp/request.json"},
+            ),
+            (
+                ["execute-parent-refresh", "PRO-35", "--request-comment", COMMENT_ID,
+                 "--authorization-comment", SMOKE_RETRY_AUTH_UUID,
+                 "--expected-action-key", "refresh-action"],
+                {"command": "execute-parent-refresh", "parent": "PRO-35",
+                 "request_comment": COMMENT_ID,
+                 "authorization_comment": SMOKE_RETRY_AUTH_UUID,
+                 "expected_action_key": "refresh-action"},
+            ),
+            (
+                ["finish-refresh", "PRO-36", "--result", "pass",
+                 "--evidence-comment", COMMENT_ID],
+                {"command": "finish-refresh", "issue": "PRO-36",
+                 "result": "pass", "evidence_comment": COMMENT_ID},
+            ),
+        )
+        for argv, expected in cases:
+            with self.subTest(command=argv[0]):
+                args = parser.parse_args(argv)
+                self.assertEqual(vars(args), expected)
+
+        with self.assertRaises(SystemExit):
+            parser.parse_args([
+                "finish-phase", "PRO-36", "--kind", "refresh",
+                "--result", "pass", "--attempt", "0",
+                "--frontend-sha", FRONTEND_SHA,
+                "--evidence-comment", COMMENT_ID,
+            ])
+
+    def test_refresh_deployment_record_never_falls_back_to_ambient_scope(self):
+        contract = {
+            "comment_create_parent_revision_delta": 1,
+            "metadata_change_parent_revision_delta": 1,
+            "metadata_same_value_parent_revision_delta": 0,
+            "status_no_start_preserves_position": True,
+            "status_category_tracks_status": True,
+            "start_creates_single_run": True,
+        }
+        with tempfile.TemporaryDirectory(prefix="eventra-refresh-config-") as directory:
+            root = Path(directory)
+            control = root / "control"
+            frontend = root / "frontend"
+            control.mkdir()
+            frontend.mkdir()
+            record = {
+                "schema_version": 1,
+                "profile": "pro-1",
+                "workspace_id": PARENT_ID,
+                "control_root": str(control),
+                "frontend_root": str(frontend),
+                "approved_control_sha": "e" * 40,
+                "mutation_contract": None,
+            }
+            deployment = root / "deployment.json"
+            deployment.write_text(json.dumps(record), encoding="utf-8")
+            with patch.dict(os.environ, {
+                    "EVENTRA_REFRESH_DEPLOYMENT_FILE": str(deployment)}, clear=True):
+                loaded = workflow_module._load_refresh_deployment(mutation=False)
+                self.assertEqual((loaded.profile, loaded.workspace_id),
+                                 ("pro-1", PARENT_ID))
+                with self.assertRaisesRegex(RuntimeError, "trusted deployment path"):
+                    workflow_module._load_refresh_deployment(mutation=True)
+
+                record["mutation_contract"] = contract
+                deployment.write_text(json.dumps(record), encoding="utf-8")
+                with patch.object(
+                        workflow_module, "TRUSTED_REFRESH_DEPLOYMENT_FILE",
+                        deployment):
+                    approved = workflow_module._load_refresh_deployment(mutation=True)
+                    self.assertEqual(approved.mutation_contract, contract)
+
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "deployment file"):
+                    workflow_module._load_refresh_deployment(mutation=False)
+
+    def test_refresh_deployment_rejects_extra_fields_and_contract_drift(self):
+        contract = dict(workflow_module.REFRESH_MUTATION_CONTRACT)
+        with tempfile.TemporaryDirectory(prefix="eventra-refresh-config-") as directory:
+            root = Path(directory)
+            control = root / "control"
+            frontend = root / "frontend"
+            control.mkdir()
+            frontend.mkdir()
+            record = {
+                "schema_version": 1,
+                "profile": "pro-1",
+                "workspace_id": PARENT_ID,
+                "control_root": str(control),
+                "frontend_root": str(frontend),
+                "approved_control_sha": "e" * 40,
+                "mutation_contract": contract,
+            }
+            deployment = root / "deployment.json"
+            with patch.dict(os.environ, {
+                    "EVENTRA_REFRESH_DEPLOYMENT_FILE": str(deployment)}, clear=True), \
+                    patch.object(workflow_module,
+                                 "TRUSTED_REFRESH_DEPLOYMENT_FILE", deployment):
+                for changed in (
+                    record | {"ambient_workspace": "forbidden"},
+                    record | {"schema_version": True},
+                    record | {"mutation_contract": contract | {
+                        "start_creates_single_run": False}},
+                    record | {"mutation_contract": contract | {
+                        "start_creates_single_run": 1}},
+                    record | {"mutation_contract": contract | {
+                        "comment_create_parent_revision_delta": True}},
+                ):
+                    with self.subTest(fields=sorted(changed)):
+                        deployment.write_text(json.dumps(changed), encoding="utf-8")
+                        with self.assertRaisesRegex(RuntimeError, "deployment"):
+                            workflow_module._load_refresh_deployment(mutation=True)
+
+    def test_refresh_components_require_the_modules_actual_checkout(self):
+        deployment = workflow_module.RefreshDeployment(
+            "pro-1", PARENT_ID, Path("/tmp").resolve(), Path.cwd(),
+            "e" * 40, dict(workflow_module.REFRESH_MUTATION_CONTRACT))
+
+        with self.assertRaisesRegex(RuntimeError, "executing control checkout"):
+            workflow_module._refresh_components(
+                deployment, object(), object())
+
 
 def phase(
     issue_key,
@@ -2898,6 +3037,27 @@ class RefreshWorkflowTests(unittest.TestCase):
         self.assertEqual(result.kind, "create_refresh_stage")
         self.assertIn(request.digest, result.action_key)
 
+    def test_refresh_wakeups_route_only_to_the_refresh_state_machine(self):
+        expected = {
+            "intent": "noop",
+            "admitted": "create_refresh_stage",
+            "reserved": "resume_refresh",
+            "child_initialized": "resume_refresh",
+            "child_dispatched": "resume_refresh",
+            "candidate_registered": "publish_refresh",
+            "published": "resume_refresh",
+        }
+        for state, kind in expected.items():
+            with self.subTest(state=state):
+                _, data = self.fixture(state=state)
+                result = decide_parent_action(self.parent(data))
+                self.assertEqual(result.kind, kind)
+                self.assertNotIn(
+                    result.kind,
+                    {"create_implementation_stage", "create_repair_stage",
+                     "create_gate_stage", "create_smoke_stage", "merge"},
+                )
+
     def test_registered_target_requires_publication_not_old_gate(self):
         _, data = self.fixture()
         result = decide_parent_action(self.parent(data))
@@ -2964,6 +3124,176 @@ class RefreshWorkflowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             finish_phase(runner, "PRO-36", replace(implementation_completion(), kind="refresh"))
         self.assertEqual(runner.mutation_count, 0)
+
+    def test_ordinary_finish_phase_cannot_write_during_refresh_reservation(self):
+        _, data = self.fixture(state="published")
+        runner = FakeWorkflowRunner()
+        runner.parent_metadata = copy.deepcopy(data["metadata"])
+
+        with self.assertRaisesRegex(RuntimeError, "refresh"):
+            finish_phase(runner, "PRO-36", implementation_completion())
+
+        self.assertEqual(runner.mutation_count, 0)
+
+    def test_post_adoption_gate_finish_guard_accepts_specialized_authority(self):
+        _, data = self.fixture(adopted=True)
+
+        class Runner:
+            def run(self, args):
+                if args[:2] == ["issue", "get"]:
+                    return copy.deepcopy(data["parent"])
+                if args[:3] == ["issue", "metadata", "list"]:
+                    return copy.deepcopy(data["metadata"])
+                raise AssertionError(f"unexpected argv: {args!r}")
+
+        class API:
+            def snapshot(self, parent):
+                self.parent = parent
+                return self_snapshot
+
+        self_snapshot = self.c.RefreshSnapshot(self.c.canonical_json(data))
+        detail = {"parent_issue_id": data["parent"]["id"]}
+
+        workflow_module._reject_refresh_parent_for_ordinary_finish(
+            Runner(), detail, API())
+
+    def test_active_refresh_finish_guard_still_rejects_ordinary_gate(self):
+        _, data = self.fixture(state="published")
+
+        class Runner:
+            def run(self, args):
+                if args[:2] == ["issue", "get"]:
+                    return copy.deepcopy(data["parent"])
+                if args[:3] == ["issue", "metadata", "list"]:
+                    return copy.deepcopy(data["metadata"])
+                raise AssertionError(f"unexpected argv: {args!r}")
+
+        detail = {"parent_issue_id": data["parent"]["id"]}
+        with self.assertRaisesRegex(RuntimeError, "dedicated finish-refresh"):
+            workflow_module._reject_refresh_parent_for_ordinary_finish(
+                Runner(), detail, object())
+
+    def test_plan_refresh_main_is_read_only_and_prints_canonical_handoff(self):
+        request, data = self.fixture(state="entry")
+        snapshot = self.c.RefreshSnapshot(self.c.canonical_json(data))
+
+        class API:
+            def snapshot(self, parent):
+                self.parent = parent
+                return snapshot
+
+        deployment = workflow_module.RefreshDeployment(
+            "pro-1", data["parent"]["workspace_id"], Path.cwd(), Path.cwd(),
+            request.payload()["control_tool_sha"], None,
+        )
+        runner = type("Runner", (), {"mutation_count": 0})()
+        output = io.StringIO()
+        with patch.object(workflow_module, "MulticaRunner", return_value=runner), \
+                patch.object(workflow_module, "GitHubRunner", return_value=object()), \
+                patch.object(workflow_module, "_load_refresh_deployment",
+                             return_value=deployment) as load, \
+                patch.object(workflow_module, "_refresh_components",
+                             return_value=(API(), object())), \
+                redirect_stdout(output):
+            self.assertEqual(workflow_module.main([
+                "plan-refresh", "PRO-900", "--prerequisite-pr",
+                request.payload()["prerequisite"]["pr_url"],
+                "--control-tool-sha", request.payload()["control_tool_sha"],
+            ]), 0)
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["mutation_count"], 0)
+        self.assertEqual(self.c.parse_request(payload["request"]), request)
+        self.assertEqual(payload["action_key"], self.c.refresh_action(request))
+        envelope = self.c.canonical_json(payload["request"])
+        self.assertEqual(payload["request_comment"],
+                         f"```eventra-candidate-refresh-request-v1\n{envelope}\n```")
+        grant = self.c.canonical_json({
+            "schema_version": 1, "request_digest": request.digest,
+            "granted_refresh": 1,
+        })
+        self.assertEqual(payload["grant_comment"],
+                         f"```eventra-candidate-refresh-grant-v1\n{grant}\n```")
+        load.assert_called_once_with(mutation=False)
+
+        with tempfile.TemporaryDirectory(prefix="eventra-refresh-plan-") as directory:
+            plan_file = Path(directory) / "plan.json"
+            plan_file.write_text(output.getvalue(), encoding="utf-8")
+            self.assertEqual(
+                workflow_module._read_refresh_request_file(str(plan_file)),
+                request,
+            )
+            plan = json.loads(output.getvalue())
+            plan["mutation_count"] = False
+            plan_file.write_text(self.c.canonical_json(plan), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "request file"):
+                workflow_module._read_refresh_request_file(str(plan_file))
+
+    def test_mutating_refresh_commands_route_only_through_approved_runtime(self):
+        request, data = self.fixture(state="entry")
+        deployment = workflow_module.RefreshDeployment(
+            "pro-1", data["parent"]["workspace_id"], Path.cwd(), Path.cwd(),
+            request.payload()["control_tool_sha"],
+            dict(workflow_module.REFRESH_MUTATION_CONTRACT),
+        )
+        api, git = object(), object()
+        result = workflow_module.refresh_executor.RefreshExecutionResult(
+            self.c.refresh_action(request), "request_staged", 1, "PRO-902")
+        envelope = {"payload": request.payload(), "digest": request.digest,
+                    "staging_ref": request.staging_ref}
+        with tempfile.TemporaryDirectory(prefix="eventra-refresh-request-") as directory:
+            request_file = Path(directory) / "request.json"
+            request_file.write_text(self.c.canonical_json(envelope), encoding="utf-8")
+            commands = (
+                (["stage-refresh-request", "PRO-900", "--request-file", str(request_file)],
+                 "stage_refresh_request", (api, "PRO-900", request), {}),
+                (["execute-parent-refresh", "PRO-900", "--request-comment", COMMENT_ID,
+                  "--authorization-comment", SMOKE_RETRY_AUTH_UUID,
+                  "--expected-action-key", self.c.refresh_action(request)],
+                 "execute_refresh",
+                 (api, git, "PRO-900", COMMENT_ID, SMOKE_RETRY_AUTH_UUID,
+                  self.c.refresh_action(request)), {}),
+                (["finish-refresh", "PRO-902", "--result", "pass",
+                  "--evidence-comment", COMMENT_ID],
+                 "finish_refresh", (api, git, "PRO-902", COMMENT_ID, "pass"), {}),
+            )
+            for argv, function_name, expected_args, expected_kwargs in commands:
+                with self.subTest(command=argv[0]), \
+                        patch.object(workflow_module, "MulticaRunner", return_value=object()), \
+                        patch.object(workflow_module, "GitHubRunner", return_value=object()), \
+                        patch.object(workflow_module, "_load_refresh_deployment",
+                                     return_value=deployment) as load, \
+                        patch.object(workflow_module, "_refresh_components",
+                                     return_value=(api, git)), \
+                        patch.object(workflow_module.refresh_executor, function_name,
+                                     return_value=result) as routed, \
+                        redirect_stdout(io.StringIO()):
+                    self.assertEqual(workflow_module.main(argv), 0)
+                    load.assert_called_once_with(mutation=True)
+                    routed.assert_called_once_with(*expected_args, **expected_kwargs)
+
+    def test_invalid_refresh_cli_input_cannot_reach_scope_or_network(self):
+        with patch.object(workflow_module, "MulticaRunner") as runner, \
+                patch.object(workflow_module, "_load_refresh_deployment") as load, \
+                patch.object(workflow_module, "_refresh_components") as components:
+            with self.assertRaises(SystemExit):
+                workflow_module.main([
+                    "finish-refresh", "PRO-902", "--result", "pass",
+                ])
+            runner.assert_not_called()
+            load.assert_not_called()
+            components.assert_not_called()
+
+        with patch.object(workflow_module, "MulticaRunner", return_value=object()), \
+                patch.object(workflow_module, "_load_refresh_deployment") as load, \
+                patch.object(workflow_module, "_refresh_components") as components:
+            with self.assertRaises(ValueError):
+                workflow_module.main([
+                    "plan-refresh", "PRO-900", "--prerequisite-pr", FRONTEND_PR,
+                    "--control-tool-sha", "not-a-sha",
+                ])
+            load.assert_not_called()
+            components.assert_not_called()
 
     def test_duplicate_or_misplaced_refresh_does_not_count_as_repair_history(self):
         _, data = self.fixture(adopted=True)
@@ -5624,6 +5954,27 @@ def stalled_workflow(**overrides):
 
 
 class RecoveryDecisionTests(unittest.TestCase):
+    def test_recovery_reports_refresh_reservation_without_rerunning_work(self):
+        snapshot = replace(
+            stalled_workflow(), refresh_reservation_state="published")
+
+        decision = decide_recovery(snapshot)
+
+        self.assertEqual(decision.kind, "noop")
+        self.assertIsNone(decision.issue_key)
+        self.assertEqual(
+            decision.reason,
+            "refresh reservation published requires execute-parent-refresh",
+        )
+
+    def test_recovery_blocks_malformed_refresh_metadata(self):
+        decision = decide_recovery(replace(
+            stalled_workflow(), refresh_metadata_malformed=True))
+
+        self.assertEqual(decision.kind, "block")
+        self.assertIsNone(decision.issue_key)
+        self.assertEqual(decision.reason, "refresh workflow metadata is malformed")
+
     def test_recovery_identity_changes_with_smoke_retry_authority(self):
         parent = authorized_smoke_retry_snapshot()
         snapshot = WorkflowSnapshot(
@@ -6327,13 +6678,154 @@ class BackendForeignParentWatchRunner(FakeWatchRunner):
 
 
 class WatchWorkflowTests(unittest.TestCase):
-    def _watch(self, runner, *, apply):
+    @staticmethod
+    def _refresh_api(data):
+        class API:
+            def snapshot(self, parent_key):
+                return workflow_module.refresh.RefreshSnapshot(
+                    workflow_module.refresh.canonical_json(data)
+                )
+
+        return API()
+
+    def _watch(self, runner, *, apply, refresh_api=None):
         return watch_projects(
             runner,
             runner.PROJECTS,
             apply=apply,
             github=runner.github,
+            refresh_api=refresh_api,
         )
+
+    def test_watcher_never_reruns_a_refresh_reservation(self):
+        from tools.multica.tests.test_candidate_refresh import refresh_snapshot_fixture
+
+        states = (
+            "reserved", "child_initialized", "child_dispatched",
+            "candidate_registered", "published",
+        )
+        for state in states:
+            for apply in (False, True):
+                with self.subTest(state=state, apply=apply):
+                    runner = FakeWatchRunner()
+                    _, data = refresh_snapshot_fixture(state=state)
+                    runner.metadata["PRO-35"] = copy.deepcopy(data["metadata"])
+                    if state != "reserved":
+                        child = copy.deepcopy(data["children"][1]["detail"])
+                        child["parent_issue_id"] = PARENT_ID
+                        runner.children = [child]
+                        runner.metadata = {
+                            "PRO-35": copy.deepcopy(data["metadata"]),
+                            child["identifier"]: copy.deepcopy(
+                                data["children"][1]["metadata"]),
+                        }
+                        runner.runs[child["identifier"]] = []
+
+                        class RefreshGitHub:
+                            def run(self, args):
+                                return {
+                                    "url": data["pr"]["url"],
+                                    "headRefOid": data["pr"]["head_sha"],
+                                    "state": "OPEN",
+                                    "mergeable": "MERGEABLE",
+                                    "mergeStateStatus": "CLEAN",
+                                    "statusCheckRollup": [],
+                                }
+
+                        runner.github = RefreshGitHub()
+
+                    result = self._watch(
+                        runner,
+                        apply=apply,
+                        refresh_api=self._refresh_api(data),
+                    )
+
+                    self.assertEqual(result.decision, "noop")
+                    self.assertIn("execute-parent-refresh", result.reason)
+                    self.assertFalse(any(call[:2] == ("issue", "rerun")
+                                         for call in runner.calls))
+
+    def test_watcher_surfaces_malformed_refresh_metadata_as_block(self):
+        runner = FakeWatchRunner()
+        runner.metadata["PRO-35"]["eventra.refresh.version"] = "1"
+
+        result = self._watch(runner, apply=True)
+
+        self.assertEqual(result.decision, "block")
+        self.assertIn("refresh", result.reason)
+        self.assertEqual(result.applied, 0)
+        self.assertFalse(any(call[:2] == ("issue", "rerun")
+                             for call in runner.calls))
+
+    def test_watcher_blocks_shape_complete_but_typed_invalid_reservation(self):
+        from tools.multica.tests.test_candidate_refresh import refresh_snapshot_fixture
+
+        runner = FakeWatchRunner()
+        _, data = refresh_snapshot_fixture(state="published")
+        reservation = json.loads(data["metadata"]["eventra.refresh.reservation"])
+        reservation["parent_position"] = "not-an-integer"
+        data["metadata"]["eventra.refresh.reservation"] = json.dumps(
+            reservation, sort_keys=True, separators=(",", ":"))
+        runner.metadata["PRO-35"] = copy.deepcopy(data["metadata"])
+
+        result = self._watch(runner, apply=True)
+
+        self.assertEqual(result.decision, "block")
+        self.assertEqual(result.applied, 0)
+        self.assertFalse(any(call[:2] == ("issue", "rerun")
+                             for call in runner.calls))
+
+    def test_watcher_blocks_reservation_bound_to_a_missing_refresh_child(self):
+        from tools.multica.tests.test_candidate_refresh import refresh_snapshot_fixture
+
+        runner = FakeWatchRunner()
+        _, data = refresh_snapshot_fixture(state="published")
+        runner.metadata["PRO-35"] = copy.deepcopy(data["metadata"])
+
+        result = self._watch(runner, apply=True)
+
+        self.assertEqual(result.decision, "block")
+        self.assertEqual(result.applied, 0)
+        self.assertFalse(any(call[:2] == ("issue", "rerun")
+                             for call in runner.calls))
+
+    def test_watcher_blocks_refresh_authority_drift_beyond_wire_shape(self):
+        from tools.multica.tests.test_candidate_refresh import refresh_snapshot_fixture
+
+        def wrong_child_position(data):
+            data["children"][1]["detail"]["position"] += 1
+
+        def wrong_phase_sha(data):
+            metadata = data["children"][1]["metadata"]
+            metadata["eventra.phase.sha.frontend"] = "9" * 40
+            data["children"][1]["detail"]["metadata"] = copy.deepcopy(metadata)
+
+        def wrong_parent_projection(data):
+            data["parent"]["position"] += 1
+
+        cases = {
+            "child position": ("published", wrong_child_position),
+            "phase candidate": ("published", wrong_phase_sha),
+            "parent projection": ("published", wrong_parent_projection),
+            "adopted without receipts": ("adopted", lambda data: None),
+        }
+        for label, (state, corrupt) in cases.items():
+            with self.subTest(label=label):
+                runner = FakeWatchRunner()
+                _, data = refresh_snapshot_fixture(state=state)
+                corrupt(data)
+                runner.metadata["PRO-35"] = copy.deepcopy(data["metadata"])
+
+                result = self._watch(
+                    runner,
+                    apply=True,
+                    refresh_api=self._refresh_api(data),
+                )
+
+                self.assertEqual(result.decision, "block")
+                self.assertEqual(result.applied, 0)
+                self.assertFalse(any(call[:2] == ("issue", "rerun")
+                                     for call in runner.calls))
 
     def _cross_stack_gate_snapshot(self):
         backend_sha = "b" * 40
@@ -7984,16 +8476,61 @@ class FakeRepairRunner:
 
 
 class SmokeExecutionTests(unittest.TestCase):
+    def test_new_smoke_reservation_keeps_refresh_reader_for_resume(self):
+        runner, github, decision = self._planned()
+        reader = object()
+
+        with patch.object(
+            workflow_module,
+            "_resume_smoke_reservation",
+            wraps=workflow_module._resume_smoke_reservation,
+        ) as resume:
+            result = execute_parent_smoke(
+                runner,
+                github,
+                "PRO-65",
+                expected_action_key=decision.action_key,
+                refresh_api=reader,
+            )
+
+        self.assertEqual(result.next_action, "smoke", result.reason)
+        self.assertIs(resume.call_args.args[-1], reader)
+
+    def test_smoke_executor_never_writes_through_refresh_authority(self):
+        from tools.multica.tests.test_candidate_refresh import refresh_snapshot_fixture
+
+        runner, github, decision = self._planned()
+        _, data = refresh_snapshot_fixture(state="intent")
+        runner.metadata["PRO-65"].update({
+            key: value for key, value in data["metadata"].items()
+            if key.startswith("eventra.refresh.")
+        })
+        before = runner.committed_mutations
+
+        result = execute_parent_smoke(
+            runner, github, "PRO-65", expected_action_key=decision.action_key)
+
+        self.assertEqual(result.next_action, "block")
+        self.assertIn("refresh", result.reason)
+        self.assertEqual(runner.committed_mutations, before)
+
     def test_existing_smoke_reservation_cannot_bypass_refresh_hold(self):
+        from tools.multica.tests.test_candidate_refresh import refresh_snapshot_fixture
+
         runner, github, decision = self._planned()
         runner.hard_interrupt_after_create = True
         with self.assertRaises(KeyboardInterrupt):
             execute_parent_smoke(runner, github, "PRO-65", expected_action_key=decision.action_key)
         runner.hard_interrupt_after_create = False
-        runner.metadata["PRO-65"]["eventra.refresh.merge_permission"] = "hold"
+        _, data = refresh_snapshot_fixture(state="intent")
+        runner.metadata["PRO-65"].update({
+            key: value for key, value in data["metadata"].items()
+            if key.startswith("eventra.refresh.")
+        })
         before = runner.committed_mutations
         result = execute_parent_smoke(runner, github, "PRO-65", expected_action_key=decision.action_key)
         self.assertEqual(result.next_action, "block")
+        self.assertIn("configured authoritative reader", result.reason)
         self.assertEqual(runner.committed_mutations, before)
 
     class GitHub(FakeRepairGitHubRunner):
@@ -8506,6 +9043,24 @@ class SmokeExecutionTests(unittest.TestCase):
 
 
 class RepairExecutionTests(unittest.TestCase):
+    def test_repair_executor_never_writes_through_refresh_authority(self):
+        from tools.multica.tests.test_candidate_refresh import refresh_snapshot_fixture
+
+        runner, github, decision = self._planned(attempt=0)
+        _, data = refresh_snapshot_fixture(state="intent")
+        runner.metadata["PRO-65"].update({
+            key: value for key, value in data["metadata"].items()
+            if key.startswith("eventra.refresh.")
+        })
+        before = runner.committed_mutations
+
+        result = execute_parent_repair(
+            runner, github, "PRO-65", expected_action_key=decision.action_key)
+
+        self.assertEqual(result.next_action, "block")
+        self.assertIn("refresh", result.reason)
+        self.assertEqual(runner.committed_mutations, before)
+
     SOURCE_GATE_FORGERIES = (
         "creation_action",
         "phase_target",

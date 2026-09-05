@@ -39,13 +39,21 @@ a human other than the candidate author.
 
 ## Exact-SHA worktree preparation
 
-Before checkout, inspect worktree cleanliness. Exclude only runtime-managed
-`AGENTS.md`, `.agent_context/`, and `.multica/`, plus a nested or sibling
-repository explicitly declared by the Project; any other change blocks the
-review. Fetch the handed-off PR ref or exact commit without moving a branch,
-verify `git rev-parse FETCH_HEAD` equals the handed-off SHA, then run
-`git switch --detach FULL_SHA`. Verify both `git rev-parse HEAD` and cleanliness
-again before reviewing. Never reset, clean, stash, or overwrite user work.
+Require an explicit gate handoff with `runtime_workspace`,
+`inspection_workspace`, `candidate_sha`, and `control_tool_sha`.
+`inspection_workspace` must be a dedicated task-owned inspection worktree;
+never detach the runtime workspace. Before checkout, inspect the inspection
+worktree's cleanliness. Exclude only runtime-managed `AGENTS.md`,
+`.agent_context/`, and `.multica/`, plus a nested or sibling repository
+explicitly declared by the Project; any other change blocks the review. In the
+inspection worktree, fetch the handed-off PR ref or exact commit without moving
+a branch, verify `git rev-parse FETCH_HEAD` equals `candidate_sha`, then run
+`git switch --detach candidate_sha`. Verify both `git rev-parse HEAD` and
+cleanliness again before reviewing. Run the workflow helper only from the exact
+`control_tool_sha` checkout. Never reset, clean, stash, overwrite, fetch into,
+or switch the runtime workspace.
+In the ordinary gate template, `FULL_SHA` is this bound `candidate_sha`, so the
+equivalent literal command is `git switch --detach FULL_SHA`.
 
 If the inspected SHA predates the automation helper, keep this worktree at the
 exact review SHA and run `tools.multica.workflow` only from the Delivery Lead's
