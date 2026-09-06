@@ -632,6 +632,28 @@ class RequestTests(ContractCase):
 
 
 class GrantTests(ContractCase):
+    def test_v2_grant_requires_v2_schema_and_fence(self):
+        request = self.api.freeze_refresh_request(
+            pristine_gate_snapshot(), supersede_pristine_gates=True)
+        payload = {"schema_version": 2, "request_digest": request.digest,
+                   "granted_refresh": 1}
+        comment = self.api.RefreshComment(
+            uid(2), uid(10), uid(11), "member", 1,
+            "```eventra-candidate-refresh-grant-v2\n"
+            + encode(payload) + "\n```",
+        )
+
+        try:
+            self.api.validate_grant(comment, request)
+        except ValueError as exc:
+            self.fail(f"valid v2 grant was rejected: {exc}")
+
+        for content in (
+                comment.content.replace("grant-v2", "grant-v1"),
+                comment.content.replace('"schema_version":2', '"schema_version":1')):
+            with self.subTest(content=content), self.assertRaises(ValueError):
+                self.api.validate_grant(replace(comment, content=content), request)
+
     def grant(self, **changes):
         content = block("grant", {"schema_version": 1, "request_digest": self.request.digest,
                                   "granted_refresh": 1})

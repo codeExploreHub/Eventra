@@ -119,7 +119,7 @@ REPAIR_PROVENANCE_KEYS = frozenset(
         "eventra.repair.source_candidates",
     }
 )
-REFRESH_MUTATION_CONTRACT = {
+REFRESH_MUTATION_CONTRACT_V1 = {
     "comment_create_parent_revision_delta": 1,
     "metadata_change_parent_revision_delta": 1,
     "metadata_same_value_parent_revision_delta": 0,
@@ -127,6 +127,12 @@ REFRESH_MUTATION_CONTRACT = {
     "status_category_tracks_status": True,
     "start_creates_single_run": True,
 }
+REFRESH_MUTATION_CONTRACT = REFRESH_MUTATION_CONTRACT_V1
+_REFRESH_MUTATION_CONTRACT_V2_FIELDS = frozenset({
+    "contract_version", "refresh_protocol", "parent_identifier",
+    "request_digest", "action_key", "superseded_gate_ids",
+    *REFRESH_MUTATION_CONTRACT_V1,
+})
 TRUSTED_REFRESH_DEPLOYMENT_FILE = (
     Path(pwd.getpwuid(os.getuid()).pw_dir)
     / ".config" / "eventra" / "refresh-deployment.json"
@@ -174,6 +180,65 @@ class RefreshDeployment:
     frontend_root: Path
     approved_control_sha: str
     mutation_contract: dict[str, object] | None
+
+
+def _refresh_mutation_contract_shape(contract: object) -> bool:
+    if type(contract) is not dict:
+        return False
+    if set(contract) == set(REFRESH_MUTATION_CONTRACT_V1):
+        return all(
+            type(contract[key]) is type(expected) and contract[key] == expected
+            for key, expected in REFRESH_MUTATION_CONTRACT_V1.items())
+    if set(contract) != _REFRESH_MUTATION_CONTRACT_V2_FIELDS:
+        return False
+    gates = contract["superseded_gate_ids"]
+    return (
+        type(contract["contract_version"]) is int
+        and contract["contract_version"] == 2
+        and type(contract["refresh_protocol"]) is int
+        and contract["refresh_protocol"] == 2
+        and type(contract["parent_identifier"]) is str
+        and ISSUE_KEY_PATTERN.fullmatch(contract["parent_identifier"]) is not None
+        and type(contract["request_digest"]) is str
+        and re.fullmatch(r"[0-9a-f]{64}", contract["request_digest"]) is not None
+        and type(contract["action_key"]) is str and bool(contract["action_key"])
+        and type(gates) is list and len(gates) == 2
+        and len(set(gates)) == 2 and all(_is_uuid(gate) for gate in gates)
+        and all(type(contract[key]) is type(expected)
+                and contract[key] == expected
+                for key, expected in REFRESH_MUTATION_CONTRACT_V1.items())
+    )
+
+
+def _require_refresh_mutation_contract(
+    deployment: RefreshDeployment,
+    request: refresh.RefreshRequest,
+    parent: str,
+) -> None:
+    """Require the trusted deployment contract for this exact request."""
+    payload = request.payload()
+    contract = deployment.mutation_contract
+    protocol = refresh.refresh_protocol(request)
+    valid = _refresh_mutation_contract_shape(contract)
+    if protocol == 1:
+        valid = valid and contract == REFRESH_MUTATION_CONTRACT_V1
+    else:
+        expected_gate_ids = [gate["id"] for gate in payload["supersession"]["gates"]]
+        valid = valid and contract == {
+            **REFRESH_MUTATION_CONTRACT_V1,
+            "contract_version": 2,
+            "refresh_protocol": 2,
+            "parent_identifier": payload["parent"]["identifier"],
+            "request_digest": request.digest,
+            "action_key": refresh.refresh_action(request),
+            "superseded_gate_ids": expected_gate_ids,
+        }
+    if (not valid or type(parent) is not str
+            or parent != payload["parent"]["identifier"]
+            or deployment.workspace_id != payload["workspace_id"]
+            or deployment.approved_control_sha != payload["control_tool_sha"]):
+        raise RuntimeError(
+            "refresh deployment mutation contract does not authorize request")
 
 
 def _load_refresh_deployment(*, mutation: bool) -> RefreshDeployment:
@@ -239,15 +304,7 @@ def _load_refresh_deployment(*, mutation: bool) -> RefreshDeployment:
     except (OSError, RuntimeError, TypeError, ValueError):
         raise RuntimeError("refresh deployment file is invalid") from None
     contract = raw["mutation_contract"]
-    contract_matches = (
-        type(contract) is dict
-        and set(contract) == set(REFRESH_MUTATION_CONTRACT)
-        and all(
-            type(contract[key]) is type(expected)
-            and contract[key] == expected
-            for key, expected in REFRESH_MUTATION_CONTRACT.items()
-        )
-    )
+    contract_matches = _refresh_mutation_contract_shape(contract)
     if contract is not None and not contract_matches:
         raise RuntimeError("refresh deployment mutation contract is invalid")
     if mutation and not contract_matches:
@@ -7870,6 +7927,7 @@ def build_workflow_parser() -> argparse.ArgumentParser:
     plan_refresh.add_argument("parent")
     plan_refresh.add_argument("--prerequisite-pr", required=True)
     plan_refresh.add_argument("--control-tool-sha", required=True)
+    plan_refresh.add_argument("--supersede-pristine-gates", action="store_true")
     stage_refresh = subparsers.add_parser("stage-refresh-request")
     stage_refresh.add_argument("parent")
     stage_refresh.add_argument("--request-file", required=True)
@@ -8002,24 +8060,34 @@ def _read_refresh_request_file(filename: str) -> refresh.RefreshRequest:
             raise RuntimeError
         raw = refresh._load_json(
             path.read_text(encoding="utf-8"), limit)
-        plan_fields = {
+        common_plan_fields = {
             "action_key", "grant_comment", "mutation_count", "request",
             "request_comment",
         }
-        if type(raw) is dict and set(raw) == plan_fields:
+        if type(raw) is dict and common_plan_fields <= set(raw):
             if (type(raw["mutation_count"]) is not int
                     or raw["mutation_count"] != 0):
                 raise RuntimeError
             request = refresh.parse_request(raw["request"])
+            protocol = refresh.refresh_protocol(request)
+            plan_fields = common_plan_fields | (
+                {"supersession_preview"} if protocol == 2 else set())
+            if set(raw) != plan_fields:
+                raise RuntimeError
             if (raw["action_key"] != refresh.refresh_action(request)
                     or raw["request_comment"]
-                        != _refresh_block("request", raw["request"])):
+                        != _refresh_block(
+                            "request", raw["request"], protocol=protocol)):
                 raise RuntimeError
             grant = {
-                "schema_version": 1, "request_digest": request.digest,
+                "schema_version": protocol, "request_digest": request.digest,
                 "granted_refresh": 1,
             }
-            if raw["grant_comment"] != _refresh_block("grant", grant):
+            if raw["grant_comment"] != _refresh_block(
+                    "grant", grant, protocol=protocol):
+                raise RuntimeError
+            if (protocol == 2 and raw["supersession_preview"] !=
+                    list(refresh.supersession_preview(request))):
                 raise RuntimeError
             return request
         return refresh.parse_request(raw)
@@ -8027,27 +8095,31 @@ def _read_refresh_request_file(filename: str) -> refresh.RefreshRequest:
         raise RuntimeError("refresh request file is invalid") from None
 
 
-def _refresh_block(kind: str, value: object) -> str:
-    return ("```eventra-candidate-refresh-" + kind + "-v1\n"
+def _refresh_block(kind: str, value: object, *, protocol: int = 1) -> str:
+    return ("```eventra-candidate-refresh-" + kind + f"-v{protocol}\n"
             + refresh.canonical_json(value) + "\n```")
 
 
 def print_refresh_plan(request: refresh.RefreshRequest) -> None:
+    protocol = refresh.refresh_protocol(request)
     envelope = {
         "payload": request.payload(), "digest": request.digest,
         "staging_ref": request.staging_ref,
     }
     grant = {
-        "schema_version": 1, "request_digest": request.digest,
+        "schema_version": protocol, "request_digest": request.digest,
         "granted_refresh": 1,
     }
-    print(_canonical_json({
+    plan = {
         "action_key": refresh.refresh_action(request),
-        "grant_comment": _refresh_block("grant", grant),
+        "grant_comment": _refresh_block("grant", grant, protocol=protocol),
         "mutation_count": 0,
         "request": envelope,
-        "request_comment": _refresh_block("request", envelope),
-    }))
+        "request_comment": _refresh_block("request", envelope, protocol=protocol),
+    }
+    if protocol == 2:
+        plan["supersession_preview"] = list(refresh.supersession_preview(request))
+    print(_canonical_json(plan))
 
 
 def print_refresh_execution_result(
@@ -8102,7 +8174,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         before = runner.mutation_count
         api, _ = _refresh_components(
             deployment, runner, GitHubRunner(), prerequisite_pr=prerequisite_pr)
-        request = refresh.freeze_refresh_request(api.snapshot(args.parent))
+        request = refresh.freeze_refresh_request(
+            api.snapshot(args.parent),
+            supersede_pristine_gates=args.supersede_pristine_gates,
+        )
         payload = request.payload()
         if (payload["control_tool_sha"] != control_sha
                 or payload["prerequisite"]["pr_url"] != prerequisite_pr
@@ -8120,17 +8195,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         api, _ = _refresh_components(
             deployment, runner, GitHubRunner(),
             prerequisite_pr=payload["prerequisite"]["pr_url"])
+        _require_refresh_mutation_contract(
+            deployment, request, args.parent)
         print_refresh_execution_result(
             refresh_executor.stage_refresh_request(api, args.parent, request))
     elif args.command == "execute-parent-refresh":
         deployment = _load_refresh_deployment(mutation=True)
         api, git = _refresh_components(deployment, runner, GitHubRunner())
+        state = api.snapshot(args.parent).state()
+        request = refresh.parse_request(
+            state["metadata"].get(refresh.REFRESH_PREFIX + "request"))
+        _require_refresh_mutation_contract(
+            deployment, request, args.parent)
         print_refresh_execution_result(refresh_executor.execute_refresh(
             api, git, args.parent, args.request_comment,
             args.authorization_comment, args.expected_action_key))
     elif args.command == "finish-refresh":
         deployment = _load_refresh_deployment(mutation=True)
         api, git = _refresh_components(deployment, runner, GitHubRunner())
+        parent = api.parent_for_child(args.issue)
+        state = api.snapshot(parent).state()
+        request = refresh.parse_request(
+            state["metadata"].get(refresh.REFRESH_PREFIX + "request"))
+        _require_refresh_mutation_contract(deployment, request, parent)
         print_refresh_execution_result(refresh_executor.finish_refresh(
             api, git, args.issue, args.evidence_comment, args.result))
     elif args.command == "execute-parent-repair":

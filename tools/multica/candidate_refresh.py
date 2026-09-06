@@ -410,10 +410,13 @@ def _comment(comment: RefreshComment, issue: str, author_type: str) -> None:
     _size(comment.content, MAX_COMMENT_BYTES)
 
 
-def _block(text: str, kind: str, *, only: bool = False) -> Any:
+def _block(text: str, kind: str, *, only: bool = False,
+           protocol: int = 1) -> Any:
     # Reject duplicate, nested and unrelated fences rather than selecting a convenient block.
     _require(text.count("```") == 2, "ambiguous refresh evidence block")
-    label = "eventra-candidate-refresh-" + kind + "-v1"
+    _require(type(protocol) is int and protocol in {1, 2},
+             "invalid refresh evidence protocol")
+    label = "eventra-candidate-refresh-" + kind + f"-v{protocol}"
     pattern = re.compile(r"^```" + re.escape(label) + r"\n([^`]+)\n```$", re.MULTILINE)
     match = pattern.search(text)
     _require(match is not None, "missing refresh evidence block")
@@ -426,9 +429,10 @@ def validate_grant(comment: RefreshComment, request: RefreshRequest) -> None:
     """Validate a scoped member claim; live lookup/consumption is a separate gate."""
     payload = _request(request)
     _comment(comment, payload["parent"]["id"], "member")
-    value = _object(_block(comment.content, "grant", only=True),
+    value = _object(_block(comment.content, "grant", only=True,
+                           protocol=payload["schema_version"]),
                     "schema_version request_digest granted_refresh")
-    _integer(value["schema_version"], 1)
+    _integer(value["schema_version"], payload["schema_version"])
     _integer(value["granted_refresh"], 1)
     _require(value["request_digest"] == request.digest, "grant request mismatch")
 
@@ -1055,7 +1059,7 @@ def validate_initial_refresh_progress(request: RefreshRequest,
                                "staging_ref": request.staging_ref})
     prefix = [
         (REFRESH_PREFIX + "request", envelope),
-        (REFRESH_PREFIX + "version", "1"),
+        (REFRESH_PREFIX + "version", str(payload["schema_version"])),
         (REFRESH_PREFIX + "merge_permission", "hold"),
         (REFRESH_PREFIX + "request_digest", request.digest),
         (REFRESH_PREFIX + "request_comment", None),
@@ -1084,7 +1088,9 @@ def validate_initial_refresh_progress(request: RefreshRequest,
         if comment.revision != 1 or identity["parent_id"] is not None:
             continue
         try:
-            parsed = parse_request(_block(comment.content, "request", only=True))
+            parsed = parse_request(_block(
+                comment.content, "request", only=True,
+                protocol=payload["schema_version"]))
             if (parsed == request and (comment.author_type == "member" or
                     (comment.author_type == "agent" and
                      comment.author_id == payload["assignment"]["lead_id"]))):
@@ -1185,8 +1191,10 @@ def refresh_metadata(metadata: dict[str, str]) -> dict[str, Any] | None:
         return None
     _require(set(values) <= REFRESH_FIELDS and {"version", "request", "request_digest", "merge_permission"} <= set(values),
              "incomplete refresh feature metadata")
-    _require(values["version"] == "1" and values["merge_permission"] == "hold", "refresh merge hold is immutable")
     request = parse_request(values["request"])
+    _require(values["version"] == str(refresh_protocol(request))
+             and values["merge_permission"] == "hold",
+             "refresh merge hold is immutable")
     _require(values["request"] == canonical_json({"payload": request.payload(), "digest": request.digest,
                                                   "staging_ref": request.staging_ref}), "noncanonical refresh request")
     _require(values["request_digest"] == request.digest, "refresh feature request mismatch")
@@ -1226,7 +1234,9 @@ def _request_comment(request: RefreshRequest, state: dict, feature: dict) -> Non
     _comment(comment, payload["parent"]["id"], comment.author_type)
     _require(comment.author_type == "member" or (comment.author_type == "agent"
              and comment.author_id == payload["assignment"]["lead_id"]), "request author mismatch")
-    parsed = parse_request(_block(comment.content, "request", only=True))
+    parsed = parse_request(_block(
+        comment.content, "request", only=True,
+        protocol=payload["schema_version"]))
     _require(parsed == request, "request comment changed")
 
 
@@ -1247,7 +1257,8 @@ def _refresh_child(request: RefreshRequest, state: dict) -> tuple[dict, Prepared
     expected = {"eventra.workflow.version": "2", "eventra.phase.kind": "refresh", "eventra.phase.attempt": "0",
                 "eventra.phase.target": "repository:frontend", "eventra.phase.role": "frontend_engineer",
                 "eventra.phase.creation_action": refresh_action(request), "eventra.phase.pr": payload["pr"]["url"],
-                "eventra.refresh.version": "1", "eventra.refresh.request_digest": request.digest,
+                "eventra.refresh.version": str(payload["schema_version"]),
+                "eventra.refresh.request_digest": request.digest,
                 "eventra.refresh.source_sha": payload["source"]["sha"]}
     _require(all(metadata.get(k) == v for k, v in expected.items()), "refresh child provenance mismatch")
     allowed = set(expected) | {"eventra.phase.sha.frontend", "eventra.phase.result", "eventra.phase.evidence_comment",
@@ -1296,7 +1307,8 @@ def _reserved_refresh_child(request: RefreshRequest, state: dict) -> None:
         ("eventra.workflow.version", "2"), ("eventra.phase.kind", "refresh"),
         ("eventra.phase.attempt", "0"), ("eventra.phase.target", "repository:frontend"),
         ("eventra.phase.role", "frontend_engineer"), ("eventra.phase.creation_action", action),
-        ("eventra.phase.pr", payload["pr"]["url"]), (REFRESH_PREFIX + "version", "1"),
+        ("eventra.phase.pr", payload["pr"]["url"]),
+        (REFRESH_PREFIX + "version", str(payload["schema_version"])),
         (REFRESH_PREFIX + "request_digest", request.digest),
         (REFRESH_PREFIX + "source_sha", payload["source"]["sha"]),
         ("eventra.phase.sha.frontend", payload["source"]["sha"]),
@@ -1329,7 +1341,7 @@ def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> Refresh
     payload, state = _request(request), _snapshot(snapshot)
     _shared_authority(payload, state)
     initial = None
-    if (len(state["children"]) == 1 and state["parent"].get("status") == "blocked"
+    if (state["parent"].get("status") == "blocked"
             and not any(key in state["metadata"] for key in
                         (REFRESH_PREFIX + "reservation", REFRESH_PREFIX + "consumed",
                          REFRESH_PREFIX + "adoption"))):
@@ -1351,7 +1363,7 @@ def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> Refresh
         _require(initial is not None and initial.metadata_writes in {4, 5}
                  and initial.comment_writes in {0, 1, 2}, "invalid paused refresh prefix")
         _require(not {"reservation", "consumed", "adoption"} & set(feature)
-                 and len(state["children"]) == 1 and metadata.get("eventra.workflow.attempt") == "0"
+                 and metadata.get("eventra.workflow.attempt") == "0"
                  and metadata.get("eventra.workflow.next_stage") == "2"
                  and metadata.get("eventra.workflow.last_action") == payload["parent"]["last_action"]
                  and metadata.get("eventra.workflow.merge_state") == "not_ready"

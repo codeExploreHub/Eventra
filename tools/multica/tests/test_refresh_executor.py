@@ -258,16 +258,17 @@ class SnapshotTests(unittest.TestCase):
         envelope = {"payload": request.payload(), "digest": request.digest,
                     "staging_ref": request.staging_ref}
         request_record = comment_record(
-            12, block("request", envelope), author=7, issue=uid(2))
+            12, "```eventra-candidate-refresh-request-v2\n"
+            + encode(envelope) + "\n```", author=7, issue=uid(2))
         grant_record = comment_record(
-            13, block("grant", {"schema_version": 1,
-                                 "request_digest": request.digest,
-                                 "granted_refresh": 1}),
+            13, "```eventra-candidate-refresh-grant-v2\n"
+            + encode({"schema_version": 2, "request_digest": request.digest,
+                      "granted_refresh": 1}) + "\n```",
             author=11, issue=uid(2))
         grant_record["author_type"] = "member"
         state["metadata"].update({
             "eventra.refresh.request": contracts.canonical_json(envelope),
-            "eventra.refresh.version": "1",
+            "eventra.refresh.version": "2",
             "eventra.refresh.merge_permission": "hold",
             "eventra.refresh.request_digest": request.digest,
             "eventra.refresh.request_comment": uid(12),
@@ -286,10 +287,12 @@ class SnapshotTests(unittest.TestCase):
         grant = contracts.RefreshComment(
             uid(2), uid(13), uid(11), "member", 1, grant_record["content"])
 
-        contracts.admit_refresh(
-            request,
-            contracts.RefreshSnapshot(contracts.canonical_json(state)),
-            grant,
+        admitted = contracts.RefreshSnapshot(contracts.canonical_json(state))
+        contracts.admit_refresh(request, admitted, grant)
+        decision = contracts.plan_refresh(request, admitted)
+        self.assertEqual(
+            (decision.kind, decision.action_key),
+            ("create_refresh_stage", contracts.refresh_action(request)),
         )
         self.assertEqual(self.runner.writes + self.github.writes, [])
 
@@ -1014,6 +1017,29 @@ class MemoryRefreshAPI:
 
 
 class StageRequestTests(unittest.TestCase):
+    def test_v2_stage_request_persists_protocol_version_and_remains_idempotent(self):
+        from tools.multica.tests.test_candidate_refresh import pristine_gate_snapshot
+
+        api = MemoryRefreshAPI()
+        snapshot = pristine_gate_snapshot()
+        api.request = contracts.freeze_refresh_request(
+            snapshot, supersede_pristine_gates=True)
+        api.state = snapshot.state()
+
+        result = self.module().stage_refresh_request(api, "PRO-900", api.request)
+
+        self.assertEqual((result.status, result.mutation_count),
+                         ("request_staged", 4))
+        self.assertEqual(api.state["metadata"]["eventra.refresh.version"], "2")
+        progress = contracts.validate_initial_refresh_progress(
+            api.request, api.snapshot("PRO-900"))
+        self.assertEqual((progress.metadata_writes, progress.comment_writes), (4, 0))
+        decision = contracts.plan_refresh(api.request, api.snapshot("PRO-900"))
+        self.assertEqual((decision.kind, decision.action_key), ("wait", None))
+        replay = self.module().stage_refresh_request(api, "PRO-900", api.request)
+        self.assertEqual((replay.status, replay.mutation_count),
+                         ("request_staged", 0))
+
     def test_stage_request_writes_exact_four_key_prefix_and_is_idempotent(self):
         api = MemoryRefreshAPI()
         result = self.module().stage_refresh_request(api, "PRO-900", api.request)

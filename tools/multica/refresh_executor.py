@@ -384,7 +384,7 @@ def stage_refresh_request(api, parent: str, request: c.RefreshRequest) -> Refres
                                  "staging_ref": request.staging_ref})
     prefix = [
         (c.REFRESH_PREFIX + "request", envelope),
-        (c.REFRESH_PREFIX + "version", "1"),
+        (c.REFRESH_PREFIX + "version", str(payload["schema_version"])),
         (c.REFRESH_PREFIX + "merge_permission", "hold"),
         (c.REFRESH_PREFIX + "request_digest", request.digest),
     ]
@@ -427,7 +427,7 @@ def _refresh_child_prefix(request: c.RefreshRequest) -> list[tuple[str, str]]:
         ("eventra.phase.role", "frontend_engineer"),
         ("eventra.phase.creation_action", c.refresh_action(request)),
         ("eventra.phase.pr", payload["pr"]["url"]),
-        (c.REFRESH_PREFIX + "version", "1"),
+        (c.REFRESH_PREFIX + "version", str(payload["schema_version"])),
         (c.REFRESH_PREFIX + "request_digest", request.digest),
         (c.REFRESH_PREFIX + "source_sha", payload["source"]["sha"]),
         ("eventra.phase.sha.frontend", payload["source"]["sha"]),
