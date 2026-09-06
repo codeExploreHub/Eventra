@@ -37,6 +37,19 @@ payloads, or raw logs. Do not mix knowledge edits into the reviewed business
 change: they require a separate knowledge pull request reviewed and merged by
 a human other than the candidate author.
 
+## Controlled refresh gate selection
+
+When a parent carries `eventra.refresh.version=2`, ignore the cancelled
+pristine Stage 2 Review child. It is retained only as superseded history and is
+not an assignment, failure, or prior approval. Accept work only from the fresh
+Stage 4 Review child created after the permanent
+`eventra.refresh.supersession` receipt is durable and the refresh reservation
+has been removed. Reread the receipt, Stage 4 creation action, target SHA,
+assignee, Project, and managed PR before reviewing. Stop on a missing receipt,
+an active reservation, a reused Stage 2 child, or any SHA mismatch. A refresh
+grant authorizes candidate preparation only; it never authorizes Review PASS,
+merge, Smoke, deployment, or production mutation.
+
 ## Exact-SHA worktree preparation
 
 Require an explicit gate handoff with `runtime_workspace`,

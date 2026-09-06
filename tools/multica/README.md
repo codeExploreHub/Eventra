@@ -733,6 +733,15 @@ roots, and full 40-character approved SHA):
   "frontend_root": "/Users/operator/Eventra-runtime",
   "approved_control_sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
   "mutation_contract": {
+    "contract_version": 2,
+    "refresh_protocol": 2,
+    "parent_identifier": "PRO-M",
+    "request_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+    "action_key": "2:PRO-M:create_refresh_stage:0:frontend:SOURCE_SHA:next-stage:3:refresh:1:REQUEST_SHA256",
+    "superseded_gate_ids": [
+      "00000000-0000-4000-8000-000000000014",
+      "00000000-0000-4000-8000-000000000015"
+    ],
     "comment_create_parent_revision_delta": 1,
     "metadata_change_parent_revision_delta": 1,
     "metadata_same_value_parent_revision_delta": 0,
@@ -761,7 +770,7 @@ mutation contract above.
 Use the four command types in this five-invocation protocol:
 
 ```text
-python3 -B -m tools.multica.workflow plan-refresh PRO-M --prerequisite-pr https://github.com/codeExploreHub/Eventra/pull/N --control-tool-sha FULL_SHA > REFRESH_PLAN.json
+python3 -B -m tools.multica.workflow plan-refresh PRO-M --prerequisite-pr https://github.com/codeExploreHub/Eventra/pull/N --control-tool-sha FULL_SHA --supersede-pristine-gates > REFRESH_PLAN.json
 python3 -B -m tools.multica.workflow stage-refresh-request PRO-M --request-file REFRESH_PLAN.json
 python3 -B -m tools.multica.workflow execute-parent-refresh PRO-M --request-comment REQUEST_UUID --authorization-comment GRANT_UUID --expected-action-key ACTION_KEY
 python3 -B -m tools.multica.workflow finish-refresh PRO-N --result pass|fail|blocked --evidence-comment COMMENT_UUID
@@ -773,9 +782,13 @@ input file for `stage-refresh-request`; do not extract or reconstruct fields.
 The output provides `action_key`, `request_comment`, and `grant_comment`.
 After staging, Delivery Lead posts the exact request text, a member separately
 posts the exact grant text, and both immutable UUIDs feed the first execute.
-That invocation dispatches Stage 2. After `finish-refresh`, repeat the same
-execute command to publish and adopt; do not plan Stage 3 before it returns
-`adopted`. The mutating commands require the approved mutation contract and
+That invocation first cancels only the two request-bound pristine Stage 2
+Review/QA children in deterministic order, then dispatches the preparation
+child in Stage 3. Every cancellation is `--no-start`, preserves the original
+Issue as immutable history, and is recovered from the exact reservation prefix
+after interruption. After `finish-refresh`, repeat the same execute command to
+publish and adopt; do not plan Stage 4 before it returns `adopted`. The
+mutating commands require the request-specific version-2 contract above and
 reread the bound parent, immutable member comments, PR head, candidate SHA, and
 `control_tool_sha`. The refresh worker
 receives separate `runtime_workspace` and task-owned `inspection_workspace`
@@ -785,7 +798,7 @@ object, and verify `FETCH_HEAD` before detaching only their inspection tree.
 
 A successful preparation publishes a staged candidate but does not adopt it:
 prepared PASS is not QA. The parent remains in a merge hold until Delivery Lead
-creates a fresh Stage 3 and both Independent Reviewer and Integration QA pass
+creates a fresh Stage 4 and both Independent Reviewer and Integration QA pass
 the exact candidate from the independent control-plane handoff. Repair does not
 clear that hold, and the member's exact-candidate merge authorization is a
 separate decision from the refresh grant. Review and publish the independent
@@ -796,11 +809,12 @@ than treating an earlier result as current evidence.
 
 ### Control-plane verification receipt (2026-09-06)
 
-The isolated candidate-refresh branch completed a local, non-live verification
-run. The Python discovery suite passed 658 tests, including a real temporary Git
-object graph and bare remote that exercised Stage 1 evidence, Stage 2 prepare,
-staged publication/adoption, fresh Stage 3 Review and QA PASS, and the final
-human merge hold. The recorded mutation-boundary test derives its write count
+The isolated candidate-refresh branches contain local, non-live verification
+evidence; this paragraph is not a live execution record. Their tests include a
+real temporary Git object graph and bare remote exercising Stage 1 evidence,
+ordered cancellation of pristine Stage 2 gates, Stage 3 preparation, durable
+publication/adoption and supersession receipt, fresh Stage 4 Review and QA,
+and the final human merge hold. The mutation-boundary test derives its write count
 from the baseline execution and exercises every `1..N` boundary both before and
 after the effect; incompatible external state stops with no later write.
 

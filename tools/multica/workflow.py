@@ -484,6 +484,7 @@ class WorkflowSnapshot:
     delivery_squad_leader_id: str = ""
     delivery_squad_members: tuple[tuple[str, str, str], ...] = ()
     refresh_reservation_state: str = ""
+    refresh_hold_reason: str = ""
     refresh_metadata_malformed: bool = False
 
     def first_terminal_run_needing_transition(
@@ -1805,7 +1806,10 @@ def _refresh_workflow_decision(snapshot: ParentSnapshot) -> ParentDecision | Non
                                                            for item in assignment["members"]))}
         if any(getattr(snapshot, key) != value for key, value in expected.items()):
             raise ValueError("outer authority mismatch")
-        superseded_ids = _receipt_bound_superseded_gate_ids(
+        decision = refresh.plan_refresh(request, snapshot.refresh_state)
+        if decision.kind == "block":
+            return ParentDecision("block_parent", None, decision.reason)
+        superseded_ids = _request_bound_superseded_gate_ids(
             snapshot.refresh_state)
         phases = tuple(
             _phase_snapshot(item["detail"], item["metadata"])
@@ -1817,9 +1821,6 @@ def _refresh_workflow_decision(snapshot: ParentSnapshot) -> ParentDecision | Non
                 or snapshot.pull_requests[0].url != pr["url"] or snapshot.pull_requests[0].head_sha != pr["head_sha"]
                 or snapshot.pull_requests[0].state != pr["state"]):
             raise ValueError("outer child or PR authority mismatch")
-        decision = refresh.plan_refresh(request, snapshot.refresh_state)
-        if decision.kind == "block":
-            return ParentDecision("block_parent", None, decision.reason)
         if decision.kind == "create_gate_stage":
             return _parent_decision(snapshot, "create_gate_stage", decision.reason)
         if decision.kind == "wait":
@@ -1837,6 +1838,44 @@ def _refresh_workflow_decision(snapshot: ParentSnapshot) -> ParentDecision | Non
         return ParentDecision("block_parent", None, "refresh workflow authority is conflicting")
 
 
+def _dedicated_refresh_decision_hold_reason(
+    decision: ParentDecision | refresh.RefreshDecision | None,
+) -> str | None:
+    """Map one specialized decision to the shared ordinary-writer hold."""
+
+    if decision is None or decision.kind == "create_gate_stage":
+        return None
+    if decision.kind in {"block", "block_parent"}:
+        raise RuntimeError("refresh workflow authority is conflicting")
+    if decision.reason == (
+        "refresh adopted; validate normal gate or repair history"
+    ):
+        return None
+    if "authorization" in decision.reason:
+        return "dedicated refresh request awaits exact member authorization"
+    if "preparation pending" in decision.reason:
+        return "dedicated refresh preparation requires finish-refresh"
+    if "cancellation" in decision.reason or "gates cancelled" in decision.reason:
+        return "dedicated refresh cancellation requires execute-parent-refresh"
+    if (
+        decision.kind == "publish_refresh"
+        or "adoption" in decision.reason
+        or "registered candidate" in decision.reason
+    ):
+        return "dedicated refresh publication requires execute-parent-refresh"
+    return "dedicated refresh execution requires execute-parent-refresh"
+
+
+def _dedicated_refresh_hold_reason(
+    snapshot: ParentSnapshot,
+) -> str | None:
+    """Classify when ordinary workflow writers must yield to refresh."""
+
+    return _dedicated_refresh_decision_hold_reason(
+        _refresh_workflow_decision(snapshot)
+    )
+
+
 def _receipt_bound_superseded_gate_ids(
         refresh_state: refresh.RefreshSnapshot | None) -> frozenset[str]:
     if refresh_state is None:
@@ -1852,6 +1891,24 @@ def _receipt_bound_superseded_gate_ids(
     receipt = refresh._supersession_receipt(
         feature, request, prepared, state)
     return frozenset(gate["id"] for gate in receipt["gates"])
+
+
+def _request_bound_superseded_gate_ids(
+        refresh_state: refresh.RefreshSnapshot | None) -> frozenset[str]:
+    """Project v2-owned pristine gates out of ordinary workflow parsing."""
+    if refresh_state is None:
+        return frozenset()
+    state = refresh_state.state()
+    feature = refresh.refresh_metadata(state["metadata"])
+    if feature is None:
+        return frozenset()
+    request = refresh.parse_request(feature["request"])
+    if refresh.refresh_protocol(request) != 2:
+        return frozenset()
+    return frozenset(
+        str(gate["id"])
+        for gate in request.payload()["supersession"]["gates"]
+    )
 
 
 def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
@@ -2965,6 +3022,9 @@ def decide_recovery(snapshot: WorkflowSnapshot) -> RecoveryDecision:
     if snapshot.refresh_metadata_malformed:
         return RecoveryDecision(
             "block", None, "refresh workflow metadata is malformed")
+    if snapshot.refresh_hold_reason:
+        return RecoveryDecision(
+            "noop", None, snapshot.refresh_hold_reason)
     if snapshot.refresh_reservation_state:
         return RecoveryDecision(
             "noop", None,
@@ -3771,18 +3831,27 @@ def load_parent_snapshot(
     )
     if parent["parent_issue_id"] is not None:
         raise RuntimeError("parent planning requires a parent issue")
-    metadata = _parent_metadata(
-        parse_issue_metadata(
-            runner.run(
-                ["issue", "metadata", "list", parent_key, "--output", "json"]
-            )
+    raw_parent_metadata = parse_issue_metadata(
+        runner.run(
+            ["issue", "metadata", "list", parent_key, "--output", "json"]
         )
     )
+    metadata = _parent_metadata(raw_parent_metadata)
     refresh_state = None
     if metadata["refresh_feature"] is not None:
         if refresh_api is None:
             raise RuntimeError("refresh requires an explicitly configured authoritative reader")
         refresh_state = refresh_api.snapshot(parent_key)
+        refresh_state_value = refresh_state.state()
+        refresh_feature = refresh.refresh_metadata(
+            refresh_state_value["metadata"]
+        )
+        refresh_request = refresh.parse_request(refresh_feature["request"])
+        if (
+            refresh_state_value["metadata"] != raw_parent_metadata
+            or refresh.plan_refresh(refresh_request, refresh_state).kind == "block"
+        ):
+            raise RuntimeError("refresh workflow authority is conflicting")
     authorizing_comment = None
     authorization_comment_uuid = str(metadata["authorization_comment_uuid"])
     if authorization_comment_uuid:
@@ -3829,7 +3898,7 @@ def load_parent_snapshot(
     quarantined: list[QuarantinedRepairChild] = []
     child_metadata_by_key: dict[str, dict[str, str]] = {}
     pr_candidates: dict[str, tuple[int, str]] = {}
-    superseded_gate_ids = _receipt_bound_superseded_gate_ids(refresh_state)
+    superseded_gate_ids = _request_bound_superseded_gate_ids(refresh_state)
     for child in children:
         if child["stage"] is None:
             continue
@@ -5493,6 +5562,9 @@ def execute_parent_repair(
             raise RuntimeError("repair execution requires a mutable parent")
         snapshot = load_parent_snapshot(
             runner, github, parent_key, refresh_api=refresh_api)
+        refresh_hold_reason = _dedicated_refresh_hold_reason(snapshot)
+        if refresh_hold_reason is not None:
+            raise RuntimeError(refresh_hold_reason)
         reservation = snapshot.repair_reservation
         if reservation is None and snapshot.last_action == expected_action_key:
             children = _verified_replayed_repair_children(
@@ -5877,12 +5949,13 @@ def _read_smoke_reservation_authority(
             ["issue", "metadata", "list", parent_key, "--output", "json"]
         )
     )
+    authoritative_refresh_state = None
     if any(key.startswith(refresh.REFRESH_PREFIX) for key in raw_parent_metadata):
         if refresh_api is None:
             raise RuntimeError(
                 "refresh requires an explicitly configured authoritative reader")
-        refresh_snapshot = refresh_api.snapshot(parent_key)
-        if refresh_snapshot.state()["metadata"] != raw_parent_metadata:
+        authoritative_refresh_state = refresh_api.snapshot(parent_key)
+        if authoritative_refresh_state.state()["metadata"] != raw_parent_metadata:
             raise RuntimeError("refresh authority changed during smoke read")
     parent_metadata = _parent_metadata(raw_parent_metadata)
     consumed_authorization_uuid = str(
@@ -5899,10 +5972,14 @@ def _read_smoke_reservation_authority(
         runner.run(["issue", "children", parent_key, "--output", "json"]),
         str(parent["id"]),
     )
+    superseded_gate_ids = _request_bound_superseded_gate_ids(
+        authoritative_refresh_state
+    )
     smoke_stage = int(reservation["next_stage"])
     source_children = tuple(
         child for child in children if child["stage"] is not None
         and int(child["stage"]) < smoke_stage
+        and str(child["id"]) not in superseded_gate_ids
     )
     smoke_children = tuple(
         child for child in children if child["stage"] == smoke_stage
@@ -6070,7 +6147,11 @@ def _read_smoke_reservation_authority(
         delivery_squad_members=assignment_authority[5],
         consumed_authorization_uuid=consumed_authorization_uuid,
         consumed_authorizing_comment=consumed_authorizing_comment,
+        refresh_state=authoritative_refresh_state,
     )
+    refresh_hold_reason = _dedicated_refresh_hold_reason(source_snapshot)
+    if refresh_hold_reason is not None:
+        raise RuntimeError(refresh_hold_reason)
     historical_authorization_problem = (
         _historical_round_three_authorization_problem(source_snapshot)
     )
@@ -6387,6 +6468,9 @@ def execute_parent_smoke(
             )
         snapshot = load_parent_snapshot(
             runner, github, parent_key, refresh_api=refresh_api)
+        refresh_hold_reason = _dedicated_refresh_hold_reason(snapshot)
+        if refresh_hold_reason is not None:
+            raise RuntimeError(refresh_hold_reason)
         if snapshot.last_action == expected_action_key:
             current = tuple(
                 item
@@ -6609,7 +6693,9 @@ def load_workflow_snapshot(
         raise RuntimeError("unsupported workflow metadata")
     decoded_parent: dict[str, object] | None = None
     refresh_reservation_state = ""
+    refresh_hold_reason = ""
     refresh_metadata_malformed = False
+    authoritative_refresh_state = None
     has_refresh_metadata = any(
         key.startswith(refresh.REFRESH_PREFIX) for key in parent_metadata)
     assignment_agent_ids: tuple[tuple[str, str], ...] = ()
@@ -6629,30 +6715,38 @@ def load_workflow_snapshot(
         if decoded_parent is not None and decoded_parent["refresh_feature"] is not None:
             feature = decoded_parent["refresh_feature"]
             reservation = feature.get("reservation")
-            if reservation is not None:
-                if not _refresh_reservation_is_watcher_safe(feature):
-                    refresh_metadata_malformed = True
-                elif refresh_api is None:
-                    refresh_metadata_malformed = True
-                else:
-                    try:
-                        authority = refresh_api.snapshot(parent_key)
-                        authority_state = authority.state()
-                        authority_feature = refresh.refresh_metadata(
-                            authority_state["metadata"])
-                        authority_request = refresh.parse_request(
-                            authority_feature["request"])
-                        authority_decision = refresh.plan_refresh(
-                            authority_request, authority)
-                        if (authority_state["metadata"] != parent_metadata
-                                or authority_feature.get("reservation")
-                                    != reservation
-                                or authority_decision.kind == "block"):
-                            raise RuntimeError
+            if refresh_api is None:
+                refresh_metadata_malformed = True
+            else:
+                try:
+                    authority = refresh_api.snapshot(parent_key)
+                    authority_state = authority.state()
+                    authority_feature = refresh.refresh_metadata(
+                        authority_state["metadata"])
+                    authority_request = refresh.parse_request(
+                        authority_feature["request"])
+                    authority_decision = refresh.plan_refresh(
+                        authority_request, authority)
+                    if (
+                        authority_state["metadata"] != parent_metadata
+                        or authority_feature != feature
+                        or authority_decision.kind == "block"
+                    ):
+                        raise RuntimeError
+                    if (
+                        reservation is not None
+                        and refresh.refresh_protocol(authority_request) == 1
+                        and not _refresh_reservation_is_watcher_safe(feature)
+                    ):
+                        raise RuntimeError
+                    protocol = refresh.refresh_protocol(authority_request)
+                    if protocol == 2:
+                        authoritative_refresh_state = authority
+                    if reservation is not None:
                         refresh_reservation_state = str(reservation["state"])
-                    except (AttributeError, KeyError, RuntimeError,
-                            TypeError, ValueError):
-                        refresh_metadata_malformed = True
+                except (AttributeError, KeyError, RuntimeError,
+                        TypeError, ValueError):
+                    refresh_metadata_malformed = True
         if decoded_parent is not None:
             consumed_uuid = str(
                 decoded_parent["consumed_authorization_uuid"])
@@ -6683,6 +6777,9 @@ def load_workflow_snapshot(
         runner.run(["issue", "children", parent_key, "--output", "json"]),
         str(parent["id"]),
     )
+    superseded_gate_ids = _request_bound_superseded_gate_ids(
+        authoritative_refresh_state
+    )
     parent_runs = parse_issue_runs(
         runner.run(["issue", "runs", parent_key, "--output", "json"]),
         str(parent["id"]),
@@ -6707,7 +6804,11 @@ def load_workflow_snapshot(
         has_active = any(item["status"] in ACTIVE_RUN_STATUSES for item in runs)
         has_human_wait = has_human_wait or _is_human_wait(child)
         phase_value = None
-        if child["stage"] is not None and workflow_version == "2":
+        if (
+            child["stage"] is not None
+            and workflow_version == "2"
+            and str(child["id"]) not in superseded_gate_ids
+        ):
             try:
                 phase_value = _phase_snapshot(child, metadata)
             except (RuntimeError, TypeError, ValueError):
@@ -6923,9 +7024,18 @@ def load_workflow_snapshot(
                 delivery_lead_id=delivery_lead_id,
                 delivery_squad_leader_id=delivery_squad_leader_id,
                 delivery_squad_members=delivery_squad_members,
+                refresh_state=authoritative_refresh_state,
             )
         except (KeyError, RuntimeError, TypeError, ValueError):
             parent_snapshot = None
+            malformed_current_stage = True
+    if parent_snapshot is not None and authoritative_refresh_state is not None:
+        try:
+            refresh_hold_reason = (
+                _dedicated_refresh_hold_reason(parent_snapshot) or ""
+            )
+        except RuntimeError:
+            refresh_metadata_malformed = True
             malformed_current_stage = True
     return WorkflowSnapshot(
         parent_issue_id=str(parent["id"]),
@@ -6957,6 +7067,7 @@ def load_workflow_snapshot(
         delivery_squad_leader_id=delivery_squad_leader_id,
         delivery_squad_members=delivery_squad_members,
         refresh_reservation_state=refresh_reservation_state,
+        refresh_hold_reason=refresh_hold_reason,
         refresh_metadata_malformed=refresh_metadata_malformed,
     )
 
@@ -7056,8 +7167,13 @@ def watch_projects(
         )
         if decision.reason == "version 1 workflow requires explicit migration":
             migrations.append((parent_key, decision))
-        elif (decision.kind == "noop"
-              and decision.reason.startswith("refresh reservation ")):
+        elif (
+            decision.kind == "noop"
+            and (
+                decision.reason.startswith("refresh reservation ")
+                or decision.reason.startswith("dedicated refresh ")
+            )
+        ):
             refresh_waits.append((parent_key, decision))
         elif decision.kind != "noop":
             candidates.append((parent_key, decision))
@@ -7323,10 +7439,13 @@ def _finish_phase_authority_problem(
     except RuntimeError:
         return "authoritative parent or child relationship is malformed"
     refresh_feature = parent_workflow["refresh_feature"]
-    if (refresh_feature is not None
-            and not ({"adoption", "consumed"} <= set(refresh_feature)
-                     and "reservation" not in refresh_feature)):
-        return "refresh workflow requires the dedicated finish-refresh command"
+    if refresh_feature is not None:
+        try:
+            _reject_refresh_parent_for_ordinary_finish(
+                runner, detail, refresh_api
+            )
+        except RuntimeError as error:
+            return str(error)
     next_stage = int(parent_workflow["next_stage"])
     attempt = int(parent_workflow["attempt"])
     if (
@@ -7806,19 +7925,23 @@ def _reject_refresh_parent_for_ordinary_finish(
         if refresh_api is None:
             raise RuntimeError(
                 "refresh requires an explicitly configured authoritative reader")
-        if (not {"adoption", "consumed"} <= set(feature)
-                or "reservation" in feature):
+        try:
+            snapshot = refresh_api.snapshot(str(raw_parent["identifier"]))
+            state = snapshot.state()
+            if (
+                state["parent"].get("id") != detail["parent_issue_id"]
+                or state["metadata"] != metadata
+            ):
+                raise RuntimeError
+            request = refresh.parse_request(feature["request"])
+            decision = refresh.plan_refresh(request, snapshot)
+            hold_reason = _dedicated_refresh_decision_hold_reason(decision)
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
             raise RuntimeError(
-                "refresh workflow requires the dedicated finish-refresh command")
-        snapshot = refresh_api.snapshot(str(raw_parent["identifier"]))
-        state = snapshot.state()
-        if (state["parent"].get("id") != detail["parent_issue_id"]
-                or state["metadata"] != metadata):
-            raise RuntimeError("refresh authority changed before phase completion")
-        request = refresh.parse_request(feature["request"])
-        decision = refresh.plan_refresh(request, snapshot)
-        if decision.kind not in {"create_gate_stage", "wait"}:
-            raise RuntimeError("refresh adoption is not valid for ordinary gates")
+                "refresh workflow authority is conflicting"
+            ) from None
+        if hold_reason is not None:
+            raise RuntimeError(hold_reason)
 
 
 def finish_phase(
@@ -8189,6 +8312,9 @@ def finish_parent(
         raise RuntimeError("parent issue is not mutable")
 
     initial_snapshot = snapshot_loader()
+    refresh_hold_reason = _dedicated_refresh_hold_reason(initial_snapshot)
+    if refresh_hold_reason is not None:
+        raise RuntimeError(refresh_hold_reason)
     initial_decision = decide_parent_action(initial_snapshot)
     fresh_snapshot = snapshot_loader()
     fresh_decision = decide_parent_action(fresh_snapshot)

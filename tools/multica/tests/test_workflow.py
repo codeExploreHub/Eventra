@@ -3151,7 +3151,7 @@ class RefreshWorkflowTests(unittest.TestCase):
             child["detail"]["metadata"] = copy.deepcopy(child["metadata"])
         meta, detail, assignment = data["metadata"], data["parent"], data["assignment"]
         refresh_state = self.c.RefreshSnapshot(self.c.canonical_json(data))
-        superseded_ids = workflow_module._receipt_bound_superseded_gate_ids(
+        superseded_ids = workflow_module._request_bound_superseded_gate_ids(
             refresh_state)
         consumed_uuid = meta.get(
             workflow_module.REPAIR_AUTHORIZATION_CONSUMED_KEY, "")
@@ -3381,6 +3381,172 @@ class RefreshWorkflowTests(unittest.TestCase):
 
     def test_legacy_gate_decision_remains_unchanged(self):
         self.assertEqual(decide_parent_action(parent_snapshot()).kind, "create_gate_stage")
+
+    def test_competing_workflow_hold_classifies_every_legal_v2_prefix(self):
+        from tools.multica import refresh_executor
+        from tools.multica.tests.test_candidate_refresh import (
+            cancel_gate_fixture,
+            encode,
+            uid,
+            v2_reserved_fixture,
+        )
+        from tools.multica.tests.test_refresh_executor import (
+            MemoryRefreshAPI,
+            MemoryRefreshGit,
+            admitted_v2_execution,
+            prepared_v2_execution,
+        )
+
+        cases = []
+        intent = MemoryRefreshAPI()
+        intent.use_v2()
+        refresh_executor.stage_refresh_request(
+            intent, "PRO-900", intent.request)
+        cases.append((
+            "staged intent",
+            copy.deepcopy(intent.state),
+            "dedicated refresh request awaits exact member authorization",
+        ))
+        intent.publish_authorization()
+        intent.set_metadata(
+            "PRO-900", "eventra.refresh.request_comment", uid(12))
+        cases.append((
+            "grant binding wait",
+            copy.deepcopy(intent.state),
+            "dedicated refresh request awaits exact member authorization",
+        ))
+
+        request, reserved, reservation = v2_reserved_fixture()
+        cases.append((
+            "reserved",
+            copy.deepcopy(reserved),
+            "dedicated refresh cancellation requires execute-parent-refresh",
+        ))
+        cancel_gate_fixture(reserved, "independent_reviewer")
+        reservation["state"] = "review_cancelled"
+        reserved["metadata"]["eventra.refresh.reservation"] = encode(
+            reservation)
+        reserved["parent"]["metadata"] = copy.deepcopy(reserved["metadata"])
+        cases.append((
+            "review cancelled",
+            copy.deepcopy(reserved),
+            "dedicated refresh cancellation requires execute-parent-refresh",
+        ))
+        cancel_gate_fixture(reserved, "integration_qa")
+        reservation["state"] = "gates_cancelled"
+        reserved["metadata"]["eventra.refresh.reservation"] = encode(
+            reservation)
+        reserved["parent"]["metadata"] = copy.deepcopy(reserved["metadata"])
+        cases.append((
+            "gates cancelled",
+            copy.deepcopy(reserved),
+            "dedicated refresh execution requires execute-parent-refresh",
+        ))
+
+        dispatched, _, dispatched_request = admitted_v2_execution()
+        refresh_executor.execute_refresh(
+            dispatched,
+            MemoryRefreshGit(dispatched_request, dispatched),
+            "PRO-900",
+            uid(12),
+            uid(13),
+            self.c.refresh_action(dispatched_request),
+        )
+        cases.append((
+            "preparation pending",
+            copy.deepcopy(dispatched.state),
+            "dedicated refresh preparation requires finish-refresh",
+        ))
+
+        prepared, prepared_git, prepared_request = prepared_v2_execution()
+        prepared.fail_at = 2
+        with self.assertRaisesRegex(RuntimeError, "before effect"):
+            refresh_executor.execute_refresh(
+                prepared,
+                prepared_git,
+                "PRO-900",
+                uid(12),
+                uid(13),
+                self.c.refresh_action(prepared_request),
+            )
+        cases.append((
+            "candidate registered",
+            copy.deepcopy(prepared.state),
+            "dedicated refresh publication requires execute-parent-refresh",
+        ))
+        interrupted = copy.deepcopy(prepared.state)
+        publishing, publishing_git, publishing_request = prepared_v2_execution()
+        publishing.fail_at = 6
+        with self.assertRaisesRegex(RuntimeError, "before effect"):
+            refresh_executor.execute_refresh(
+                publishing,
+                publishing_git,
+                "PRO-900",
+                uid(12),
+                uid(13),
+                self.c.refresh_action(publishing_request),
+            )
+        interrupted = copy.deepcopy(publishing.state)
+        cases.append((
+            "adopted before cleanup",
+            interrupted,
+            "dedicated refresh publication requires execute-parent-refresh",
+        ))
+
+        for name, data, expected in cases:
+            with self.subTest(name=name):
+                self.assertEqual(
+                    workflow_module._dedicated_refresh_hold_reason(
+                        self.parent(data)
+                    ),
+                    expected,
+                )
+
+        _, adopted = self.v2_fixture()
+        self.assertIsNone(
+            workflow_module._dedicated_refresh_hold_reason(
+                self.parent(adopted)
+            )
+        )
+
+    def test_competing_parent_mutators_share_the_dedicated_refresh_hold(self):
+        from tools.multica import refresh_executor
+        from tools.multica.tests.test_refresh_executor import MemoryRefreshAPI
+
+        api = MemoryRefreshAPI()
+        api.use_v2()
+        refresh_executor.stage_refresh_request(api, "PRO-900", api.request)
+        held = self.parent(api.state)
+        reason = "dedicated refresh request awaits exact member authorization"
+
+        repair_runner = FakeRepairRunner(attempt=0)
+        before = repair_runner.committed_mutations
+        with patch.object(
+            workflow_module, "load_parent_snapshot", return_value=held
+        ):
+            repair = execute_parent_repair(
+                repair_runner,
+                FakeRepairGitHubRunner(),
+                "PRO-65",
+                expected_action_key="not-a-refresh-action",
+            )
+            smoke = execute_parent_smoke(
+                repair_runner,
+                SmokeExecutionTests.GitHub(),
+                "PRO-65",
+                expected_action_key="not-a-refresh-action",
+            )
+
+        self.assertEqual((repair.next_action, repair.reason), ("block", reason))
+        self.assertEqual((smoke.next_action, smoke.reason), ("block", reason))
+        self.assertEqual(repair_runner.committed_mutations, before)
+
+        parent_runner = FakeParentCompletionRunner()
+        with self.assertRaisesRegex(RuntimeError, reason):
+            finish_parent(parent_runner, "PRO-35", lambda: held)
+        self.assertFalse(any(
+            call[:2] == ("issue", "status") for call in parent_runner.calls
+        ))
 
     def test_paused_intent_does_not_fall_through_to_old_gate(self):
         _, data = self.fixture(state="intent")
@@ -3770,10 +3936,139 @@ class RefreshWorkflowTests(unittest.TestCase):
                     return copy.deepcopy(data["metadata"])
                 raise AssertionError(f"unexpected argv: {args!r}")
 
+        class API:
+            def snapshot(self, parent):
+                self.parent = parent
+                return self_snapshot
+
+        self_snapshot = self.c.RefreshSnapshot(self.c.canonical_json(data))
         detail = {"parent_issue_id": data["parent"]["id"]}
-        with self.assertRaisesRegex(RuntimeError, "dedicated finish-refresh"):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "dedicated refresh publication requires execute-parent-refresh",
+        ):
             workflow_module._reject_refresh_parent_for_ordinary_finish(
-                Runner(), detail, object())
+                Runner(), detail, API())
+
+    def test_v2_stage_four_gate_finishes_after_supersession_receipt(self):
+        _, adopted = self.v2_fixture()
+        data = self.gates(adopted)
+        target = next(
+            child for child in data["children"]
+            if child["detail"]["stage"] == 4
+            and child["metadata"]["eventra.phase.kind"] == "review"
+        )
+        evidence_uuid = target["metadata"]["eventra.phase.evidence_comment"]
+        evidence_content = target["evidence"]["content"]
+        target["detail"]["status"] = "in_review"
+        target["detail"]["status_category"] = "in_review"
+        target["metadata"].pop("eventra.phase.result")
+        target["metadata"].pop("eventra.phase.evidence_comment")
+        target["evidence"] = None
+        parent = self.parent(data)
+        target_key = str(target["detail"]["identifier"])
+        parent_id = str(data["parent"]["id"])
+        squad_id = str(data["assignment"]["squad_id"])
+
+        class Runner(FakeSnapshotFinishRunner):
+            def run(self, args, *, stdin_json=None):
+                call = tuple(args)
+                if call == (
+                    "squad", "get", squad_id, "--output", "json"
+                ):
+                    self.calls.append(call)
+                    return copy.deepcopy(self.assignment_squad_detail)
+                if call == (
+                    "squad", "member", "list", squad_id,
+                    "--output", "json",
+                ):
+                    self.calls.append(call)
+                    return copy.deepcopy(self.assignment_squad_members)
+                if call == ("issue", "get", parent_id, "--output", "json"):
+                    self.calls.append(call)
+                    return copy.deepcopy(self.parent)
+                if call == (
+                    "issue", "metadata", "list", parent_id,
+                    "--output", "json",
+                ):
+                    self.calls.append(call)
+                    return copy.deepcopy(self.parent_metadata)
+                return super().run(args, stdin_json=stdin_json)
+
+        runner = Runner(parent, target_key)
+        runner.parent["id"] = parent_id
+        runner.parent["project_id"] = data["parent"]["project_id"]
+        runner.parent["assignee_id"] = squad_id
+        for issue in runner.issues.values():
+            issue["parent_issue_id"] = parent_id
+        runner.parent_metadata = copy.deepcopy(data["metadata"])
+        roles = data["assignment"]["roles"]
+        current_roles = {
+            **roles,
+            "backend_engineer": "00000000-0000-4000-8000-000000000018",
+        }
+        runner.assignment_agents = [{
+            "id": identity,
+            "name": workflow_module.SQUAD_AGENT_NAMES[role],
+        } for role, identity in current_roles.items()]
+        runner.assignment_projects = [{
+            "id": data["assignment"]["projects"][repository],
+            "title": title,
+        } for repository, title in (
+            workflow_module.ASSIGNMENT_PROJECT_TITLES.items()
+        )]
+        runner.assignment_squads = [{
+            "id": squad_id,
+            "name": workflow_module.DELIVERY_SQUAD_NAME,
+        }]
+        runner.assignment_squad_detail = {
+            "id": squad_id,
+            "name": workflow_module.DELIVERY_SQUAD_NAME,
+            "description": "Coordinates Eventra delivery.",
+            "instructions": "Exact Eventra squad contract.",
+            "leader_id": data["assignment"]["lead_id"],
+        }
+        runner.assignment_squad_members = [{
+            "id": f"membership-{index}",
+            "squad_id": squad_id,
+            "member_id": identity,
+            "member_type": "agent",
+            "role": "leader" if role == "delivery_lead" else role,
+        } for index, (role, identity) in enumerate(
+            sorted(current_roles.items()), start=1
+        )]
+        runner.evidence_comments[target_key] = [{
+            "id": evidence_uuid,
+            "issue_id": runner.issues[target_key]["id"],
+            "author_id": roles["independent_reviewer"],
+            "author_type": "agent",
+            "content": evidence_content,
+        }]
+
+        class API:
+            def snapshot(self, parent_key):
+                self.parent_key = parent_key
+                return parent.refresh_state
+
+        result = finish_phase(
+            runner,
+            target_key,
+            PhaseCompletion(
+                kind="review",
+                result="pass",
+                attempt=0,
+                evidence_comment=evidence_uuid,
+                frontend_sha=data["metadata"][
+                    "eventra.workflow.frontend_sha"
+                ],
+                backend_sha=None,
+                pr_url=None,
+            ),
+            refresh_api=API(),
+        )
+
+        self.assertEqual((result.status, result.result), ("done", "pass"))
+        self.assertGreater(runner.mutation_count, 0)
 
     def test_v2_plan_requires_explicit_flag_and_prints_zero_write_preview(self):
         from tools.multica.tests.test_candidate_refresh import pristine_gate_snapshot
@@ -6794,6 +7089,26 @@ def stalled_workflow(**overrides):
 
 
 class RecoveryDecisionTests(unittest.TestCase):
+    def test_recovery_holds_every_legal_dedicated_refresh_prefix(self):
+        reasons = (
+            "dedicated refresh request awaits exact member authorization",
+            "dedicated refresh cancellation requires execute-parent-refresh",
+            "dedicated refresh preparation requires finish-refresh",
+            "dedicated refresh publication requires execute-parent-refresh",
+        )
+        for reason in reasons:
+            with self.subTest(reason=reason):
+                snapshot = replace(
+                    stalled_workflow(),
+                    refresh_hold_reason=reason,
+                )
+
+                decision = decide_recovery(snapshot)
+
+                self.assertEqual(decision.kind, "noop")
+                self.assertIsNone(decision.issue_key)
+                self.assertEqual(decision.reason, reason)
+
     def test_recovery_reports_refresh_reservation_without_rerunning_work(self):
         snapshot = replace(
             stalled_workflow(), refresh_reservation_state="published")
@@ -7541,6 +7856,139 @@ class WatchWorkflowTests(unittest.TestCase):
         )
 
     @staticmethod
+    def _v2_refresh_runner(data):
+        roles = data["assignment"]["roles"]
+        projects = data["assignment"]["projects"]
+        squad_id = data["assignment"]["squad_id"]
+        lead_id = data["assignment"]["lead_id"]
+
+        class Runner(FakeWatchRunner):
+            PROJECTS = (projects["frontend"], projects["backend"])
+
+            def run(self, args, *, stdin_json=None):
+                call = tuple(args)
+                if call == ("agent", "list", "--output", "json"):
+                    self.calls.append(call)
+                    return [{
+                        "id": lead_id,
+                        "name": workflow_module.SQUAD_AGENT_NAMES[
+                            workflow_module.DELIVERY_LEAD_ROLE
+                        ],
+                    }, *[
+                        {
+                            "id": roles[role],
+                            "name": workflow_module.ASSIGNMENT_AGENT_NAMES[role],
+                        }
+                        for role in workflow_module.ASSIGNMENT_AGENT_NAMES
+                    ]]
+                if call == ("project", "list", "--output", "json"):
+                    self.calls.append(call)
+                    return [
+                        {
+                            "id": projects[repository],
+                            "title": title,
+                        }
+                        for repository, title in (
+                            workflow_module.ASSIGNMENT_PROJECT_TITLES.items()
+                        )
+                    ]
+                if call == ("squad", "list", "--output", "json"):
+                    self.calls.append(call)
+                    return copy.deepcopy(self.squads)
+                if call == (
+                    "squad", "get", squad_id, "--output", "json"
+                ):
+                    self.calls.append(call)
+                    return copy.deepcopy(self.squad_detail)
+                if call == (
+                    "squad", "member", "list", squad_id,
+                    "--output", "json",
+                ):
+                    self.calls.append(call)
+                    return copy.deepcopy(self.squad_members)
+                return super().run(args, stdin_json=stdin_json)
+
+        runner = Runner()
+        runner.parent = copy.deepcopy(data["parent"])
+        runner.children = [
+            copy.deepcopy(item["detail"]) for item in data["children"]
+        ]
+        runner.child = runner.children[-1]
+        runner.metadata = {
+            runner.parent["identifier"]: copy.deepcopy(data["metadata"]),
+            **{
+                item["detail"]["identifier"]: copy.deepcopy(item["metadata"])
+                for item in data["children"]
+            },
+        }
+        issue_keys = {
+            runner.parent["id"]: runner.parent["identifier"],
+            **{
+                item["detail"]["id"]: item["detail"]["identifier"]
+                for item in data["children"]
+            },
+        }
+        runner.runs = {key: [] for key in issue_keys.values()}
+        for run in data["runs"]:
+            runner.runs[issue_keys[run["issue_id"]]].append(
+                copy.deepcopy(run)
+            )
+        runner.evidence_comments = {
+            runner.parent["identifier"]: [
+                {**copy.deepcopy(item), "id": item["comment_uuid"]}
+                for item in data["comments"]
+            ]
+        }
+        for item in data["children"]:
+            evidence = item.get("evidence")
+            if evidence is not None:
+                runner.evidence_comments[item["detail"]["identifier"]] = [{
+                    **copy.deepcopy(evidence),
+                    "id": evidence["comment_uuid"],
+                }]
+        runner.squads = [{
+            "id": squad_id,
+            "name": "Eventra Local Delivery",
+        }]
+        runner.squad_detail = {
+            "id": squad_id,
+            "name": "Eventra Local Delivery",
+            "description": "Coordinates Eventra delivery.",
+            "instructions": "Exact Eventra squad contract.",
+            "leader_id": lead_id,
+        }
+        runner.squad_members = [
+            {
+                "id": f"membership-{index}",
+                "squad_id": squad_id,
+                "member_id": member_id,
+                "member_type": "agent",
+                "role": (
+                    "leader"
+                    if role == workflow_module.DELIVERY_LEAD_ROLE
+                    else role
+                ),
+            }
+            for index, (role, member_id) in enumerate(
+                sorted(roles.items()), start=1
+            )
+        ]
+
+        class GitHub:
+            def run(self, args):
+                return {
+                    "url": data["pr"]["url"],
+                    "headRefOid": data["pr"]["head_sha"],
+                    "state": str(data["pr"]["state"]).upper(),
+                    "mergeable": "MERGEABLE",
+                    "mergeStateStatus": "CLEAN",
+                    "statusCheckRollup": [],
+                }
+
+        runner.github = GitHub()
+        return runner
+
+    @staticmethod
     def _round_three_gate_runner(*, active: bool):
         fixture = RefreshWorkflowTests(
             methodName=(
@@ -7581,7 +8029,7 @@ class WatchWorkflowTests(unittest.TestCase):
                     result = self._watch(runner, apply=apply)
 
                     self.assertEqual(result.applied, 0)
-                    self.assertEqual(result.decision, "noop")
+                    self.assertEqual(result.decision, "noop", result.reason)
                     self.assertFalse(any(
                         call[:2] == ("issue", "rerun")
                         for call in runner.calls))
@@ -7633,6 +8081,189 @@ class WatchWorkflowTests(unittest.TestCase):
                     self.assertIn("execute-parent-refresh", result.reason)
                     self.assertFalse(any(call[:2] == ("issue", "rerun")
                                          for call in runner.calls))
+
+    def test_watcher_apply_holds_every_executable_v2_refresh_prefix(self):
+        from tools.multica import refresh_executor
+        from tools.multica.tests.test_candidate_refresh import (
+            encode,
+            prepared_payload,
+            uid,
+        )
+        from tools.multica.tests.test_refresh_executor import (
+            MemoryRefreshGit,
+            MemoryRefreshAPI,
+        )
+
+        def admitted_execution():
+            api = MemoryRefreshAPI()
+            api.use_v2()
+            roles = api.state["assignment"]["roles"]
+            roles["backend_engineer"] = uid(18)
+            api.state["assignment"]["members"] = [
+                {
+                    "member_id": member_id,
+                    "member_type": "agent",
+                    "role": "leader" if role == "delivery_lead" else role,
+                }
+                for role, member_id in sorted(roles.items())
+            ]
+            api.request = workflow_module.refresh.freeze_refresh_request(
+                workflow_module.refresh.RefreshSnapshot(
+                    workflow_module.refresh.canonical_json(api.state)
+                ),
+                supersede_pristine_gates=True,
+            )
+            refresh_executor.stage_refresh_request(
+                api, "PRO-900", api.request
+            )
+            api.publish_authorization()
+            api.writes.clear()
+            api.write_index = 0
+            return api, MemoryRefreshGit(api.request, api), api.request
+
+        def prepared_execution():
+            api, git, request = admitted_execution()
+            refresh_executor.execute_refresh(
+                api,
+                git,
+                "PRO-900",
+                uid(12),
+                uid(13),
+                workflow_module.refresh.refresh_action(request),
+            )
+            child = next(
+                item for item in api.state["children"]
+                if item["metadata"].get("eventra.phase.kind") == "refresh"
+            )
+            payload = prepared_payload(request)
+            payload["schema_version"] = 2
+            payload["child_id"] = child["detail"]["id"]
+            payload["context_receipt"]["task_id"] = (
+                child["detail"]["identifier"]
+            )
+            evidence_uuid = uid(93)
+            api.add_comment(
+                child["detail"]["identifier"],
+                workflow_module.refresh.RefreshComment(
+                    child["detail"]["id"],
+                    evidence_uuid,
+                    request.payload()["assignment"]["engineer_id"],
+                    "agent",
+                    1,
+                    "Preparation only; no PR publication.\n"
+                    "```eventra-candidate-refresh-prepared-v2\n"
+                    + encode(payload)
+                    + "\n```",
+                ),
+            )
+            refresh_executor.finish_refresh(
+                api,
+                git,
+                child["detail"]["identifier"],
+                evidence_uuid,
+                "pass",
+            )
+            api.writes.clear()
+            api.write_index = 0
+            return api, git, request
+
+        dispatched, _, request = admitted_execution()
+        refresh_executor.execute_refresh(
+            dispatched,
+            MemoryRefreshGit(request, dispatched),
+            "PRO-900",
+            uid(12),
+            uid(13),
+            workflow_module.refresh.refresh_action(request),
+        )
+
+        registered, registered_git, registered_request = prepared_execution()
+        registered.fail_at = 2
+        with self.assertRaisesRegex(RuntimeError, "before effect"):
+            refresh_executor.execute_refresh(
+                registered,
+                registered_git,
+                "PRO-900",
+                uid(12),
+                uid(13),
+                workflow_module.refresh.refresh_action(registered_request),
+            )
+
+        cleanup, cleanup_git, cleanup_request = prepared_execution()
+        cleanup.fail_at = 6
+        with self.assertRaisesRegex(RuntimeError, "before effect"):
+            refresh_executor.execute_refresh(
+                cleanup,
+                cleanup_git,
+                "PRO-900",
+                uid(12),
+                uid(13),
+                workflow_module.refresh.refresh_action(cleanup_request),
+            )
+
+        cases = (
+            (dispatched.state,
+             "dedicated refresh preparation requires finish-refresh"),
+            (registered.state,
+             "dedicated refresh publication requires execute-parent-refresh"),
+            (cleanup.state,
+             "dedicated refresh publication requires execute-parent-refresh"),
+        )
+        for data, reason in cases:
+            for apply in (False, True):
+                with self.subTest(reason=reason, apply=apply):
+                    case_data = copy.deepcopy(data)
+                    runner = self._v2_refresh_runner(case_data)
+
+                    result = self._watch(
+                        runner,
+                        apply=apply,
+                        refresh_api=self._refresh_api(case_data),
+                    )
+
+                    self.assertEqual(result.applied, 0)
+                    self.assertEqual(result.decision, "noop", result.reason)
+                    self.assertEqual(result.reason, reason)
+                    self.assertFalse(any(
+                        call[:2] == ("issue", "rerun")
+                        for call in runner.calls
+                    ))
+
+        malformed_cases = {}
+        unknown = copy.deepcopy(dispatched.state)
+        unknown["metadata"]["eventra.refresh.unexpected"] = "value"
+        unknown["parent"]["metadata"] = copy.deepcopy(unknown["metadata"])
+        malformed_cases["unknown refresh field"] = unknown
+        typed = copy.deepcopy(dispatched.state)
+        reservation = json.loads(
+            typed["metadata"]["eventra.refresh.reservation"]
+        )
+        reservation["parent_position"] = "not-an-integer"
+        typed["metadata"]["eventra.refresh.reservation"] = json.dumps(
+            reservation, sort_keys=True, separators=(",", ":")
+        )
+        typed["parent"]["metadata"] = copy.deepcopy(typed["metadata"])
+        malformed_cases["typed invalid reservation"] = typed
+        for label, data in malformed_cases.items():
+            with self.subTest(label=label):
+                runner = self._v2_refresh_runner(data)
+
+                result = self._watch(
+                    runner,
+                    apply=True,
+                    refresh_api=self._refresh_api(data),
+                )
+
+                self.assertEqual(result.decision, "block")
+                self.assertEqual(
+                    result.reason,
+                    "refresh workflow metadata is malformed",
+                )
+                self.assertEqual(result.applied, 0)
+                self.assertFalse(any(
+                    call[:2] == ("issue", "rerun")
+                    for call in runner.calls
+                ))
 
     def test_watcher_surfaces_malformed_refresh_metadata_as_block(self):
         runner = FakeWatchRunner()

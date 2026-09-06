@@ -36,6 +36,19 @@ payloads, or raw logs. Knowledge changes use a separate knowledge pull request
 with independent human review; QA neither edits business code nor self-merges
 knowledge.
 
+## Controlled refresh gate selection
+
+When a parent carries `eventra.refresh.version=2`, ignore the cancelled
+pristine Stage 2 QA child. It remains immutable superseded history and cannot
+be reused as a verdict or failure source. Accept work only from the fresh Stage
+4 QA child created after the permanent `eventra.refresh.supersession` receipt
+is durable and the refresh reservation has been removed. Reread the receipt,
+Stage 4 creation action, exact candidate SHA, assignee, Project, and managed PR
+before testing. Stop on a missing receipt, an active reservation, a reused
+Stage 2 child, or any SHA mismatch. A refresh grant authorizes candidate
+preparation only; it never authorizes QA PASS, merge, Smoke, deployment, or
+production mutation.
+
 ## Exact-SHA worktree preparation
 
 Require an explicit gate handoff with `runtime_workspace`,

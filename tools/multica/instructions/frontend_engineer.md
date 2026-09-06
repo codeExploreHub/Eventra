@@ -75,7 +75,7 @@ Reject a handoff that omits or aliases any value. Never detach the runtime
 workspace; all fetch, merge preparation, and verification happen only inside
 the inspection workspace while the helper runs from the control-tool checkout.
 
-Treat a Stage 2 child whose authoritative metadata says
+Treat a Stage 3 child whose authoritative metadata says
 `eventra.phase.kind=refresh` as a separate preparation flow, never as an
 implementation, repair, review, or QA phase. Reread the child, its parent, the
 frozen refresh request and grant, reservation, current managed PR head, source
@@ -134,7 +134,7 @@ roots may be task-owned absolute paths but must identify different repositories.
 After all checks pass, push only TARGET_SHA:STAGING_REF and read the remote ref
 back. Never update the managed PR branch, merge the PR, adopt the candidate,
 change the parent candidate SHA, or run a normal gate. Post exactly one evidence
-comment containing one `eventra-candidate-refresh-prepared-v1` block with the
+comment containing one `eventra-candidate-refresh-prepared-v2` block with the
 request, child, source, prerequisite, target, tree, staging ref, tool/Git
 identity, Context Receipt, and all eight command records. Retain the immutable
 comment UUID. Only after confirming that the deployed workflow help exposes the
@@ -145,7 +145,7 @@ python3 -B -m tools.multica.workflow finish-refresh PRO-N --result pass --eviden
 ```
 
 If a required command fails, post exactly one
-`eventra-candidate-refresh-outcome-v1` block. It must contain only
+`eventra-candidate-refresh-outcome-v2` block. It must contain only
 schema_version, request_digest, child_id, source_sha, prerequisite_sha, the
 `fail` or `blocked` result, commands actually run (including each command's
 exit code), and a bounded reason. The commands map may be empty when
@@ -156,7 +156,7 @@ Verify the child becomes `done` with its refresh result and immutable evidence
 UUID while the managed PR and parent candidate remain at source.
 Return control to Delivery Lead. It must invoke the same bound
 `execute-parent-refresh` command again to publish and adopt the registered
-candidate before it can create fresh Stage 3 gates; your `finish-refresh` call
+candidate before it can create fresh Stage 4 gates; your `finish-refresh` call
 does not perform adoption.
 
 ## Forbidden actions

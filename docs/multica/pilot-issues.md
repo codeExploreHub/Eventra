@@ -18,7 +18,7 @@ path. Never infer its Multica scope, workspace paths, `control_tool_sha`, or
 mutation contract from ambient state. Use only this five-invocation sequence:
 
 ```text
-python3 -B -m tools.multica.workflow plan-refresh PRO-M --prerequisite-pr https://github.com/codeExploreHub/Eventra/pull/N --control-tool-sha FULL_SHA > REFRESH_PLAN.json
+python3 -B -m tools.multica.workflow plan-refresh PRO-M --prerequisite-pr https://github.com/codeExploreHub/Eventra/pull/N --control-tool-sha FULL_SHA --supersede-pristine-gates > REFRESH_PLAN.json
 python3 -B -m tools.multica.workflow stage-refresh-request PRO-M --request-file REFRESH_PLAN.json
 python3 -B -m tools.multica.workflow execute-parent-refresh PRO-M --request-comment REQUEST_UUID --authorization-comment GRANT_UUID --expected-action-key ACTION_KEY
 python3 -B -m tools.multica.workflow finish-refresh PRO-N --result pass|fail|blocked --evidence-comment COMMENT_UUID
@@ -28,13 +28,15 @@ python3 -B -m tools.multica.workflow execute-parent-refresh PRO-M --request-comm
 Save the whole `plan-refresh` JSON. It contains `action_key`, the exact request
 comment, and the exact member grant. Stage that file, post the request, obtain a
 separate member-authored grant and retain both UUIDs, then run the first execute
-to dispatch Stage 2. After `finish-refresh`, repeat execute with the same bound
+to cancel only the request-bound pristine Stage 2 Review/QA children and
+dispatch the preparation child in Stage 3. After `finish-refresh`, repeat
+execute with the same bound
 UUIDs and action key; continue only when it returns `adopted`.
 
 The worker, Reviewer, and QA handoffs distinguish `runtime_workspace` from a
 task-owned `inspection_workspace` and bind `candidate_sha` plus
 `control_tool_sha`; never detach the runtime workspace. A prepared PASS is not
-QA and cannot release the merge hold. It must be followed by a fresh Stage 3
+QA and cannot release the merge hold. It must be followed by a fresh Stage 4
 whose Independent Reviewer and Integration QA independently fetch and verify
 the exact candidate. Repair preserves the hold, and a member's later
 exact-candidate merge authorization is independent of the request/grant.
@@ -302,6 +304,31 @@ Independent Reviewer (exact SHA pair) and Integration QA (same exact SHA pair)
 → Delivery Lead coordinated merge decision. Any changed SHA invalidates the
 corresponding review or QA result and returns to its owning child.
 
+## PRO-122 controlled supersession pilot identities
+
+Use these identities only as the expected topology for a future explicitly
+approved live run; this document does not claim that any refresh mutation has
+happened:
+
+- `PRO-122`: frontend-only parent and sole refresh transaction owner.
+- `PRO-123`: completed Stage 1 implementation source whose exact PASS evidence,
+  managed PR, and source SHA are frozen by the request.
+- `PRO-124`: pristine Stage 2 Independent Reviewer child eligible for ordered
+  `--no-start` cancellation only when its ID, revision, assignment, empty
+  metadata/history, and authority digest match the request.
+- `PRO-125`: pristine Stage 2 Integration QA child eligible for the second
+  ordered cancellation under the same exact checks.
+
+Expected transition: freeze and preview with zero writes; stage the request;
+post the exact Delivery Lead request and separate member grant; cancel
+`PRO-124` then `PRO-125`; create one Stage 3 refresh preparation child; finish
+it with immutable v2 evidence; publish/adopt once; persist the permanent
+supersession receipt; remove the reservation; then create fresh Stage 4 Review
+and QA children at the adopted SHA. The cancelled Issues remain visible and
+must never be deleted, reopened, counted as gates, or used as repair evidence.
+Merge, Smoke, deployment, and production mutation require their existing
+separate authorities.
+
 ## Candidate refresh control-plane verification
 
 The 2026-09-06 isolated control-plane run is evidence for the helper code only;
@@ -310,7 +337,8 @@ combined tests cover every baseline-recorded mutation boundary before and after
 its effect, reject incompatible external writes without later effects, and use
 a real temporary Git repository plus bare remote for the complete refresh path.
 That path preserves Stage 1, leaves remote `master` unchanged, adopts only the
-staged candidate, requires fresh Stage 3 Reviewer and QA gates, and ends at
+staged candidate, requires ordered Stage 2 cancellation, Stage 3 preparation,
+and fresh Stage 4 Reviewer and QA gates, and ends at
 `human merge approval required` without deployment or Smoke.
 
 The serial frontend receipt is: local contract 4 PASS, footer metadata 14 PASS,
