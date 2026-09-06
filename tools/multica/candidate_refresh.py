@@ -684,7 +684,7 @@ def authority_projection(snapshot: RefreshSnapshot, *,
     if not supersede_pristine_gates:
         _require(len(state["children"]) == 1,
                  "refresh freeze requires one source child")
-    source = _object(sources[0], "detail metadata evidence")
+    source = _object(sources[0], "detail metadata evidence comment_manifest")
     detail = _issue_detail(source["detail"], "unknown source authority field")
     _require(detail["metadata"] == source["metadata"], "source metadata echo conflict")
     _require(detail["parent_issue_id"] == parent["id"] and detail["stage"] == 1
@@ -706,6 +706,8 @@ def authority_projection(snapshot: RefreshSnapshot, *,
         "prerequisite": state["prerequisite"], "tool": state["tool"],
     }
     if supersede_pristine_gates:
+        projection["source"]["comment_manifest"] = source["comment_manifest"]
+        projection["runs"] = state["runs"]
         projection["supersession"] = {
             "mode": "cancel-pristine-gates-v1",
             "gates": _pristine_gate_records(state),
@@ -731,12 +733,85 @@ def _snapshot(snapshot: RefreshSnapshot) -> dict[str, Any]:
     _require(all(type(k) is str and type(v) is str for k, v in state["metadata"].items()))
     _require(state["parent"].get("metadata") == state["metadata"],
              "parent metadata echo conflict")
-    for child in state["children"]:
-        _require(type(child) is dict and type(child.get("detail")) is dict
-                 and child["detail"].get("metadata") == child.get("metadata"),
-                 "child metadata echo conflict")
     manifest_fields = {"issue_id", "comment_uuid", "author_id", "author_type", "type",
                        "revision", "parent_id", "created_at", "content_digest"}
+    observed_issue_ids = {state["parent"].get("id")}
+    for raw_child in state["children"]:
+        child = _object(raw_child, "detail metadata evidence comment_manifest")
+        _require(type(child["detail"]) is dict and type(child["metadata"]) is dict
+                 and child["detail"].get("metadata") == child["metadata"],
+                 "child metadata echo conflict")
+        issue_id, evidence = child["detail"].get("id"), child["evidence"]
+        _uuid(issue_id)
+        _require(issue_id not in observed_issue_ids,
+                 "duplicate refresh issue authority")
+        observed_issue_ids.add(issue_id)
+        _require(type(child["comment_manifest"]) is list,
+                 "invalid child comment manifest")
+        child_seen, child_parents = set(), {}
+        for item in child["comment_manifest"]:
+            _require(type(item) is dict and set(item) == manifest_fields,
+                     "invalid child comment manifest")
+            _uuid(item["issue_id"]); _uuid(item["comment_uuid"])
+            _history_identity(item["author_id"], item["author_type"], item["type"])
+            _require(item["issue_id"] == issue_id,
+                     "invalid child comment manifest identity")
+            _integer(item["revision"])
+            if item["parent_id"] is not None:
+                _uuid(item["parent_id"])
+            _require(type(item["created_at"]) is str,
+                     "invalid child comment manifest time")
+            try:
+                created = datetime.fromisoformat(item["created_at"].replace("Z", "+00:00"))
+            except ValueError:
+                raise ValueError("invalid child comment manifest time") from None
+            _require(created.tzinfo is not None,
+                     "invalid child comment manifest time")
+            _match(item["content_digest"], _DIGEST)
+            _require(item["comment_uuid"] not in child_seen,
+                     "duplicate child comment manifest")
+            child_seen.add(item["comment_uuid"])
+            child_parents[item["comment_uuid"]] = item["parent_id"]
+        _require(child["comment_manifest"] == sorted(
+            child["comment_manifest"], key=lambda item: item["comment_uuid"]),
+            "noncanonical child comment manifest")
+        for comment_uuid, parent_id in child_parents.items():
+            _require(parent_id is None or parent_id in child_seen,
+                     "incomplete child comment manifest thread")
+            lineage, current = set(), comment_uuid
+            while current is not None:
+                _require(current not in lineage,
+                         "cyclic child comment manifest thread")
+                lineage.add(current)
+                current = child_parents[current]
+        evidence_uuid = child["metadata"].get("eventra.phase.evidence_comment")
+        _require((evidence_uuid is None) == (evidence is None),
+                 "child comment manifest mismatch")
+        if evidence is not None:
+            try:
+                comment = RefreshComment(**evidence)
+            except TypeError:
+                raise ValueError("child comment manifest mismatch") from None
+            _comment(comment, issue_id, comment.author_type)
+            matches = [item for item in child["comment_manifest"]
+                       if item["comment_uuid"] == comment.comment_uuid]
+            _require(len(matches) == 1 and evidence_uuid == comment.comment_uuid,
+                     "child comment manifest mismatch")
+            item = matches[0]
+            _require(item["type"] == "comment"
+                     and item["author_id"] == comment.author_id
+                     and item["author_type"] == comment.author_type
+                     and item["revision"] == comment.revision
+                     and item["content_digest"] == hashlib.sha256(
+                         comment.content.encode("utf-8")).hexdigest(),
+                     "child comment manifest mismatch")
+    seen_runs = set()
+    for run in state["runs"]:
+        _require(type(run) is dict and run.get("issue_id") in observed_issue_ids,
+                 "unbound refresh run")
+        _uuid(run.get("id")); _uuid(run.get("agent_id"))
+        _require(run["id"] not in seen_runs, "duplicate refresh run")
+        seen_runs.add(run["id"])
     parent_id, seen, manifest_comment_ids = state["parent"].get("id"), set(), set()
     normalized = {}
     for raw in state["comments"]:
@@ -814,7 +889,7 @@ def _source_authority(payload: dict, state: dict) -> dict:
     children = state["children"]
     matches = [child for child in children if child.get("detail", {}).get("id") == source["child_id"]]
     _require(len(matches) == 1, "missing or duplicate source child")
-    child = _object(matches[0], "detail metadata evidence")
+    child = _object(matches[0], "detail metadata evidence comment_manifest")
     detail, metadata, evidence = child["detail"], child["metadata"], child["evidence"]
     _require(type(detail) is dict and type(metadata) is dict and type(evidence) is dict, "invalid source")
     expected = {"id": source["child_id"], "identifier": source["child_identifier"],
@@ -922,7 +997,7 @@ def freeze_refresh_request(snapshot: RefreshSnapshot, *,
     sources = [child for child in state["children"]
                if child.get("detail", {}).get("stage") == 1]
     _require(len(sources) == 1, "refresh freeze requires one source child")
-    source = _object(sources[0], "detail metadata evidence")
+    source = _object(sources[0], "detail metadata evidence comment_manifest")
     detail, source_metadata, evidence = source["detail"], source["metadata"], source["evidence"]
     _require(type(evidence) is dict, "missing source evidence")
     parent, metadata, assignment = state["parent"], state["metadata"], state["assignment"]
@@ -1061,7 +1136,10 @@ def validate_initial_refresh_progress(request: RefreshRequest,
     frozen["parent"]["revision"] = payload["parent"]["revision"]
     frozen["parent"]["metadata"] = frozen["metadata"]
     frozen_snapshot = RefreshSnapshot(canonical_json(frozen))
-    _require(authority_digest(frozen_snapshot) == payload["baseline"]["authority_digest"],
+    _require(authority_digest(
+        frozen_snapshot,
+        supersede_pristine_gates=payload["schema_version"] == 2,
+    ) == payload["baseline"]["authority_digest"],
              "frozen refresh authority changed")
     _entry_authority(payload, frozen_snapshot.state())
     _require(state["parent"].get("revision") == payload["parent"]["revision"]
@@ -1156,7 +1234,7 @@ def _refresh_child(request: RefreshRequest, state: dict) -> tuple[dict, Prepared
     payload = request.payload()
     matches = [child for child in state["children"] if child["detail"]["stage"] == 2]
     _require(len(matches) == 1, "refresh Stage 2 membership mismatch")
-    child = _object(matches[0], "detail metadata evidence")
+    child = _object(matches[0], "detail metadata evidence comment_manifest")
     detail, metadata = child["detail"], child["metadata"]
     _uuid(detail["id"])
     _match(detail["identifier"], _ISSUE)
@@ -1203,7 +1281,7 @@ def _reserved_refresh_child(request: RefreshRequest, state: dict) -> None:
     matches = [item for item in state["children"]
                if item["detail"]["id"] != payload["source"]["child_id"]]
     _require(len(matches) == 1, "reserved refresh child membership mismatch")
-    child = _object(matches[0], "detail metadata evidence")
+    child = _object(matches[0], "detail metadata evidence comment_manifest")
     detail, metadata = child["detail"], child["metadata"]
     action = refresh_action(request)
     expected_detail = {

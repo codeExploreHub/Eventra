@@ -26,7 +26,8 @@ def refresh_snapshot_fixture(*, state="candidate_registered", adopted=False):
         return request, data
     data = {"parent": copy.deepcopy(boundary.parent), "metadata": copy.deepcopy(boundary.metadata),
             "children": [{"detail": copy.deepcopy(boundary.child), "metadata": copy.deepcopy(boundary.child_metadata),
-                          "evidence": comment(boundary.evidence, uid(3))}], "runs": [],
+                          "evidence": comment(boundary.evidence, uid(3)),
+                          "comment_manifest": c.comment_manifest([boundary.evidence], uid(3))}], "runs": [],
             "comments": [], "comment_manifest": [],
             "pr": {**boundary.payload["pr"], "head_sha": "b" * 40, "state": "open", "merged": False},
             "prerequisite": {**boundary.payload["prerequisite"], "merged": True, "ancestor_sha": "d" * 40},
@@ -63,8 +64,10 @@ def refresh_snapshot_fixture(*, state="candidate_registered", adopted=False):
     if state == "admitted":
         return finish(request, data)
     prepared_block = prepared_payload(request)
-    prepared_comment = {"issue_id": uid(9), "comment_uuid": uid(13), "author_id": uid(8), "author_type": "agent",
-                        "revision": 1, "content": block("prepared", prepared_block)}
+    prepared_record = {"id": uid(13), "issue_id": uid(9), "author_id": uid(8), "author_type": "agent",
+                       "revision": 1, "type": "comment", "created_at": "2026-09-04T01:03:00Z",
+                       "content": block("prepared", prepared_block)}
+    prepared_comment = comment(prepared_record, uid(9))
     prepared = {"request_digest": request.digest, "child_id": uid(9), "source_sha": "b" * 40,
                 "prerequisite_sha": "d" * 40, "target_sha": "f" * 40, "tree_sha": "1" * 40,
                 "evidence_uuid": uid(13), "evidence_digest": hashlib.sha256(prepared_comment["content"].encode()).hexdigest(),
@@ -81,7 +84,8 @@ def refresh_snapshot_fixture(*, state="candidate_registered", adopted=False):
                     "eventra.refresh.version": "1", "eventra.refresh.request_digest": request.digest, "eventra.refresh.source_sha": "b" * 40}
         data["children"].append({"detail": issue_detail(id=uid(9), identifier="PRO-902", parent_issue_id=uid(2), stage=2,
                                           project_id=uid(5), assignee_id=uid(8), status="done", workspace_id=uid(1)),
-                                  "metadata": metadata, "evidence": prepared_comment})
+                                  "metadata": metadata, "evidence": prepared_comment,
+                                  "comment_manifest": c.comment_manifest([prepared_record], uid(9))})
     if adopted:
         consumed = {"version": 1, "request_digest": request.digest, "authorization_uuid": uid(10),
                     "child_id": uid(9), "target_sha": "f" * 40}
@@ -341,6 +345,9 @@ def pristine_gate_snapshot():
 
     payload = request_payload()
     evidence_content = "Original Stage 1 PASS for " + payload["source"]["sha"]
+    evidence_record = {"id": uid(4), "issue_id": uid(3), "author_id": uid(8),
+                       "author_type": "agent", "revision": 1, "type": "comment",
+                       "created_at": "2026-09-04T01:00:00Z", "content": evidence_content}
     evidence = {"issue_id": uid(3), "comment_uuid": uid(4),
                 "author_id": uid(8), "author_type": "agent", "revision": 1,
                 "content": evidence_content}
@@ -398,7 +405,8 @@ def pristine_gate_snapshot():
     state = {
         "parent": parent, "metadata": metadata,
         "children": [
-            {"detail": source, "metadata": source_metadata, "evidence": evidence},
+            {"detail": source, "metadata": source_metadata, "evidence": evidence,
+             "comment_manifest": c.comment_manifest([evidence_record], uid(3))},
             gate(14, "independent_reviewer", "PRO-900 frontend review", uid(16)),
             gate(15, "integration_qa", "PRO-900 frontend QA", uid(17)),
         ],
@@ -782,6 +790,35 @@ class BaselineContractTests(ContractCase):
         for state in cases:
             with self.subTest(state=state["parent"].get("status")), self.assertRaises(ValueError):
                 self.api.authority_projection(self.api.RefreshSnapshot(encode(state)))
+
+    def test_v2_authority_digest_binds_child_manifests_and_all_runs(self):
+        state = pristine_gate_snapshot().state()
+        baseline = self.api.authority_digest(
+            self.api.RefreshSnapshot(encode(state)),
+            supersede_pristine_gates=True)
+        source_history = copy.deepcopy(state)
+        source_history["children"][0]["comment_manifest"].append({
+            "issue_id": uid(3), "comment_uuid": uid(70),
+            "author_id": "00000000-0000-0000-0000-000000000000",
+            "author_type": "system", "type": "system", "revision": 1,
+            "parent_id": None, "created_at": "2026-09-05T01:00:00Z",
+            "content_digest": hashlib.sha256(b"history").hexdigest(),
+        })
+        completed_run = copy.deepcopy(state)
+        completed_run["runs"].append({
+            "id": uid(71), "issue_id": uid(2), "agent_id": uid(7),
+            "status": "completed", "created_at": "2026-09-05T01:00:00Z",
+            "activity_at": "2026-09-05T01:01:00Z",
+        })
+
+        for changed in (source_history, completed_run):
+            with self.subTest(kind="manifest" if changed is source_history else "run"):
+                self.assertNotEqual(
+                    self.api.authority_digest(
+                        self.api.RefreshSnapshot(encode(changed)),
+                        supersede_pristine_gates=True),
+                    baseline,
+                )
 
     def test_metadata_budget_counts_whole_ascii_encoded_map_and_request(self):
         self.assertTrue(hasattr(self.api, "validate_metadata_budget"),

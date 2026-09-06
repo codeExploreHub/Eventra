@@ -72,6 +72,31 @@ class ReadBoundary:
                         for index, (role, agent_id) in enumerate(self.role_ids.items())]
         self.mutate_on_read = None
 
+    def add_pristine_gates(self):
+        gate_action = ("2:PRO-900:create_gate_stage:0:frontend:" + "b" * 40
+                       + ":-:next-stage:2")
+        for number, role, suffix in (
+                (14, "independent_reviewer", "review"),
+                (15, "integration_qa", "QA")):
+            identifier = f"PRO-{888 + number}"
+            description = (
+                f"## Exact-SHA scope\n\n- Parent: PRO-900\n- Role: {role}\n"
+                f"- Candidate SHA: `{'b' * 40}`\n"
+                f"- Managed PR: `{self.payload['pr']['url']}`\n"
+                f"- Stage action: `{gate_action}`\n"
+                f"- Implementation evidence: comment `{uid(4)}`"
+            )
+            child = issue_detail(
+                id=uid(number), identifier=identifier, parent_issue_id=uid(2),
+                stage=2, assignee_id=self.role_ids[role], project_id=uid(5),
+                revision=1, status="backlog", status_category="backlog",
+                workspace_id=uid(1), title=f"PRO-900 frontend {suffix}",
+                description=description,
+            )
+            self.children.append(child)
+            self.comments[identifier] = []
+            self.runs[identifier] = []
+
     def run(self, args):
         self.calls.append(tuple(args))
         if self.mutate_on_read:
@@ -84,11 +109,20 @@ class ReadBoundary:
             raise AssertionError("missing JSON boundary")
         args = args[:-2]
         if args[:2] == ["issue", "get"]:
-            value = copy.deepcopy({"PRO-900": self.parent, "PRO-901": self.child}[args[2]])
-            value["metadata"] = copy.deepcopy({"PRO-900": self.metadata,
-                                               "PRO-901": self.child_metadata}[args[2]])
+            if args[2] == "PRO-900":
+                value, metadata = self.parent, self.metadata
+            else:
+                matches = [child for child in self.children
+                           if child["identifier"] == args[2]]
+                if len(matches) != 1:
+                    raise AssertionError("unknown issue fixture")
+                value = matches[0]
+                metadata = self.child_metadata if args[2] == "PRO-901" else {}
+            value = copy.deepcopy(value)
+            value["metadata"] = copy.deepcopy(metadata)
         elif args[:3] == ["issue", "metadata", "list"]:
-            value = {"PRO-900": self.metadata, "PRO-901": self.child_metadata}[args[3]]
+            value = (self.metadata if args[3] == "PRO-900" else
+                     self.child_metadata if args[3] == "PRO-901" else {})
         elif args == ["issue", "children", "PRO-900"]:
             stages = sorted({child["stage"] for child in self.children if child["stage"] is not None})
             value = {"total": len(self.children), "unstaged": [c for c in self.children if c["stage"] is None],
@@ -172,6 +206,200 @@ class SnapshotTests(unittest.TestCase):
             "desktop-api.multica.ai", uid(1), self.scope.approved_control_sha)
 
         self.api._scope()
+
+    def test_v2_snapshot_binds_complete_pristine_gate_history(self):
+        self.runner.add_pristine_gates()
+
+        snapshot = self.snapshot()
+        state = snapshot.state()
+        gates = [child for child in state["children"]
+                 if child["detail"]["stage"] == 2]
+
+        self.assertEqual(len(gates), 2)
+        self.assertEqual([gate["comment_manifest"] for gate in gates], [[], []])
+        request = contracts.freeze_refresh_request(
+            snapshot, supersede_pristine_gates=True)
+        self.assertEqual(contracts.refresh_protocol(request), 2)
+
+    def test_v2_snapshot_rejects_tampered_child_comment_manifest_without_writes(self):
+        self.runner.add_pristine_gates()
+        state = self.snapshot().state()
+        source = next(child for child in state["children"]
+                      if child["detail"]["stage"] == 1)
+        source["comment_manifest"][0]["content_digest"] = "0" * 64
+
+        with self.assertRaisesRegex(ValueError, "child comment manifest mismatch"):
+            contracts.freeze_refresh_request(
+                contracts.RefreshSnapshot(contracts.canonical_json(state)),
+                supersede_pristine_gates=True)
+        self.assertEqual(self.runner.writes, [])
+
+    def test_v2_snapshot_rejects_run_not_bound_to_observed_issue_without_writes(self):
+        self.runner.add_pristine_gates()
+        state = self.snapshot().state()
+        state["runs"].append({
+            "id": uid(98), "issue_id": uid(99), "agent_id": uid(8),
+            "status": "completed", "created_at": "2026-09-05T01:00:00Z",
+            "activity_at": "2026-09-05T01:01:00Z",
+        })
+
+        with self.assertRaisesRegex(ValueError, "unbound refresh run"):
+            contracts.freeze_refresh_request(
+                contracts.RefreshSnapshot(contracts.canonical_json(state)),
+                supersede_pristine_gates=True)
+        self.assertEqual(self.runner.writes + self.github.writes, [])
+
+    def test_v2_complete_stable_reads_admit_without_writes(self):
+        self.runner.add_pristine_gates()
+        frozen = self.snapshot()
+        request = contracts.freeze_refresh_request(
+            frozen, supersede_pristine_gates=True)
+        state = frozen.state()
+        envelope = {"payload": request.payload(), "digest": request.digest,
+                    "staging_ref": request.staging_ref}
+        request_record = comment_record(
+            12, block("request", envelope), author=7, issue=uid(2))
+        grant_record = comment_record(
+            13, block("grant", {"schema_version": 1,
+                                 "request_digest": request.digest,
+                                 "granted_refresh": 1}),
+            author=11, issue=uid(2))
+        grant_record["author_type"] = "member"
+        state["metadata"].update({
+            "eventra.refresh.request": contracts.canonical_json(envelope),
+            "eventra.refresh.version": "1",
+            "eventra.refresh.merge_permission": "hold",
+            "eventra.refresh.request_digest": request.digest,
+            "eventra.refresh.request_comment": uid(12),
+            "eventra.refresh.authorization_comment": uid(13),
+        })
+        state["comments"].extend([
+            asdict(contracts.RefreshComment(
+                uid(2), record["id"], record["author_id"],
+                record["author_type"], record["revision"], record["content"]))
+            for record in (request_record, grant_record)
+        ])
+        state["comment_manifest"] = contracts.comment_manifest(
+            [*self.runner.comments["PRO-900"], request_record, grant_record], uid(2))
+        state["parent"]["metadata"] = copy.deepcopy(state["metadata"])
+        state["parent"]["revision"] += 8
+        grant = contracts.RefreshComment(
+            uid(2), uid(13), uid(11), "member", 1, grant_record["content"])
+
+        contracts.admit_refresh(
+            request,
+            contracts.RefreshSnapshot(contracts.canonical_json(state)),
+            grant,
+        )
+        self.assertEqual(self.runner.writes + self.github.writes, [])
+
+    def test_v2_freeze_rejects_every_nonpristine_gate_history_identity(self):
+        from tools.multica.tests.test_candidate_refresh import pristine_gate_snapshot
+
+        identities = (
+            ("member", "comment", uid(11)),
+            ("agent", "comment", uid(16)),
+            ("agent", "system", uid(16)),
+            ("system", "system", "00000000-0000-0000-0000-000000000000"),
+            ("system", "progress_update", "00000000-0000-0000-0000-000000000000"),
+        )
+        for author_type, record_type, author_id in identities:
+            state = pristine_gate_snapshot().state()
+            gate = next(child for child in state["children"]
+                        if child["detail"]["identifier"] == "PRO-902")
+            gate["comment_manifest"] = [{
+                "issue_id": gate["detail"]["id"], "comment_uuid": uid(70),
+                "author_id": author_id, "author_type": author_type,
+                "type": record_type, "revision": 1, "parent_id": None,
+                "created_at": "2026-09-05T01:00:00Z",
+                "content_digest": hashlib.sha256(b"history").hexdigest(),
+            }]
+            with self.subTest(identity=(author_type, record_type)), \
+                    self.assertRaises(ValueError):
+                contracts.freeze_refresh_request(
+                    contracts.RefreshSnapshot(contracts.canonical_json(state)),
+                    supersede_pristine_gates=True)
+        self.assertEqual(self.runner.writes + self.github.writes, [])
+
+    def test_v2_freeze_rejects_gate_runs_and_semantic_mutations(self):
+        from tools.multica.tests.test_candidate_refresh import pristine_gate_snapshot
+        base = pristine_gate_snapshot().state()
+        gate = next(child for child in base["children"]
+                    if child["detail"]["identifier"] == "PRO-902")
+        variants = []
+        for status in ("completed", "running"):
+            state = copy.deepcopy(base)
+            state["runs"].append({
+                "id": uid(70 if status == "completed" else 71),
+                "issue_id": gate["detail"]["id"], "agent_id": uid(16),
+                "status": status, "created_at": "2026-09-05T01:00:00Z",
+                "activity_at": "2026-09-05T01:01:00Z",
+            })
+            variants.append(("run-" + status, state))
+        for field, value in (
+                ("project_id", uid(30)), ("assignee_id", uid(17)),
+                ("title", "wrong title"), ("description", "wrong description"),
+                ("status", "todo"), ("revision", 2)):
+            state = copy.deepcopy(base)
+            state["children"][1]["detail"][field] = value
+            variants.append((field, state))
+        metadata = copy.deepcopy(base)
+        metadata["children"][1]["metadata"] = {"custom": "value"}
+        metadata["children"][1]["detail"]["metadata"] = {"custom": "value"}
+        variants.append(("metadata", metadata))
+        unknown = copy.deepcopy(base)
+        unknown["children"][1]["detail"]["future_field"] = True
+        variants.append(("unknown-field", unknown))
+        evidence_state = copy.deepcopy(base)
+        evidence_gate = evidence_state["children"][1]
+        evidence_record = comment_record(
+            72, "gate evidence", author=16, issue=evidence_gate["detail"]["id"])
+        evidence_gate["metadata"] = {"eventra.phase.evidence_comment": uid(72)}
+        evidence_gate["detail"]["metadata"] = copy.deepcopy(evidence_gate["metadata"])
+        evidence_gate["evidence"] = asdict(contracts.RefreshComment(
+            evidence_gate["detail"]["id"], uid(72), uid(16), "agent", 1,
+            evidence_record["content"]))
+        evidence_gate["comment_manifest"] = contracts.comment_manifest(
+            [evidence_record], evidence_gate["detail"]["id"])
+        variants.append(("evidence", evidence_state))
+
+        for name, state in variants:
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                contracts.freeze_refresh_request(
+                    contracts.RefreshSnapshot(contracts.canonical_json(state)),
+                    supersede_pristine_gates=True)
+        self.assertEqual(self.runner.writes + self.github.writes, [])
+
+    def test_v2_gate_paginated_or_malformed_comment_tree_fails_closed(self):
+        for records in (
+                {"items": [], "has_more": True},
+                [dict(comment_record(70, "reply", author=16), parent_id=uid(71))]):
+            self.runner.add_pristine_gates()
+            self.runner.comments["PRO-902"] = records
+            with self.subTest(records=type(records).__name__), \
+                    self.assertRaises((ValueError, RuntimeError)):
+                self.snapshot()
+            self.assertEqual(self.runner.writes + self.github.writes, [])
+            self.runner.children = self.runner.children[:1]
+            for identifier in ("PRO-902", "PRO-903"):
+                self.runner.comments.pop(identifier, None)
+                self.runner.runs.pop(identifier, None)
+
+    def test_v2_same_revision_gate_change_between_reads_blocks_freeze(self):
+        self.runner.add_pristine_gates()
+        gate_reads = 0
+
+        def change_gate(args):
+            nonlocal gate_reads
+            if args[:3] == ["issue", "get", "PRO-902"]:
+                gate_reads += 1
+                if gate_reads == 2:
+                    self.runner.children[1]["title"] += " changed"
+
+        self.runner.mutate_on_read = change_gate
+        with self.assertRaisesRegex(RuntimeError, "changed"):
+            self.snapshot()
+        self.assertEqual(self.runner.writes + self.github.writes, [])
 
     def test_scope_rejects_unsafe_dotted_cli_profiles(self):
         for profile in (".hidden", "desktop..ai", "desktop.", "desktop/ai"):
@@ -610,6 +838,7 @@ class MemoryRefreshAPI:
         self.create_effects = 0
         self.complete_started_run = False
         self.issue_comments = {}
+        self.issue_comment_records = {}
 
     def _mutate(self, operation, args, apply):
         self.write_index += 1
@@ -640,10 +869,21 @@ class MemoryRefreshAPI:
         return self.state["parent"]["identifier"]
 
     def add_comment(self, issue, comment):
-        if comment.issue_id != next(item["detail"]["id"] for item in self.state["children"]
-                                    if item["detail"]["identifier"] == issue):
+        child = next(item for item in self.state["children"]
+                     if item["detail"]["identifier"] == issue)
+        if comment.issue_id != child["detail"]["id"]:
             raise RuntimeError("wrong comment scope")
         self.issue_comments[(issue, comment.comment_uuid)] = comment
+        self.issue_comment_records[(issue, comment.comment_uuid)] = {
+            "id": comment.comment_uuid, "issue_id": comment.issue_id,
+            "author_id": comment.author_id, "author_type": comment.author_type,
+            "revision": comment.revision, "type": "comment",
+            "created_at": "2026-09-05T01:00:00Z", "content": comment.content,
+        }
+        records = [record for (record_issue, _), record in self.issue_comment_records.items()
+                   if record_issue == issue]
+        child["comment_manifest"] = contracts.comment_manifest(
+            records, child["detail"]["id"])
 
     def comment(self, issue, comment_uuid):
         try:
@@ -762,7 +1002,8 @@ class MemoryRefreshAPI:
                              status="backlog", project_id=project_id, assignee_id=assignee_id,
                              workspace_id=uid(1), description=description, title=title, revision=1)
         child["metadata"] = {}
-        self.state["children"].append({"detail": child, "metadata": {}, "evidence": None})
+        self.state["children"].append({"detail": child, "metadata": {}, "evidence": None,
+                                       "comment_manifest": []})
         self.create_effects += 1
         self.writes.append(("create_child", parent, "PRO-902"))
         if self.fail_at == self.write_index and self.fail_after:

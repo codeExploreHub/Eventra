@@ -317,12 +317,22 @@ class RefreshAPI:
             _need(all(detail[k] == v for k, v in item.items()), "child detail differs from parent relation")
             child_metadata = parse_issue_metadata(self._read(["issue", "metadata", "list", item["identifier"]]))
             _need(detail.get("metadata") == child_metadata, "child metadata echo conflict")
-            comments = self._all_comments(item["identifier"], item["id"])
+            comment_records, comments = self._all_comment_state(
+                item["identifier"], item["id"])
             evidence_uuid = child_metadata.get("eventra.phase.evidence_comment")
             evidence = [asdict(comment) for comment in comments if comment.comment_uuid == evidence_uuid]
             _need(evidence_uuid is None or len(evidence) == 1, "missing child evidence")
-            children.append({"detail": detail, "metadata": child_metadata, "evidence": evidence[0] if evidence else None})
+            children.append({
+                "detail": detail, "metadata": child_metadata,
+                "evidence": evidence[0] if evidence else None,
+                "comment_manifest": c.comment_manifest(comment_records, item["id"]),
+            })
             runs.extend(self._runs(item["identifier"], item["id"]))
+        observed_issue_ids = {parent["id"], *(child["detail"]["id"] for child in children)}
+        _need(all(run["issue_id"] in observed_issue_ids for run in runs),
+              "run is not bound to an observed issue")
+        _need(len({run["id"] for run in runs}) == len(runs),
+              "duplicate run identity across observed issues")
         source = [child for child in children if child["detail"]["stage"] == 1]
         _need(len(source) == 1, "source Stage 1 membership")
         url = source[0]["metadata"].get("eventra.phase.pr")
