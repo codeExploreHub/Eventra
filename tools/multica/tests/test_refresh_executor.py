@@ -271,6 +271,22 @@ class SnapshotTests(unittest.TestCase):
             snapshot, supersede_pristine_gates=True)
         self.assertEqual(contracts.refresh_protocol(request), 2)
 
+    def test_snapshot_normalizes_rest_closed_merged_pr_state(self):
+        self.github.pr.update(state="closed", merged=True)
+
+        state = self.snapshot().state()
+
+        self.assertEqual(state["pr"]["state"], "merged")
+        self.assertIs(state["pr"]["merged"], True)
+
+    def test_snapshot_rejects_rest_open_merged_pr_state_without_writes(self):
+        self.github.pr.update(state="open", merged=True)
+
+        with self.assertRaisesRegex(RuntimeError, "PR state"):
+            self.snapshot()
+
+        self.assertEqual(self.runner.writes + self.github.writes, [])
+
     def test_v2_snapshot_rejects_tampered_child_comment_manifest_without_writes(self):
         self.runner.add_pristine_gates()
         state = self.snapshot().state()
@@ -1630,7 +1646,8 @@ class MemoryRefreshGit:
         reservation = contracts.refresh_metadata(
             self.api.state["metadata"])["reservation"]
         if (reservation["state"] != "candidate_registered"
-                or reservation["prepared"] != asdict(prepared)):
+                or reservation["prepared"] !=
+                    contracts._prepared_checkpoint(request, prepared)):
             raise RuntimeError("candidate was not registered before publication")
         head = self.api.state["pr"]["head_sha"]
         if head == prepared.target_sha:
@@ -1642,6 +1659,38 @@ class MemoryRefreshGit:
         if self.fail_after_push:
             raise RuntimeError("managed push acknowledgement lost")
         return True
+
+
+def prepared_v2_execution():
+    """Reach v2 prepared PASS through the public executor and finish APIs."""
+    from tools.multica.tests.test_candidate_refresh import prepared_payload
+
+    api, git, request = admitted_v2_execution()
+    module = importlib.import_module("tools.multica.refresh_executor")
+    module.execute_refresh(
+        api, git, "PRO-900", uid(12), uid(13),
+        contracts.refresh_action(request),
+    )
+    child = next(item for item in api.state["children"]
+                 if item["metadata"].get("eventra.phase.kind") == "refresh")
+    payload = prepared_payload(request)
+    payload["schema_version"] = 2
+    payload["child_id"] = child["detail"]["id"]
+    payload["context_receipt"]["task_id"] = child["detail"]["identifier"]
+    evidence_uuid = uid(93)
+    evidence = contracts.RefreshComment(
+        child["detail"]["id"], evidence_uuid,
+        request.payload()["assignment"]["engineer_id"], "agent", 1,
+        "Preparation only; no PR publication.\n"
+        "```eventra-candidate-refresh-prepared-v2\n"
+        + encode(payload) + "\n```",
+    )
+    api.add_comment(child["detail"]["identifier"], evidence)
+    module.finish_refresh(
+        api, git, child["detail"]["identifier"], evidence_uuid, "pass")
+    api.writes.clear()
+    api.write_index = 0
+    return api, git, request
 
 
 class FinishRefreshTests(unittest.TestCase):
@@ -2031,6 +2080,118 @@ class PublishRefreshTests(unittest.TestCase):
         api.write_index = 0
         publisher = MemoryRefreshGit(api.request, api)
         return api, module, publisher, child, evidence_uuid
+
+    def test_v2_adoption_commits_receipt_before_reservation_cleanup(self):
+        api, _, request = prepared_v2_execution()
+        module = importlib.import_module("tools.multica.refresh_executor")
+        git = MemoryRefreshGit(request, api)
+
+        result = module.execute_refresh(
+            api, git, "PRO-900", uid(12), uid(13),
+            contracts.refresh_action(request),
+        )
+
+        self.assertEqual(result.status, "adopted")
+        self.assertIn("eventra.refresh.supersession", api.state["metadata"])
+        self.assertNotIn("eventra.refresh.reservation", api.state["metadata"])
+        self.assertNotIn("eventra.refresh.adoption", api.state["metadata"])
+        self.assertNotIn("eventra.refresh.consumed", api.state["metadata"])
+        receipt = contracts._load_json(
+            api.state["metadata"]["eventra.refresh.supersession"],
+            contracts.MAX_COMMENT_BYTES,
+        )
+        self.assertEqual(receipt["version"], 2)
+        self.assertEqual(receipt["refresh_stage"], 3)
+        self.assertEqual(receipt["fresh_gate_stage"], 4)
+        receipt_index = next(index for index, write in enumerate(api.writes)
+                             if write[:3] == (
+                                 "set_metadata", "PRO-900",
+                                 "eventra.refresh.supersession"))
+        delete_index = next(index for index, write in enumerate(api.writes)
+                            if write[:3] == (
+                                "delete_metadata", "PRO-900",
+                                "eventra.refresh.reservation"))
+        self.assertLess(receipt_index, delete_index)
+
+    def test_v2_publication_reservation_is_compact_exact_and_budgeted(self):
+        api, _, request = prepared_v2_execution()
+        module = importlib.import_module("tools.multica.refresh_executor")
+        git = MemoryRefreshGit(request, api)
+        api.fail_at = 2
+
+        with self.assertRaisesRegex(RuntimeError, "before effect"):
+            module.execute_refresh(
+                api, git, "PRO-900", uid(12), uid(13),
+                contracts.refresh_action(request),
+            )
+
+        feature = contracts.refresh_metadata(api.state["metadata"])
+        reservation = feature["reservation"]
+        child, prepared = contracts._refresh_child(request, api.state)
+        self.assertEqual(reservation["state"], "candidate_registered")
+        self.assertEqual(set(reservation),
+                         contracts.V2_PUBLICATION_RESERVATION_FIELDS)
+        self.assertEqual(
+            reservation["prepared"],
+            contracts._prepared_checkpoint(request, prepared),
+        )
+        self.assertEqual(reservation["child_id"], child["detail"]["id"])
+        contracts.validate_metadata_budget(api.state["metadata"], request=request)
+
+        forged = copy.deepcopy(reservation)
+        forged["prepared"]["digest"] = "0" * 64
+        api.state["metadata"]["eventra.refresh.reservation"] = encode(forged)
+        api.state["parent"]["metadata"] = copy.deepcopy(api.state["metadata"])
+        before = len(api.writes)
+        api.fail_at = None
+        with self.assertRaises((ValueError, RuntimeError)):
+            module.execute_refresh(
+                api, git, "PRO-900", uid(12), uid(13),
+                contracts.refresh_action(request),
+            )
+        self.assertEqual(len(api.writes), before)
+
+    def test_v2_receipt_and_reservation_cleanup_boundaries_recover(self):
+        for fail_at in (5, 6):
+            for fail_after in (False, True):
+                with self.subTest(fail_at=fail_at, fail_after=fail_after):
+                    api, _, request = prepared_v2_execution()
+                    module = importlib.import_module("tools.multica.refresh_executor")
+                    git = MemoryRefreshGit(request, api)
+                    api.fail_at, api.fail_after = fail_at, fail_after
+
+                    if fail_after:
+                        result = module.execute_refresh(
+                            api, git, "PRO-900", uid(12), uid(13),
+                            contracts.refresh_action(request),
+                        )
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "before effect"):
+                            module.execute_refresh(
+                                api, git, "PRO-900", uid(12), uid(13),
+                                contracts.refresh_action(request),
+                            )
+                        if fail_at == 6:
+                            feature = contracts.refresh_metadata(
+                                api.state["metadata"])
+                            self.assertIn("supersession", feature)
+                            self.assertIn("reservation", feature)
+                            contracts.validate_metadata_budget(
+                                api.state["metadata"], request=request)
+                        api.fail_at = None
+                        result = module.execute_refresh(
+                            api, git, "PRO-900", uid(12), uid(13),
+                            contracts.refresh_action(request),
+                        )
+
+                    self.assertEqual(result.status, "adopted")
+                    self.assertIn("eventra.refresh.supersession", api.state["metadata"])
+                    self.assertNotIn("eventra.refresh.reservation", api.state["metadata"])
+                    receipt_writes = [write for write in api.writes
+                                      if write[:3] == (
+                                          "set_metadata", "PRO-900",
+                                          "eventra.refresh.supersession")]
+                    self.assertEqual(len(receipt_writes), 1)
 
     def test_publish_ack_loss_does_not_duplicate_delivery(self):
         api, module, git, child, _ = self.prepared_case()

@@ -111,6 +111,29 @@ def refresh_snapshot_fixture(*, state="candidate_registered", adopted=False):
     return finish(request, data)
 
 
+def v2_adopted_fixture():
+    """Reach a permanent v2 receipt through the real executor lifecycle."""
+    from tools.multica import refresh_executor
+    from tools.multica.tests.test_refresh_executor import prepared_v2_execution
+
+    api, git, request = prepared_v2_execution()
+    refresh_executor.execute_refresh(
+        api, git, "PRO-900", uid(12), uid(13),
+        refresh_executor.c.refresh_action(request),
+    )
+    state = copy.deepcopy(api.state)
+    state["assignment"]["roles"]["backend_engineer"] = uid(18)
+    state["assignment"]["members"] = [
+        {
+            "member_id": member_id,
+            "member_type": "agent",
+            "role": "leader" if role == "delivery_lead" else role,
+        }
+        for role, member_id in state["assignment"]["roles"].items()
+    ]
+    return request, state
+
+
 class RefreshDecisionTests(unittest.TestCase):
     def setUp(self):
         from tools.multica import candidate_refresh as c
@@ -133,6 +156,124 @@ class RefreshDecisionTests(unittest.TestCase):
             (self.c._refresh_stage(v2), self.c._fresh_gate_stage(v2)),
             (3, 4),
         )
+
+    def test_v2_adopted_receipt_exposes_only_stage_four_gates(self):
+        request, data = v2_adopted_fixture()
+
+        decision = self.decision(request, data)
+
+        self.assertEqual(decision.kind, "create_gate_stage")
+        self.assertIn("Stage 4", decision.reason)
+        self.assertEqual(data["metadata"]["eventra.workflow.next_stage"], "4")
+        self.assertIn("eventra.refresh.supersession", data["metadata"])
+        self.assertNotIn("eventra.refresh.reservation", data["metadata"])
+
+    def test_v2_supersession_receipt_drift_blocks(self):
+        request, base = v2_adopted_fixture()
+        key = "eventra.refresh.supersession"
+        mutations = (
+            ("gate-order", lambda value: value["gates"].reverse()),
+            ("gate-uuid", lambda value: value["gates"][0].__setitem__(
+                "id", uid(99))),
+            ("gate-digest", lambda value: value["gates"][0].__setitem__(
+                "authority_digest", "0" * 64)),
+            ("gate-revision", lambda value: value["gates"][0].__setitem__(
+                "cancelled_revision", 3)),
+            ("gate-revision-type", lambda value: value["gates"][0].__setitem__(
+                "cancelled_revision", 2.0)),
+            ("request", lambda value: value.__setitem__("request_uuid", uid(99))),
+            ("grant", lambda value: value.__setitem__(
+                "authorization_uuid", uid(99))),
+            ("source", lambda value: value.__setitem__("source_sha", "0" * 40)),
+            ("target", lambda value: value.__setitem__("target_sha", "0" * 40)),
+            ("pr", lambda value: value["pr"].__setitem__("head_ref", "wrong")),
+            ("prerequisite", lambda value: value.__setitem__(
+                "prerequisite_sha", "0" * 40)),
+            ("control", lambda value: value.__setitem__(
+                "control_tool_sha", "0" * 40)),
+            ("child-id", lambda value: value.__setitem__("child_id", uid(99))),
+            ("child-identifier", lambda value: value.__setitem__(
+                "child_identifier", "PRO-999")),
+            ("evidence-uuid", lambda value: value.__setitem__(
+                "evidence_uuid", uid(99))),
+            ("evidence-digest", lambda value: value.__setitem__(
+                "evidence_digest", "0" * 64)),
+            ("refresh-stage", lambda value: value.__setitem__("refresh_stage", 2)),
+            ("refresh-stage-type", lambda value: value.__setitem__(
+                "refresh_stage", 3.0)),
+            ("fresh-gate-stage", lambda value: value.__setitem__(
+                "fresh_gate_stage", 3)),
+            ("extra", lambda value: value.__setitem__("extra", True)),
+        )
+        for name, mutate in mutations:
+            data = copy.deepcopy(base)
+            receipt = json.loads(data["metadata"][key])
+            mutate(receipt)
+            data["metadata"][key] = encode(receipt)
+            data["parent"]["metadata"] = copy.deepcopy(data["metadata"])
+            with self.subTest(name=name):
+                self.assertEqual(self.decision(request, data).kind, "block")
+
+        missing = copy.deepcopy(base)
+        del missing["metadata"][key]
+        missing["parent"]["metadata"] = copy.deepcopy(missing["metadata"])
+        self.assertEqual(self.decision(request, missing).kind, "block")
+
+        premature_merge = copy.deepcopy(base)
+        premature_merge["pr"].update({"state": "merged", "merged": True})
+        self.assertEqual(
+            self.decision(request, premature_merge).kind, "block")
+
+    def test_v2_supersession_receipt_before_adoption_blocks(self):
+        from tools.multica.tests.test_refresh_executor import prepared_v2_execution
+
+        api, _, request = prepared_v2_execution()
+        state = api.state
+        feature = self.c.refresh_metadata(state["metadata"])
+        _, prepared = self.c._refresh_child(request, state)
+        receipt = self.c._build_supersession_receipt(
+            request, prepared, feature["request_comment"],
+            feature["authorization_comment"],
+            feature["reservation"]["child_identifier"],
+        )
+        state["metadata"]["eventra.refresh.supersession"] = encode(receipt)
+        state["parent"]["metadata"] = copy.deepcopy(state["metadata"])
+        state["parent"]["revision"] += 1
+
+        self.assertEqual(self.decision(request, state).kind, "block")
+
+    def test_v2_adopted_cleanup_prefixes_resume_with_or_without_receipt(self):
+        from tools.multica import refresh_executor
+        from tools.multica.tests.test_refresh_executor import (
+            MemoryRefreshGit, prepared_v2_execution)
+
+        for fail_at, receipt_expected in ((5, False), (6, True)):
+            with self.subTest(fail_at=fail_at):
+                api, _, request = prepared_v2_execution()
+                api.fail_at = fail_at
+                with self.assertRaisesRegex(RuntimeError, "before effect"):
+                    refresh_executor.execute_refresh(
+                        api, MemoryRefreshGit(request, api), "PRO-900",
+                        uid(12), uid(13),
+                        refresh_executor.c.refresh_action(request),
+                    )
+
+                feature = self.c.refresh_metadata(api.state["metadata"])
+                self.assertEqual(feature["reservation"]["state"], "adopted")
+                self.assertEqual("supersession" in feature, receipt_expected)
+                self.assertNotIn("adoption", feature)
+                self.assertNotIn("consumed", feature)
+                self.assertEqual(
+                    self.decision(request, api.state).kind,
+                    "resume_refresh",
+                )
+
+    def test_v1_rejects_v2_supersession_feature_field(self):
+        request, data = refresh_snapshot_fixture(adopted=True)
+        data["metadata"]["eventra.refresh.supersession"] = encode({})
+        data["parent"]["metadata"] = copy.deepcopy(data["metadata"])
+
+        self.assertEqual(self.decision(request, data).kind, "block")
 
     def test_v2_cancellation_prefixes_are_exact(self):
         request, data, reservation = v2_reserved_fixture()

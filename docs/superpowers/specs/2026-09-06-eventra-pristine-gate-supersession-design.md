@@ -252,8 +252,8 @@ proves every parent revision and comment-manifest change from the exact writes.
 
 ### 8.2 Reservation
 
-After request and grant UUIDs are bound, the executor writes a version-2
-reservation containing:
+After request and grant UUIDs are bound, the executor first writes a full
+version-2 reservation containing:
 
 - request digest, request UUID, grant UUID, and action key;
 - source, PR, prerequisite, control-tool, and parent projection identity;
@@ -266,6 +266,32 @@ reservation containing:
   or `adopted`.
 
 The reservation is persisted and read back before any gate status write.
+
+The full shape is exact and contains these fields: `version`, `request_digest`,
+`request_uuid`, `authorization_uuid`, `action_key`, `state`, `parent_id`,
+`parent_identifier`, `source`, `pr`, `prerequisite`, `control_tool_sha`, `gates`,
+`refresh_stage`, `fresh_gate_stage`, `child_id`, `child_identifier`,
+`child_position`, `prepared`, `parent_status_category`, `parent_position`, and
+`parent_projection_digest`. It remains in use from `reserved` through
+`child_dispatched`.
+
+At the `candidate_registered` transition, after the prepared candidate has been
+validated and durably recorded on the refresh child, the executor replaces that
+full object with an exact compact publication reservation. Its fields are
+`version`, `request_digest`, `request_uuid`, `authorization_uuid`, `action_key`,
+`state`, `child_id`, `child_identifier`, `child_position`, `prepared`,
+`parent_status_category`, `parent_position`, and `parent_projection_digest`.
+The compact `prepared` value is exactly
+`{"digest": sha256(canonical_json(asdict(PreparedCandidate)))}`. The omitted
+authority remains bound by the immutable request, the current child evidence,
+and revalidation of the cancelled gates. The compact shape is used for
+`candidate_registered`, `published`, and `adopted` and is rejected in every
+earlier state.
+
+This state-dependent compaction is required by Multica's 6144-byte whole-metadata
+map limit. It leaves enough room for the permanent receipt to coexist with the
+`adopted` reservation during the crash-recovery boundary; a full reservation and
+receipt cannot safely coexist within that limit.
 
 ### 8.3 Gate cancellation
 
@@ -322,14 +348,44 @@ Before deleting the transient reservation, adoption writes a permanent canonical
 - refresh child UUID/identifier and prepared evidence UUID/digest;
 - `refresh_stage=3` and `fresh_gate_stage=4`.
 
-The receipt is read back before reservation deletion. It is included in all later
-refresh provenance validation and is never deleted.
+Protocol v2 does not write the v1 `eventra.refresh.adoption` or
+`eventra.refresh.consumed` records. The exact supersession receipt replaces both:
+the executor first persists and reads back the `adopted` compact reservation,
+then persists and reads back the receipt, and only then deletes and confirms the
+reservation. Both legal recovery prefixes—`adopted + reservation` and
+`adopted + receipt + reservation`—resume idempotently. A receipt before the
+`adopted` checkpoint is invalid.
+
+The receipt is included in all later refresh provenance validation and is never
+deleted.
 
 After adoption, the ordinary planner returns `create_gate_stage` for Stage 4. New
 Review and Integration QA children must bind the adopted target SHA, attempt 0,
 the Stage 4 creation action, and their authoritative agent assignments. The old
 cancelled gates are accepted only when the complete supersession receipt matches;
 otherwise they remain a conflicting history.
+
+Even if the managed PR is already merged, Smoke creation still requires the
+complete gate set that immediately authorizes the first Smoke: Stage 4 on the
+direct path, or the latest post-repair gate stage after a valid repair. That set
+must bind the current candidate SHA and assignment identity and contain only PASS
+results. Missing, active, malformed, stale-SHA, failed, or blocked gates cannot be
+bypassed by the merged PR state or by a pre-created PASS Smoke.
+
+For a post-repair gate stage, validation reconstructs every intervening round from
+the original Stage 4 failure forward. Each source gate set must be complete and
+contain canonical failure evidence; each immediately following repair must bind
+that failure bundle digest, evidence UUIDs, creation action, source candidates,
+round, assignee, project, and managed PR, finish with PASS, and produce the SHA
+used by the next adjacent gate stage. The check repeats for every repair round;
+attempt-number continuity alone is never sufficient authority.
+
+Round 3 additionally retains verifiable human authority after consumption. The
+parent-scoped comment identified by the consumed UUID is read twice on every
+authoritative snapshot and must still be a unique `member` comment with canonical
+JSON containing exactly the reconstructed failure-bundle digest and integer
+`granted_round=3`. Matching UUIDs in parent metadata, repair children, and action
+keys are insufficient without that original comment.
 
 ## 9. Concurrency and competing writers
 

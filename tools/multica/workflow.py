@@ -388,6 +388,7 @@ class ParentSnapshot:
     authorization_comment_uuid: str = ""
     consumed_authorization_uuid: str = ""
     authorizing_comment: AuthorizingComment | None = None
+    consumed_authorizing_comment: AuthorizingComment | None = None
     smoke_retry_authorization_comment_uuid: str = ""
     consumed_smoke_retry_authorization_uuid: str = ""
     smoke_retry_authorizing_comment: AuthorizingComment | None = None
@@ -996,8 +997,18 @@ def _work_repository_coverage(
 def _attempt_history_is_consistent(snapshot: ParentSnapshot) -> bool:
     refresh_phases = tuple(item for item in snapshot.children if item.kind == "refresh" or item.refresh_provenance is not None)
     if refresh_phases:
+        refresh_stage = 2
+        if snapshot.refresh_state is not None:
+            try:
+                feature = refresh.refresh_metadata(
+                    snapshot.refresh_state.state()["metadata"])
+                request = refresh.parse_request(feature["request"])
+                refresh_stage = refresh._refresh_stage(request)
+            except (ValueError, TypeError, KeyError, AttributeError):
+                return False
         if (len(refresh_phases) != 1 or refresh_phases[0].kind != "refresh"
-                or refresh_phases[0].stage != 2 or refresh_phases[0].attempt != 0
+                or refresh_phases[0].stage != refresh_stage
+                or refresh_phases[0].attempt != 0
                 or refresh_phases[0].refresh_provenance is None or snapshot.refresh_state is None):
             return False
         decision = _refresh_workflow_decision(snapshot)
@@ -1329,15 +1340,13 @@ def _failure_bundle(
     return payload
 
 
-def _repair_authorization_matches(
-    snapshot: ParentSnapshot,
+def _repair_authorization_comment_matches(
+    comment_uuid: str,
+    comment: AuthorizingComment | None,
     bundle: dict[str, object],
 ) -> bool:
-    comment_uuid = snapshot.authorization_comment_uuid
-    comment = snapshot.authorizing_comment
     if (
         not _is_uuid(comment_uuid)
-        or bool(snapshot.consumed_authorization_uuid)
         or not isinstance(comment, AuthorizingComment)
         or comment.comment_uuid != comment_uuid
         or comment.author_type != "member"
@@ -1361,6 +1370,20 @@ def _repair_authorization_matches(
             sort_keys=True,
             separators=(",", ":"),
             allow_nan=False,
+        )
+    )
+
+
+def _repair_authorization_matches(
+    snapshot: ParentSnapshot,
+    bundle: dict[str, object],
+) -> bool:
+    return (
+        not snapshot.consumed_authorization_uuid
+        and _repair_authorization_comment_matches(
+            snapshot.authorization_comment_uuid,
+            snapshot.authorizing_comment,
+            bundle,
         )
     )
 
@@ -1589,6 +1612,13 @@ def _current_repair_provenance_problem(
     digest = str(bundle["digest"])
     if expected_action != snapshot.last_action or digests != {digest}:
         return "current repair bundle or creation action is not canonical"
+    if (snapshot.attempt == 3
+            and not _repair_authorization_comment_matches(
+                authorization_uuid,
+                snapshot.consumed_authorizing_comment,
+                bundle,
+            )):
+        return "historical round-three member authorization is invalid"
     expected_specs = {
         str(spec["repository"]): spec for spec in specs
     }
@@ -1630,6 +1660,121 @@ def _current_repair_provenance_problem(
     )
 
 
+def _historical_repair_chain_problem(
+    snapshot: ParentSnapshot,
+    authorizing_gates: tuple[PhaseSnapshot, ...],
+    initial_gate_stage: int,
+) -> str | None:
+    """Revalidate every completed repair between initial and merge gates."""
+    if not authorizing_gates:
+        return "merged refresh has no authorizing gate set"
+    gate_stage = authorizing_gates[0].stage
+    gate_attempts = {item.attempt for item in authorizing_gates}
+    if gate_stage == initial_gate_stage:
+        return (None if gate_attempts == {0}
+                else "initial refresh gate attempt is conflicting")
+    if len(gate_attempts) != 1:
+        return "post-repair gate attempt is conflicting"
+    target_attempt = next(iter(gate_attempts))
+    if target_attempt not in {1, 2, 3}:
+        return "post-repair gate attempt is outside the repair budget"
+
+    previous_gate_stage = initial_gate_stage
+    for repair_round in range(1, target_attempt + 1):
+        repairs = tuple(item for item in snapshot.children
+                        if item.kind == "repair"
+                        and item.attempt == repair_round)
+        if (not repairs or len({item.stage for item in repairs}) != 1
+                or repairs[0].stage != previous_gate_stage + 1):
+            return "historical repair Stage chain is incomplete"
+        repair_stage = repairs[0].stage
+        if any(item.status != "done" or item.result != "pass"
+               for item in repairs):
+            return "historical repair did not complete with PASS"
+        source_sets = {item.repair_source_candidates for item in repairs}
+        if len(source_sets) != 1:
+            return "historical repair source candidates are conflicting"
+        source_candidates = dict(next(iter(source_sets)))
+        replacement_candidates = dict(source_candidates)
+        for item in repairs:
+            repository = item.repair_repository
+            replacement = (item.frontend_sha if repository == "frontend"
+                           else item.backend_sha)
+            if repository not in replacement_candidates or replacement is None:
+                return "historical repair replacement is incomplete"
+            replacement_candidates[repository] = replacement
+        pull_requests = tuple(
+            replace(
+                item,
+                head_sha=replacement_candidates.get(
+                    item.repository, item.head_sha),
+                state="open",
+            )
+            for item in snapshot.pull_requests
+        )
+        repair_snapshot = replace(
+            snapshot,
+            attempt=repair_round,
+            next_stage=repair_stage + 1,
+            last_action=repairs[0].creation_action,
+            candidate_frontend_sha=replacement_candidates.get("frontend"),
+            candidate_backend_sha=replacement_candidates.get("backend"),
+            pull_requests=pull_requests,
+        )
+        problem = _current_repair_provenance_problem(
+            repair_snapshot, repairs)
+        if problem is not None:
+            return problem
+
+        next_gate_stage = repair_stage + 1
+        round_gates = tuple(item for item in snapshot.children
+                            if item.stage == next_gate_stage)
+        gate_snapshot = replace(
+            repair_snapshot,
+            next_stage=next_gate_stage + 1,
+            last_action=None,
+        )
+        if (not round_gates
+                or any(item.status != "done" for item in round_gates)
+                or any(item.result not in PHASE_RESULTS
+                       for item in round_gates)
+                or not _historical_gate_identity_matches(
+                    gate_snapshot, round_gates)):
+            return "post-repair gate history is incomplete or conflicting"
+        if (repair_round < target_attempt
+                and all(item.result == "pass" for item in round_gates)):
+            return "passing gate history cannot source another repair"
+        previous_gate_stage = next_gate_stage
+
+    if (previous_gate_stage != gate_stage
+            or {item.issue_key for item in authorizing_gates}
+            != {item.issue_key for item in round_gates}):
+        return "authorizing gate set is not the end of the repair chain"
+    return None
+
+
+def _historical_round_three_authorization_problem(
+    snapshot: ParentSnapshot,
+) -> str | None:
+    repairs = tuple(item for item in snapshot.children
+                    if item.kind == "repair" and item.attempt == 3)
+    if not repairs:
+        return (None if not snapshot.consumed_authorization_uuid
+                else "consumed round-three authorization lacks repair history")
+    if (len({item.stage for item in repairs}) != 1
+            or len({item.creation_action for item in repairs}) != 1):
+        return "round-three repair history is incomplete or conflicting"
+    repair_stage = repairs[0].stage
+    historical = replace(
+        snapshot,
+        attempt=3,
+        next_stage=repair_stage + 1,
+        last_action=repairs[0].creation_action,
+        repair_reservation=None,
+    )
+    return _current_repair_provenance_problem(historical, repairs)
+
+
 def _refresh_workflow_decision(snapshot: ParentSnapshot) -> ParentDecision | None:
     """Bind the specialized authority to this exact outer snapshot before routing."""
     if snapshot.refresh_state is None:
@@ -1660,7 +1805,13 @@ def _refresh_workflow_decision(snapshot: ParentSnapshot) -> ParentDecision | Non
                                                            for item in assignment["members"]))}
         if any(getattr(snapshot, key) != value for key, value in expected.items()):
             raise ValueError("outer authority mismatch")
-        phases = tuple(_phase_snapshot(item["detail"], item["metadata"]) for item in state["children"])
+        superseded_ids = _receipt_bound_superseded_gate_ids(
+            snapshot.refresh_state)
+        phases = tuple(
+            _phase_snapshot(item["detail"], item["metadata"])
+            for item in state["children"]
+            if item["detail"]["id"] not in superseded_ids
+        )
         if (sorted(phases, key=lambda item: item.issue_key) != sorted(snapshot.children, key=lambda item: item.issue_key)
                 or len(snapshot.pull_requests) != 1 or snapshot.pull_requests[0].repository != "frontend"
                 or snapshot.pull_requests[0].url != pr["url"] or snapshot.pull_requests[0].head_sha != pr["head_sha"]
@@ -1672,13 +1823,35 @@ def _refresh_workflow_decision(snapshot: ParentSnapshot) -> ParentDecision | Non
         if decision.kind == "create_gate_stage":
             return _parent_decision(snapshot, "create_gate_stage", decision.reason)
         if decision.kind == "wait":
-            if ("adoption" in feature and "consumed" in feature and "reservation" not in feature
+            completed_history = (
+                "reservation" not in feature
+                and ({"adoption", "consumed"} <= set(feature)
+                     or "supersession" in feature)
+            )
+            if (completed_history
                     and decision.reason == "refresh adopted; validate normal gate or repair history"):
                 return None  # Normal exact gate/repair checks still run below.
             return ParentDecision("noop", None, decision.reason)
         return ParentDecision(decision.kind, decision.action_key, decision.reason)
     except (ValueError, RuntimeError, TypeError, KeyError, AttributeError):
         return ParentDecision("block_parent", None, "refresh workflow authority is conflicting")
+
+
+def _receipt_bound_superseded_gate_ids(
+        refresh_state: refresh.RefreshSnapshot | None) -> frozenset[str]:
+    if refresh_state is None:
+        return frozenset()
+    state = refresh_state.state()
+    feature = refresh.refresh_metadata(state["metadata"])
+    if feature is None or "supersession" not in feature:
+        return frozenset()
+    request = refresh.parse_request(feature["request"])
+    child, prepared = refresh._refresh_child(request, state)
+    if prepared is None:
+        raise ValueError("supersession receipt lacks prepared child")
+    receipt = refresh._supersession_receipt(
+        feature, request, prepared, state)
+    return frozenset(gate["id"] for gate in receipt["gates"])
 
 
 def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
@@ -1725,6 +1898,11 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
             "block_parent",
             "smoke reservation requires exact executor reconciliation",
         )
+    round_three_problem = _historical_round_three_authorization_problem(
+        snapshot)
+    if round_three_problem is not None:
+        return _parent_decision(
+            snapshot, "block_parent", round_three_problem)
     if snapshot.merge_state == "partial":
         return _parent_decision(
             snapshot,
@@ -1788,7 +1966,9 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
         )
 
     if snapshot.merge_state == "merged":
-        if snapshot.refresh_state is not None:
+        superseded_gate_ids = _receipt_bound_superseded_gate_ids(
+            snapshot.refresh_state)
+        if snapshot.refresh_state is not None and not superseded_gate_ids:
             return ParentDecision("noop", None, "human merge approval required")
         if not _attempt_history_is_consistent(snapshot):
             return _parent_decision(
@@ -1796,6 +1976,68 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
                 "block_parent",
                 "parent attempt conflicts with completed child history",
             )
+        if snapshot.refresh_state is not None:
+            feature = refresh.refresh_metadata(
+                snapshot.refresh_state.state()["metadata"])
+            receipt = feature["supersession"]
+            smoke_stages = [item.stage for item in snapshot.children
+                            if item.kind == "smoke"]
+            gate_stage = (min(smoke_stages) - 1
+                          if smoke_stages else current_stage)
+            gates = tuple(item for item in snapshot.children
+                          if item.stage == gate_stage)
+            if (
+                gate_stage < receipt["fresh_gate_stage"]
+                or not gates
+                or not {item.kind for item in gates}
+                    <= {"review", "qa", "integration_qa"}
+            ):
+                return _parent_decision(
+                    snapshot,
+                    "block_parent",
+                    "merged refresh lacks its request-bound gate set",
+                )
+            repair_problem = _historical_repair_chain_problem(
+                snapshot, gates, receipt["fresh_gate_stage"])
+            if repair_problem is not None:
+                return _parent_decision(
+                    snapshot,
+                    "block_parent",
+                    repair_problem,
+                )
+            if any(item.status != "done" for item in gates):
+                if not smoke_stages and gate_stage == current_stage:
+                    return ParentDecision(
+                        "noop", None, "fresh gate stage is still active")
+                return _parent_decision(
+                    snapshot,
+                    "block_parent",
+                    "merged refresh has later history before its gate set completed",
+                )
+            if any(item.result not in PHASE_RESULTS for item in gates):
+                return _parent_decision(
+                    snapshot,
+                    "block_parent",
+                    "terminal refresh gate evidence is malformed",
+                )
+            if not _phase_shas_match(snapshot, gates):
+                return _parent_decision(
+                    snapshot,
+                    "block_parent",
+                    "merged refresh gate evidence does not match current candidates",
+                )
+            if not _historical_gate_identity_matches(snapshot, gates):
+                return _parent_decision(
+                    snapshot,
+                    "block_parent",
+                    "merged refresh gate coverage is incomplete",
+                )
+            if not all(item.result == "pass" for item in gates):
+                return _parent_decision(
+                    snapshot,
+                    "block_parent",
+                    "merged refresh contains a non-passing gate",
+                )
         if latest and {item.kind for item in latest} == {"smoke"}:
             if any(item.status != "done" for item in latest):
                 return ParentDecision("noop", None, "smoke stage is still active")
@@ -1996,6 +2238,15 @@ def _recovery_authority_identity(
         parent.next_stage,
         parent.authorization_comment_uuid,
         parent.consumed_authorization_uuid,
+        (
+            None
+            if parent.consumed_authorizing_comment is None
+            else (
+                parent.consumed_authorizing_comment.comment_uuid,
+                parent.consumed_authorizing_comment.author_type,
+                parent.consumed_authorizing_comment.content,
+            )
+        ),
         parent.smoke_retry_authorization_comment_uuid,
         parent.consumed_smoke_retry_authorization_uuid,
         (
@@ -2579,6 +2830,9 @@ def _current_assignment_provenance_problem(
         or parent.smoke_reservation is not None
     ):
         return "current assignment reservation is still in progress"
+    round_three_problem = _historical_round_three_authorization_problem(parent)
+    if round_three_problem is not None:
+        return round_three_problem
     current_children = tuple(
         child
         for child in snapshot.children
@@ -3162,7 +3416,9 @@ def _refresh_phase_provenance(metadata: dict[str, str]) -> str | None:
     expected = {"eventra.refresh.version", "eventra.refresh.request_digest", "eventra.refresh.source_sha"}
     source = metadata.get("eventra.refresh.source_sha", "")
     digest = metadata.get("eventra.refresh.request_digest", "")
-    if (keys != expected or kind != "refresh" or metadata.get("eventra.refresh.version") != "1"
+    protocol_text = metadata.get("eventra.refresh.version", "")
+    refresh_stage = {"1": 2, "2": 3}.get(protocol_text)
+    if (keys != expected or kind != "refresh" or refresh_stage is None
             or metadata.get("eventra.workflow.version") != "2" or metadata.get("eventra.phase.attempt") != "0"
             or SHA_PATTERN.fullmatch(source) is None or re.fullmatch(r"[0-9a-f]{64}", digest) is None
             or metadata.get("eventra.phase.target") != "repository:frontend"
@@ -3170,9 +3426,12 @@ def _refresh_phase_provenance(metadata: dict[str, str]) -> str | None:
             or "eventra.phase.sha.backend" in metadata
             or any(key.startswith("eventra.repair.") for key in metadata)
             or re.fullmatch(r"2:PRO-[1-9][0-9]*:create_refresh_stage:0:frontend:" + source
-                            + r":next-stage:2:refresh:1:" + digest, metadata.get("eventra.phase.creation_action", "")) is None):
+                            + rf":next-stage:{refresh_stage}:refresh:{protocol_text}:"
+                            + digest,
+                            metadata.get("eventra.phase.creation_action", "")) is None):
         raise RuntimeError("malformed child refresh provenance")
-    return _canonical_json({"version": 1, "request_digest": digest, "source_sha": source})
+    return _canonical_json({"version": int(protocol_text),
+                            "request_digest": digest, "source_sha": source})
 
 
 def _phase_snapshot(
@@ -3181,8 +3440,10 @@ def _phase_snapshot(
 ) -> PhaseSnapshot:
     kind = metadata.get("eventra.phase.kind", "unknown")
     refresh_provenance = _refresh_phase_provenance(metadata)
-    if refresh_provenance is not None and (type(issue["stage"]) is not int or issue["stage"] != 2):
-        raise RuntimeError("refresh must occupy Stage 2")
+    if refresh_provenance is not None:
+        protocol = json.loads(refresh_provenance)["version"]
+        if type(issue["stage"]) is not int or issue["stage"] != protocol + 1:
+            raise RuntimeError("refresh must occupy its request-bound Stage")
     result = metadata.get("eventra.phase.result")
     attempt_text = metadata.get("eventra.phase.attempt", "0")
     frontend_sha = metadata.get("eventra.phase.sha.frontend")
@@ -3473,6 +3734,28 @@ def _read_gate_evidence_set(
     return tuple(sorted(authorities))
 
 
+def _read_parent_authorization(
+    runner: MulticaRunner,
+    parent_key: str,
+    comment_uuid: str,
+) -> AuthorizingComment:
+    raw_comment = parse_authorizing_comment(
+        runner.run(
+            [
+                "issue", "comment", "list", parent_key,
+                "--thread", comment_uuid, "--full", "--compact",
+                "--output", "json",
+            ]
+        ),
+        comment_uuid,
+    )
+    return AuthorizingComment(
+        comment_uuid=raw_comment["comment_uuid"],
+        author_type=raw_comment["author_type"],
+        content=raw_comment["content"],
+    )
+
+
 def load_parent_snapshot(
     runner: MulticaRunner,
     github: GitHubRunner,
@@ -3503,28 +3786,14 @@ def load_parent_snapshot(
     authorizing_comment = None
     authorization_comment_uuid = str(metadata["authorization_comment_uuid"])
     if authorization_comment_uuid:
-        raw_comment = parse_authorizing_comment(
-            runner.run(
-                [
-                    "issue",
-                    "comment",
-                    "list",
-                    parent_key,
-                    "--thread",
-                    authorization_comment_uuid,
-                    "--full",
-                    "--compact",
-                    "--output",
-                    "json",
-                ]
-            ),
-            authorization_comment_uuid,
-        )
-        authorizing_comment = AuthorizingComment(
-            comment_uuid=raw_comment["comment_uuid"],
-            author_type=raw_comment["author_type"],
-            content=raw_comment["content"],
-        )
+        authorizing_comment = _read_parent_authorization(
+            runner, parent_key, authorization_comment_uuid)
+    consumed_authorization_uuid = str(
+        metadata["consumed_authorization_uuid"])
+    consumed_authorizing_comment = None
+    if consumed_authorization_uuid:
+        consumed_authorizing_comment = _read_parent_authorization(
+            runner, parent_key, consumed_authorization_uuid)
     smoke_retry_authorizing_comment = None
     smoke_retry_authorization_comment_uuid = str(
         metadata["smoke_retry_authorization_comment_uuid"]
@@ -3560,6 +3829,7 @@ def load_parent_snapshot(
     quarantined: list[QuarantinedRepairChild] = []
     child_metadata_by_key: dict[str, dict[str, str]] = {}
     pr_candidates: dict[str, tuple[int, str]] = {}
+    superseded_gate_ids = _receipt_bound_superseded_gate_ids(refresh_state)
     for child in children:
         if child["stage"] is None:
             continue
@@ -3572,6 +3842,8 @@ def load_parent_snapshot(
             )
         )
         child_metadata_by_key[str(child["identifier"])] = child_metadata
+        if str(child["id"]) in superseded_gate_ids:
+            continue
         reservation = metadata["repair_reservation"]
         if reservation is not None:
             incomplete = _quarantined_repair_child(
@@ -3728,6 +4000,19 @@ def load_parent_snapshot(
                 "smoke retry authorization changed during recovery read"
             )
 
+    if consumed_authorization_uuid:
+        try:
+            stable_consumed_authorizing_comment = _read_parent_authorization(
+                runner, parent_key, consumed_authorization_uuid)
+        except RuntimeError:
+            raise RuntimeError(
+                "consumed repair authorization changed during parent read"
+            ) from None
+        if (stable_consumed_authorizing_comment
+                != consumed_authorizing_comment):
+            raise RuntimeError(
+                "consumed repair authorization changed during parent read")
+
     current_stage = int(metadata["next_stage"]) - 1
     current_kinds = {
         item.kind for item in phases if item.stage == current_stage
@@ -3813,6 +4098,7 @@ def load_parent_snapshot(
             metadata["consumed_authorization_uuid"]
         ),
         authorizing_comment=authorizing_comment,
+        consumed_authorizing_comment=consumed_authorizing_comment,
         smoke_retry_authorization_comment_uuid=(
             smoke_retry_authorization_comment_uuid
         ),
@@ -4043,8 +4329,16 @@ def _validate_repair_reservation(
         ):
             if not _repair_authorization_matches(source_snapshot, bundle):
                 raise RuntimeError("reserved repair authorization no longer matches")
-        elif snapshot.consumed_authorization_uuid != authorization_uuid:
-            raise RuntimeError("reserved repair authorization was not consumed")
+        elif (
+            snapshot.consumed_authorization_uuid != authorization_uuid
+            or not _repair_authorization_comment_matches(
+                authorization_uuid,
+                snapshot.consumed_authorizing_comment,
+                bundle,
+            )
+        ):
+            raise RuntimeError(
+                "reserved repair authorization was not validly consumed")
     elif authorization_uuid:
         raise RuntimeError("automatic repair cannot carry authorization")
     if committed_children is not None:
@@ -5105,6 +5399,14 @@ def _verified_replayed_repair_children(
         bundle = _failure_bundle(source_snapshot, source_phases)
     except ValueError:
         raise RuntimeError("recorded repair bundle cannot be reconstructed") from None
+    if (repair_round == 3
+            and not _repair_authorization_comment_matches(
+                authorization_uuid,
+                snapshot.consumed_authorizing_comment,
+                bundle,
+            )):
+        raise RuntimeError(
+            "recorded round-three member authorization conflicts")
     computed_key = _action_key(
         source_snapshot,
         "create_repair_stage",
@@ -5583,6 +5885,16 @@ def _read_smoke_reservation_authority(
         if refresh_snapshot.state()["metadata"] != raw_parent_metadata:
             raise RuntimeError("refresh authority changed during smoke read")
     parent_metadata = _parent_metadata(raw_parent_metadata)
+    consumed_authorization_uuid = str(
+        parent_metadata["consumed_authorization_uuid"]
+    )
+    consumed_authorizing_comment = None
+    if consumed_authorization_uuid:
+        consumed_authorizing_comment = _read_parent_authorization(
+            runner,
+            parent_key,
+            consumed_authorization_uuid,
+        )
     children = parse_issue_children(
         runner.run(["issue", "children", parent_key, "--output", "json"]),
         str(parent["id"]),
@@ -5756,9 +6068,15 @@ def _read_smoke_reservation_authority(
         delivery_lead_id=assignment_authority[3],
         delivery_squad_leader_id=assignment_authority[4],
         delivery_squad_members=assignment_authority[5],
+        consumed_authorization_uuid=consumed_authorization_uuid,
+        consumed_authorizing_comment=consumed_authorizing_comment,
+    )
+    historical_authorization_problem = (
+        _historical_round_three_authorization_problem(source_snapshot)
     )
     if (
-        not _historical_gate_identity_matches(source_snapshot, source_gate)
+        historical_authorization_problem is not None
+        or not _historical_gate_identity_matches(source_snapshot, source_gate)
         or any(item.status != "done" or item.result != "pass" for item in source_gate)
         or any(
             item.state != "merged"
@@ -5858,6 +6176,7 @@ def _read_smoke_reservation_authority(
         authorization_comment,
         source_smoke_evidence,
         assignment_authority,
+        consumed_authorizing_comment,
     )
 
 
@@ -6299,6 +6618,8 @@ def load_workflow_snapshot(
     delivery_lead_id = ""
     delivery_squad_leader_id = ""
     delivery_squad_members: tuple[tuple[str, str, str], ...] = ()
+    consumed_authorizing_comment = None
+    consumed_authorization_malformed = False
     if workflow_version == "2":
         try:
             decoded_parent = _parent_metadata(parent_metadata)
@@ -6332,6 +6653,16 @@ def load_workflow_snapshot(
                     except (AttributeError, KeyError, RuntimeError,
                             TypeError, ValueError):
                         refresh_metadata_malformed = True
+        if decoded_parent is not None:
+            consumed_uuid = str(
+                decoded_parent["consumed_authorization_uuid"])
+            if consumed_uuid:
+                try:
+                    consumed_authorizing_comment = (
+                        _read_parent_authorization(
+                            runner, parent_key, consumed_uuid))
+                except (RuntimeError, TypeError, ValueError):
+                    consumed_authorization_malformed = True
         if project_ids:
             try:
                 authority = _exact_assignment_authority(runner)
@@ -6448,6 +6779,18 @@ def load_workflow_snapshot(
     except (RuntimeError, TypeError, ValueError):
         evidence_authority_malformed = True
 
+    if (decoded_parent is not None
+            and decoded_parent["consumed_authorization_uuid"]):
+        try:
+            stable_consumed_comment = _read_parent_authorization(
+                runner, parent_key,
+                str(decoded_parent["consumed_authorization_uuid"]),
+            )
+            if stable_consumed_comment != consumed_authorizing_comment:
+                consumed_authorization_malformed = True
+        except (RuntimeError, TypeError, ValueError):
+            consumed_authorization_malformed = True
+
     next_stage_text = parent_metadata.get("eventra.workflow.next_stage")
     current_stage = (
         int(next_stage_text) - 1
@@ -6463,6 +6806,7 @@ def load_workflow_snapshot(
     ]
     malformed_current_stage = workflow_version == "2" and (
         evidence_authority_malformed
+        or consumed_authorization_malformed
         or current_stage is None
         or any(int(item["stage"]) > current_stage for item in staged)
         or (bool(staged) and not current_stage_children)
@@ -6562,6 +6906,7 @@ def load_workflow_snapshot(
                 consumed_authorization_uuid=str(
                     decoded_parent["consumed_authorization_uuid"]
                 ),
+                consumed_authorizing_comment=consumed_authorizing_comment,
                 repair_reservation=decoded_parent["repair_reservation"],
                 smoke_reservation=decoded_parent["smoke_reservation"],
                 parent_id=str(parent["id"]),

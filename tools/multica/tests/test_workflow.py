@@ -539,6 +539,14 @@ class FakeSnapshotFinishRunner:
             self.parent_metadata[
                 workflow_module.REPAIR_AUTHORIZATION_CONSUMED_KEY
             ] = snapshot.consumed_authorization_uuid
+        parent_comments = []
+        if snapshot.consumed_authorizing_comment is not None:
+            comment = snapshot.consumed_authorizing_comment
+            parent_comments.append({
+                "id": comment.comment_uuid,
+                "author_type": comment.author_type,
+                "content": comment.content,
+            })
         if snapshot.smoke_retry_authorization_comment_uuid:
             self.parent_metadata[
                 workflow_module.SMOKE_RETRY_AUTHORIZATION_KEY
@@ -549,13 +557,13 @@ class FakeSnapshotFinishRunner:
             ] = snapshot.consumed_smoke_retry_authorization_uuid
         if snapshot.smoke_retry_authorizing_comment is not None:
             comment = snapshot.smoke_retry_authorizing_comment
-            self.evidence_comments[snapshot.identifier] = [
-                {
-                    "id": comment.comment_uuid,
-                    "author_type": comment.author_type,
-                    "content": comment.content,
-                }
-            ]
+            parent_comments.append({
+                "id": comment.comment_uuid,
+                "author_type": comment.author_type,
+                "content": comment.content,
+            })
+        if parent_comments:
+            self.evidence_comments[snapshot.identifier] = parent_comments
         if repair_replay:
             self._install_repair_replay_identity()
         self.calls = []
@@ -3128,9 +3136,12 @@ def committed_smoke_retry_snapshot(*, result="pass", identifier="PRO-65", **over
 class RefreshWorkflowTests(unittest.TestCase):
     def setUp(self):
         from tools.multica import candidate_refresh as c
-        from tools.multica.tests.test_candidate_refresh import refresh_snapshot_fixture
+        from tools.multica.tests.test_candidate_refresh import (
+            refresh_snapshot_fixture, v2_adopted_fixture)
         self.c = c
         self.fixture = refresh_snapshot_fixture
+        self.v2_fixture = v2_adopted_fixture
+        self.repair_authorizations = {}
         self.assertIn("refresh_state", ParentSnapshot.__dataclass_fields__, "workflow refresh guard not implemented")
 
     def parent(self, data):
@@ -3139,31 +3150,47 @@ class RefreshWorkflowTests(unittest.TestCase):
         for child in data["children"]:
             child["detail"]["metadata"] = copy.deepcopy(child["metadata"])
         meta, detail, assignment = data["metadata"], data["parent"], data["assignment"]
+        refresh_state = self.c.RefreshSnapshot(self.c.canonical_json(data))
+        superseded_ids = workflow_module._receipt_bound_superseded_gate_ids(
+            refresh_state)
+        consumed_uuid = meta.get(
+            workflow_module.REPAIR_AUTHORIZATION_CONSUMED_KEY, "")
         return ParentSnapshot(identifier=detail["identifier"], classification=meta["eventra.workflow.classification"],
             attempt=int(meta["eventra.workflow.attempt"]), last_action=meta["eventra.workflow.last_action"],
             merge_state=meta["eventra.workflow.merge_state"], candidate_frontend_sha=meta["eventra.workflow.frontend_sha"],
-            candidate_backend_sha=None, children=tuple(workflow_module._phase_snapshot(child["detail"], child["metadata"])
-                                                      for child in data["children"]),
-            pull_requests=(PullRequestSnapshot("frontend", data["pr"]["url"], data["pr"]["head_sha"], "open", True, True),),
+            candidate_backend_sha=None, children=tuple(
+                workflow_module._phase_snapshot(child["detail"], child["metadata"])
+                for child in data["children"]
+                if child["detail"]["id"] not in superseded_ids),
+            pull_requests=(PullRequestSnapshot(
+                "frontend", data["pr"]["url"], data["pr"]["head_sha"],
+                data["pr"]["state"], True, True),),
             parent_status=detail["status"], next_stage=int(meta["eventra.workflow.next_stage"]), parent_id=detail["id"],
             parent_project_id=detail["project_id"], parent_assignee_type="squad", parent_assignee_id=assignment["squad_id"],
             delivery_squad_id=assignment["squad_id"], delivery_lead_id=assignment["lead_id"], delivery_squad_leader_id=assignment["lead_id"],
             assignment_agent_ids=tuple(sorted((role, identity) for role, identity in assignment["roles"].items() if role != "delivery_lead")),
             assignment_project_ids=tuple(sorted(assignment["projects"].items())),
             delivery_squad_members=tuple(sorted((item["member_id"], item["member_type"], item["role"]) for item in assignment["members"])),
-            refresh_state=self.c.RefreshSnapshot(self.c.canonical_json(data)))
+            consumed_authorization_uuid=consumed_uuid,
+            consumed_authorizing_comment=self.repair_authorizations.get(
+                consumed_uuid), refresh_state=refresh_state)
 
     def gates(self, data, *, result="pass"):
         from tools.multica.tests.test_candidate_refresh import uid
         from tools.multica.tests.test_issue_contracts import issue_detail
         data = copy.deepcopy(data)
-        action = "2:PRO-900:create_gate_stage:0:frontend:" + "f" * 40 + ":-:next-stage:3"
-        data["metadata"].update({"eventra.workflow.next_stage": "4", "eventra.workflow.last_action": action})
+        stage = int(data["metadata"]["eventra.workflow.next_stage"])
+        attempt = data["metadata"]["eventra.workflow.attempt"]
+        candidate_sha = data["metadata"]["eventra.workflow.frontend_sha"]
+        action = (f"2:PRO-900:create_gate_stage:{attempt}:frontend:" + candidate_sha
+                  + f":-:next-stage:{stage}")
+        data["metadata"].update({"eventra.workflow.next_stage": str(stage + 1),
+                                 "eventra.workflow.last_action": action})
         for index, (kind, role) in enumerate((("review", "independent_reviewer"), ("qa", "integration_qa"))):
-            child_id = uid(40 + index)
-            evidence_id = uid(42 + index)
-            meta = {"eventra.workflow.version": "2", "eventra.phase.kind": kind, "eventra.phase.attempt": "0",
-                    "eventra.phase.result": result if kind == "review" else "pass", "eventra.phase.sha.frontend": "f" * 40,
+            child_id = uid(100 + stage * 10 + index)
+            evidence_id = uid(200 + stage * 10 + index)
+            meta = {"eventra.workflow.version": "2", "eventra.phase.kind": kind, "eventra.phase.attempt": attempt,
+                    "eventra.phase.result": result if kind == "review" else "pass", "eventra.phase.sha.frontend": candidate_sha,
                     "eventra.phase.creation_action": action, "eventra.phase.target": "repository:frontend", "eventra.phase.role": role,
                     "eventra.phase.evidence_comment": evidence_id, "eventra.phase.failure_repositories": "[]"}
             if result != "pass" and kind == "review":
@@ -3181,11 +3208,175 @@ class RefreshWorkflowTests(unittest.TestCase):
                         "author_id": data["assignment"]["roles"][role],
                         "author_type": "agent", "revision": 1,
                         "content": evidence_content}
-            data["children"].append({"detail": issue_detail(id=child_id, identifier=f"PRO-{940 + index}", parent_issue_id=uid(2),
-                                     stage=3, project_id=uid(5), assignee_id=data["assignment"]["roles"][role], status="done", workspace_id=uid(1)),
+            data["children"].append({"detail": issue_detail(id=child_id, identifier=f"PRO-{900 + stage * 10 + index}", parent_issue_id=uid(2),
+                                     stage=stage, project_id=uid(5), assignee_id=data["assignment"]["roles"][role], status="done", workspace_id=uid(1)),
                                      "metadata": meta, "evidence": evidence,
                                      "comment_manifest": self.c.comment_manifest(
                                          [evidence_record], child_id)})
+        return data
+
+    def smoke(self, data):
+        from tools.multica.tests.test_candidate_refresh import uid
+        from tools.multica.tests.test_issue_contracts import issue_detail
+
+        data = copy.deepcopy(data)
+        stage = int(data["metadata"]["eventra.workflow.next_stage"])
+        attempt = data["metadata"]["eventra.workflow.attempt"]
+        candidate_sha = data["metadata"]["eventra.workflow.frontend_sha"]
+        before = self.parent(data)
+        action = workflow_module._action_key(
+            replace(before, last_action=None),
+            "create_smoke_stage", before.attempt)
+        data["metadata"].update({
+            "eventra.workflow.next_stage": str(stage + 1),
+            "eventra.workflow.last_action": action,
+        })
+        child_id, evidence_id = uid(50), uid(51)
+        metadata = {
+            "eventra.workflow.version": "2",
+            "eventra.phase.kind": "smoke",
+            "eventra.phase.attempt": attempt,
+            "eventra.phase.result": "pass",
+            "eventra.phase.sha.frontend": candidate_sha,
+            "eventra.phase.creation_action": action,
+            "eventra.phase.target": "suite:smoke",
+            "eventra.phase.role": "integration_qa",
+            "eventra.phase.evidence_comment": evidence_id,
+            "eventra.phase.failure_repositories": "[]",
+        }
+        evidence_content = "smoke evidence"
+        record = {
+            "id": evidence_id, "issue_id": child_id,
+            "author_id": data["assignment"]["roles"]["integration_qa"],
+            "author_type": "agent", "type": "comment", "revision": 1,
+            "created_at": "2026-09-05T02:00:00Z",
+            "content": evidence_content,
+        }
+        data["children"].append({
+            "detail": issue_detail(
+                id=child_id, identifier="PRO-950", parent_issue_id=uid(2),
+                stage=stage, project_id=uid(5),
+                assignee_id=data["assignment"]["roles"]["integration_qa"],
+                status="done", workspace_id=uid(1)),
+            "metadata": metadata,
+            "evidence": {
+                "issue_id": child_id, "comment_uuid": evidence_id,
+                "author_id": data["assignment"]["roles"]["integration_qa"],
+                "author_type": "agent", "revision": 1,
+                "content": evidence_content,
+            },
+            "comment_manifest": self.c.comment_manifest([record], child_id),
+        })
+        return data
+
+    def merged(self, data):
+        data = copy.deepcopy(data)
+        before = self.parent(data)
+        action = workflow_module._action_key(
+            replace(before, last_action=None), "merge", before.attempt)
+        data["metadata"].update({
+            "eventra.workflow.merge_state": "merged",
+            "eventra.workflow.last_action": action,
+        })
+        data["pr"].update({"state": "merged", "merged": True})
+        return data
+
+    def repaired(self, data):
+        from tools.multica.tests.test_candidate_refresh import uid
+        from tools.multica.tests.test_issue_contracts import issue_detail
+
+        data = copy.deepcopy(data)
+        source_parent = self.parent(data)
+        source_attempt = int(data["metadata"]["eventra.workflow.attempt"])
+        if source_attempt == 2:
+            source_gates = tuple(
+                item for item in source_parent.children
+                if item.stage == source_parent.next_stage - 1)
+            bundle = _failure_bundle(source_parent, source_gates)
+            authorization_uuid = uid(700)
+            authorizing_comment = AuthorizingComment(
+                authorization_uuid,
+                "member",
+                json.dumps({
+                    "bundle_digest": bundle["digest"],
+                    "granted_round": 3,
+                }, sort_keys=True, separators=(",", ":")),
+            )
+            source_parent = replace(
+                source_parent,
+                authorization_comment_uuid=authorization_uuid,
+                authorizing_comment=authorizing_comment,
+            )
+            self.repair_authorizations[authorization_uuid] = authorizing_comment
+        decision = decide_parent_action(source_parent)
+        self.assertEqual(decision.kind, "create_repair_stage")
+        bundle = decision.failure_bundle
+        stage = int(data["metadata"]["eventra.workflow.next_stage"])
+        repair_attempt = source_attempt + 1
+        target_sha = ("a", "c", "d")[source_attempt] * 40
+        data["metadata"].update({
+            "eventra.workflow.attempt": str(repair_attempt),
+            "eventra.workflow.next_stage": str(stage + 1),
+            "eventra.workflow.last_action": decision.action_key,
+            "eventra.workflow.frontend_sha": target_sha,
+        })
+        if repair_attempt == 3:
+            data["metadata"][
+                workflow_module.REPAIR_AUTHORIZATION_CONSUMED_KEY
+            ] = decision.action_key.rsplit(":authorization:", 1)[1]
+        data["pr"]["head_sha"] = target_sha
+        child_id, evidence_id = uid(300 + stage), uid(400 + stage)
+        evidence_uuids = sorted(
+            failure["evidence_comment_uuid"]
+            for failure in bundle["failures"])
+        metadata = {
+            "eventra.workflow.version": "2",
+            "eventra.phase.kind": "repair",
+            "eventra.phase.attempt": str(repair_attempt),
+            "eventra.phase.result": "pass",
+            "eventra.phase.sha.frontend": target_sha,
+            "eventra.phase.pr": data["pr"]["url"],
+            "eventra.phase.failure_repositories": "[]",
+            "eventra.phase.evidence_comment": evidence_id,
+            "eventra.repair.creation_action": decision.action_key,
+            "eventra.repair.failure_bundle_digest": bundle["digest"],
+            "eventra.repair.failure_evidence_uuids": json.dumps(
+                evidence_uuids, sort_keys=True, separators=(",", ":")),
+            "eventra.repair.authorizing_comment_uuid": (
+                "" if repair_attempt < 3
+                else data["metadata"][
+                    workflow_module.REPAIR_AUTHORIZATION_CONSUMED_KEY]
+            ),
+            "eventra.repair.repository": "frontend",
+            "eventra.repair.pull_request": data["pr"]["url"],
+            "eventra.repair.round": str(repair_attempt),
+            "eventra.repair.source_candidates": json.dumps(
+                bundle["candidate_shas"], sort_keys=True,
+                separators=(",", ":")),
+        }
+        evidence_content = "repair evidence"
+        record = {
+            "id": evidence_id, "issue_id": child_id,
+            "author_id": data["assignment"]["roles"]["frontend_engineer"],
+            "author_type": "agent", "type": "comment", "revision": 1,
+            "created_at": "2026-09-05T02:00:00Z",
+            "content": evidence_content,
+        }
+        data["children"].append({
+            "detail": issue_detail(
+                id=child_id, identifier=f"PRO-{1000 + stage}", parent_issue_id=uid(2),
+                stage=stage, project_id=uid(5),
+                assignee_id=data["assignment"]["roles"]["frontend_engineer"],
+                status="done", workspace_id=uid(1)),
+            "metadata": metadata,
+            "evidence": {
+                "issue_id": child_id, "comment_uuid": evidence_id,
+                "author_id": data["assignment"]["roles"]["frontend_engineer"],
+                "author_type": "agent", "revision": 1,
+                "content": evidence_content,
+            },
+            "comment_manifest": self.c.comment_manifest([record], child_id),
+        })
         return data
 
     def test_legacy_gate_decision_remains_unchanged(self):
@@ -3236,6 +3427,253 @@ class RefreshWorkflowTests(unittest.TestCase):
         self.assertIn("next-stage:3", result.action_key)
         self.assertEqual(parent.children[0], before)
         self.assertEqual(parent.children[0].frontend_sha, "b" * 40)
+
+    def test_v2_adoption_creates_only_stage_four_gates(self):
+        _, data = self.v2_fixture()
+        parent = self.parent(data)
+
+        result = decide_parent_action(parent)
+
+        self.assertEqual(result.kind, "create_gate_stage")
+        self.assertIn("next-stage:4", result.action_key)
+        self.assertEqual(
+            [item.stage for item in parent.children if item.kind == "refresh"],
+            [3],
+        )
+        self.assertEqual(
+            [(item["detail"]["stage"], item["detail"]["status"])
+             for item in data["children"]
+             if item["detail"]["identifier"] in {"PRO-902", "PRO-903"}],
+            [(2, "cancelled"), (2, "cancelled")],
+        )
+        self.assertFalse(any(
+            item.issue_key in {"PRO-902", "PRO-903"}
+            for item in parent.children))
+
+    def test_v2_only_stage_four_gates_count_for_pass_or_repair(self):
+        _, data = self.v2_fixture()
+        passed = self.gates(data)
+        pass_result = decide_parent_action(self.parent(passed))
+        self.assertEqual((pass_result.kind, pass_result.reason),
+                         ("noop", "human merge approval required"))
+
+        failed = self.gates(data, result="fail")
+        failure_result = decide_parent_action(self.parent(failed))
+        self.assertEqual(failure_result.kind, "create_repair_stage")
+        self.assertIn("create_repair_stage:1", failure_result.action_key)
+
+        wrong_stage = self.gates(data)
+        for child in wrong_stage["children"][-2:]:
+            child["detail"]["stage"] = 3
+        self.assertEqual(
+            decide_parent_action(self.parent(wrong_stage)).kind,
+            "block_parent",
+        )
+
+    def test_v2_receipt_survives_merge_and_later_smoke_history(self):
+        _, adopted = self.v2_fixture()
+        receipt = adopted["metadata"]["eventra.refresh.supersession"]
+        gated = self.merged(self.gates(adopted))
+
+        merged = decide_parent_action(self.parent(gated))
+
+        self.assertEqual(merged.kind, "create_smoke_stage")
+        self.assertEqual(gated["metadata"]["eventra.refresh.supersession"], receipt)
+
+        smoked = self.smoke(gated)
+        completed = decide_parent_action(self.parent(smoked))
+        self.assertEqual(completed.kind, "complete_parent")
+        self.assertEqual(smoked["metadata"]["eventra.refresh.supersession"], receipt)
+
+    def test_v2_merged_state_cannot_bypass_fresh_gate_quality(self):
+        _, adopted = self.v2_fixture()
+
+        cases = []
+        cases.append(("missing", self.merged(adopted), "block_parent"))
+        for result in ("fail", "blocked"):
+            cases.append((result, self.merged(
+                self.gates(adopted, result=result)), "block_parent"))
+
+        active = self.gates(adopted)
+        active["children"][-1]["detail"]["status"] = "in_progress"
+        cases.append(("active", self.merged(active), "noop"))
+
+        wrong_sha = self.gates(adopted)
+        wrong_sha["children"][-1]["metadata"][
+            "eventra.phase.sha.frontend"] = "a" * 40
+        cases.append(("wrong-sha", self.merged(wrong_sha), "block_parent"))
+
+        for name, data, expected in cases:
+            with self.subTest(name=name):
+                result = decide_parent_action(self.parent(data))
+                self.assertEqual(result.kind, expected)
+                self.assertNotEqual(result.kind, "create_smoke_stage")
+
+    def test_v2_existing_smoke_cannot_hide_nonpassing_gate_history(self):
+        _, adopted = self.v2_fixture()
+        cases = []
+        for result in ("fail", "blocked"):
+            gated = self.merged(self.gates(adopted, result=result))
+            cases.append((result, self.smoke(gated)))
+
+        active = self.gates(adopted)
+        active["children"][-1]["detail"]["status"] = "in_progress"
+        cases.append(("active", self.smoke(self.merged(active))))
+
+        for name, data in cases:
+            with self.subTest(name=name):
+                result = decide_parent_action(self.parent(data))
+                self.assertEqual(result.kind, "block_parent")
+                self.assertNotEqual(result.kind, "complete_parent")
+
+    def test_v2_repair_then_passing_gates_can_reach_smoke_completion(self):
+        _, adopted = self.v2_fixture()
+        repaired = self.repaired(self.gates(adopted, result="fail"))
+        regated = self.gates(repaired)
+        merged = self.merged(regated)
+
+        self.assertEqual(
+            decide_parent_action(self.parent(merged)).kind,
+            "create_smoke_stage",
+        )
+        self.assertEqual(
+            decide_parent_action(self.parent(self.smoke(merged))).kind,
+            "complete_parent",
+        )
+
+    def test_v2_post_repair_gates_require_valid_repair_history(self):
+        from tools.multica.tests.test_candidate_refresh import uid
+
+        def creation_action(child, value):
+            action = child["metadata"]["eventra.repair.creation_action"]
+            parts = action.split(":")
+            parts[12] = value
+            child["metadata"]["eventra.repair.creation_action"] = ":".join(parts)
+
+        def source_candidates(child):
+            replacement = "b" * 40
+            child["metadata"]["eventra.repair.source_candidates"] = json.dumps(
+                {"frontend": replacement}, sort_keys=True,
+                separators=(",", ":"))
+            action = child["metadata"]["eventra.repair.creation_action"]
+            child["metadata"]["eventra.repair.creation_action"] = action.replace(
+                ":frontend:" + "f" * 40 + ":-:",
+                ":frontend:" + replacement + ":-:",
+            )
+
+        def failed_result(child):
+            child["metadata"]["eventra.phase.result"] = "fail"
+
+        mutations = (
+            ("bundle-digest", lambda child: child["metadata"].__setitem__(
+                "eventra.repair.failure_bundle_digest", "0" * 64)),
+            ("creation-action", lambda child: creation_action(child, "0" * 64)),
+            ("source-candidates", source_candidates),
+            ("evidence-uuids", lambda child: child["metadata"].__setitem__(
+                "eventra.repair.failure_evidence_uuids",
+                json.dumps([uid(99)]))),
+            ("assignment", lambda child: child["detail"].__setitem__(
+                "assignee_id", uid(99))),
+            ("active", lambda child: child["detail"].__setitem__(
+                "status", "in_progress")),
+            ("failed", failed_result),
+        )
+        for name, mutate in mutations:
+            with self.subTest(name=name):
+                _, adopted = self.v2_fixture()
+                repaired = self.repaired(self.gates(adopted, result="fail"))
+                repair = next(child for child in repaired["children"]
+                              if child["metadata"].get("eventra.phase.kind") == "repair")
+                mutate(repair)
+                merged = self.merged(self.gates(repaired))
+                result = decide_parent_action(self.parent(merged))
+                self.assertEqual(result.kind, "block_parent")
+                self.assertNotEqual(result.kind, "create_smoke_stage")
+
+    def test_v2_multiple_valid_repairs_revalidate_before_smoke(self):
+        _, adopted = self.v2_fixture()
+        first = self.repaired(self.gates(adopted, result="fail"))
+        second = self.repaired(self.gates(first, result="fail"))
+        merged = self.merged(self.gates(second))
+
+        self.assertEqual(
+            decide_parent_action(self.parent(merged)).kind,
+            "create_smoke_stage",
+        )
+        self.assertEqual(
+            decide_parent_action(self.parent(self.smoke(merged))).kind,
+            "complete_parent",
+        )
+
+    def test_v2_round_three_authorization_is_revalidated_before_smoke(self):
+        from tools.multica.tests.test_candidate_refresh import uid
+
+        _, adopted = self.v2_fixture()
+        first = self.repaired(self.gates(adopted, result="fail"))
+        second = self.repaired(self.gates(first, result="fail"))
+        third = self.repaired(self.gates(second, result="fail"))
+        merged = self.merged(self.gates(third))
+        parent = self.parent(merged)
+
+        self.assertEqual(decide_parent_action(parent).kind,
+                         "create_smoke_stage")
+        self.assertEqual(
+            decide_parent_action(self.parent(self.smoke(merged))).kind,
+            "complete_parent",
+        )
+
+        valid = parent.consumed_authorizing_comment
+        self.assertIsNotNone(valid)
+        bodies = (
+            ("missing", None),
+            ("wrong-author", replace(valid, author_type="agent")),
+            ("wrong-body", replace(valid, content="{}")),
+            ("wrong-digest", replace(valid, content=json.dumps({
+                "bundle_digest": "0" * 64, "granted_round": 3,
+            }, sort_keys=True, separators=(",", ":")))),
+            ("wrong-round", replace(valid, content=json.dumps({
+                "bundle_digest": json.loads(valid.content)["bundle_digest"],
+                "granted_round": 2,
+            }, sort_keys=True, separators=(",", ":")))),
+        )
+        for name, comment in bodies:
+            with self.subTest(name=name):
+                changed = replace(
+                    parent, consumed_authorizing_comment=comment)
+                self.assertEqual(
+                    decide_parent_action(changed).kind, "block_parent")
+
+        forged_uuid = uid(799)
+        forged_children = tuple(
+            replace(
+                item,
+                authorizing_comment_uuid=forged_uuid,
+                creation_action=item.creation_action.rsplit(
+                    ":authorization:", 1)[0]
+                    + ":authorization:" + forged_uuid,
+            )
+            if item.kind == "repair" and item.attempt == 3
+            else item
+            for item in parent.children
+        )
+        forged = replace(
+            parent,
+            children=forged_children,
+            consumed_authorization_uuid=forged_uuid,
+            consumed_authorizing_comment=None,
+        )
+        self.assertEqual(decide_parent_action(forged).kind, "block_parent")
+
+    def test_v2_receipt_survives_later_repair_history(self):
+        _, adopted = self.v2_fixture()
+        receipt = adopted["metadata"]["eventra.refresh.supersession"]
+        repaired = self.repaired(self.gates(adopted, result="fail"))
+
+        result = decide_parent_action(self.parent(repaired))
+
+        self.assertEqual(result.kind, "create_gate_stage")
+        self.assertIn("next-stage:6", result.action_key)
+        self.assertEqual(repaired["metadata"]["eventra.refresh.supersession"], receipt)
 
     def test_full_gate_pass_keeps_human_merge_hold(self):
         _, data = self.fixture(adopted=True)
@@ -4288,6 +4726,16 @@ class ParentDecisionTests(unittest.TestCase):
                 ),
             ),
             consumed_authorization_uuid=authorization_uuid,
+            consumed_authorizing_comment=(
+                None if repair_round != 3 else AuthorizingComment(
+                    authorization_uuid,
+                    "member",
+                    json.dumps({
+                        "bundle_digest": bundle["digest"],
+                        "granted_round": 3,
+                    }, sort_keys=True, separators=(",", ":")),
+                )
+            ),
         )
 
     def test_partial_repair_requires_completed_output_to_equal_current_head(self):
@@ -6836,7 +7284,8 @@ class FakeWatchRunner:
         if call[:2] == ("issue", "list"):
             flags = dict(zip(call[2::2], call[3::2]))
             self._assert_list_flags(flags)
-            parent_version = self.metadata["PRO-35"]["eventra.workflow.version"]
+            parent_key = self.parent["identifier"]
+            parent_version = self.metadata[parent_key]["eventra.workflow.version"]
             expected_filter = {
                 "1": '"eventra.workflow.version=""1"""',
                 "2": '"eventra.workflow.version=""2"""',
@@ -6856,7 +7305,7 @@ class FakeWatchRunner:
                 "total": len(issues),
             }
         if call[:2] == ("issue", "get"):
-            if call[2] == "PRO-35":
+            if call[2] == self.parent["identifier"]:
                 return copy.deepcopy(self.parent)
             return copy.deepcopy(
                 next(
@@ -6865,7 +7314,9 @@ class FakeWatchRunner:
                     if child["identifier"] == call[2]
                 )
             )
-        if call == ("issue", "children", "PRO-35", "--output", "json"):
+        if call == (
+            "issue", "children", self.parent["identifier"], "--output", "json"
+        ):
             stages = []
             for stage in sorted({child["stage"] for child in self.children}):
                 children = [
@@ -7088,6 +7539,52 @@ class WatchWorkflowTests(unittest.TestCase):
             github=runner.github,
             refresh_api=refresh_api,
         )
+
+    @staticmethod
+    def _round_three_gate_runner(*, active: bool):
+        fixture = RefreshWorkflowTests(
+            methodName=(
+                "test_v2_round_three_authorization_is_revalidated_before_smoke"
+            )
+        )
+        fixture.setUp()
+        _, adopted = fixture.v2_fixture()
+        first = fixture.repaired(fixture.gates(adopted, result="fail"))
+        second = fixture.repaired(fixture.gates(first, result="fail"))
+        third = fixture.repaired(fixture.gates(second, result="fail"))
+        parent = replace(
+            fixture.parent(fixture.gates(third)), refresh_state=None)
+        current = tuple(item for item in parent.children
+                        if item.stage == parent.next_stage - 1)
+        target = current[0].issue_key
+        if active:
+            parent = replace(
+                parent,
+                children=tuple(
+                    replace(item, status="in_review", result=None,
+                            evidence_comment="")
+                    if item.issue_key == target else item
+                    for item in parent.children
+                ),
+            )
+        runner = FakeWatchRunner()
+        runner.install_parent_snapshot(parent, target)
+        runner.evidence_comments[parent.identifier][0]["author_type"] = "agent"
+        return runner
+
+    def test_watcher_never_recovers_post_round_three_work_with_invalid_comment(self):
+        for active in (False, True):
+            for apply in (False, True):
+                with self.subTest(active=active, apply=apply):
+                    runner = self._round_three_gate_runner(active=active)
+
+                    result = self._watch(runner, apply=apply)
+
+                    self.assertEqual(result.applied, 0)
+                    self.assertEqual(result.decision, "noop")
+                    self.assertFalse(any(
+                        call[:2] == ("issue", "rerun")
+                        for call in runner.calls))
 
     def test_watcher_never_reruns_a_refresh_reservation(self):
         from tools.multica.tests.test_candidate_refresh import refresh_snapshot_fixture
@@ -7394,6 +7891,7 @@ class WatchWorkflowTests(unittest.TestCase):
             children=source.children + (current,),
             consumed_authorization_uuid=auth_uuid,
             authorization_comment_uuid="",
+            consumed_authorizing_comment=source.authorizing_comment,
             authorizing_comment=None,
         )
 
@@ -9027,6 +9525,115 @@ class SmokeExecutionTests(unittest.TestCase):
         )
         self.assertEqual(decision.kind, "retry_smoke_stage", decision.reason)
         return runner, github, decision, smoke_key
+
+    def _round_three_smoke_reserved(self):
+        fixture = RefreshWorkflowTests(
+            methodName=(
+                "test_v2_round_three_authorization_is_revalidated_before_smoke"
+            )
+        )
+        fixture.setUp()
+        _, adopted = fixture.v2_fixture()
+        first = fixture.repaired(fixture.gates(adopted, result="fail"))
+        second = fixture.repaired(fixture.gates(first, result="fail"))
+        third = fixture.repaired(fixture.gates(second, result="fail"))
+        snapshot = fixture.parent(
+            fixture.merged(fixture.gates(third, result="pass"))
+        )
+        decision = decide_parent_action(snapshot)
+        self.assertEqual(
+            decision.kind,
+            "create_smoke_stage",
+            decision.reason,
+        )
+        reservation = workflow_module._build_smoke_reservation(
+            snapshot,
+            decision,
+        )
+        target_key = next(
+            item.issue_key
+            for item in snapshot.children
+            if item.stage == snapshot.next_stage - 1
+        )
+        runner = FakeSnapshotFinishRunner(snapshot, target_key)
+        runner.parent_metadata[workflow_module.SMOKE_RESERVATION_KEY] = (
+            workflow_module._canonical_json(reservation)
+        )
+        github = FakeSnapshotGitHubRunner(snapshot.pull_requests)
+        return runner, github, decision, snapshot.consumed_authorization_uuid
+
+    def test_round_three_smoke_reservation_rejects_invalid_member_comment_without_writes(self):
+        corruptions = (
+            ("missing", lambda runner, comment: runner.evidence_comments[
+                runner.snapshot.identifier
+            ].clear()),
+            ("author", lambda runner, comment: comment.__setitem__(
+                "author_type", "agent")),
+            ("body", lambda runner, comment: comment.__setitem__(
+                "content", "{}")),
+            ("digest", lambda runner, comment: comment.__setitem__(
+                "content", json.dumps({
+                    "bundle_digest": "0" * 64,
+                    "granted_round": 3,
+                }, sort_keys=True, separators=(",", ":")))),
+            ("round", lambda runner, comment: comment.__setitem__(
+                "content", json.dumps({
+                    "bundle_digest": json.loads(comment["content"])[
+                        "bundle_digest"
+                    ],
+                    "granted_round": 2,
+                }, sort_keys=True, separators=(",", ":")))),
+            ("uuid", lambda runner, comment: runner.parent_metadata.__setitem__(
+                workflow_module.REPAIR_AUTHORIZATION_CONSUMED_KEY,
+                "00000000-0000-4000-8000-000000000099",
+            )),
+        )
+        for name, corrupt in corruptions:
+            with self.subTest(name=name):
+                runner, github, decision, authorization_uuid = (
+                    self._round_three_smoke_reserved()
+                )
+                comment = next(
+                    item
+                    for item in runner.evidence_comments[
+                        runner.snapshot.identifier
+                    ]
+                    if item["id"] == authorization_uuid
+                )
+                corrupt(runner, comment)
+
+                result = execute_parent_smoke(
+                    runner,
+                    github,
+                    runner.snapshot.identifier,
+                    expected_action_key=decision.action_key,
+                )
+
+                self.assertEqual(result.next_action, "block", result.reason)
+                self.assertEqual(result.mutation_count, 0)
+                self.assertEqual(runner.mutation_count, 0)
+                self.assertFalse(any(
+                    call[:2] == ("issue", "create")
+                    for call in runner.calls
+                ))
+
+    def test_round_three_smoke_reservation_rejects_comment_drift_without_writes(self):
+        runner, github, decision, _ = self._round_three_smoke_reserved()
+        runner.evidence_drift_after_first_read.add(runner.snapshot.identifier)
+
+        result = execute_parent_smoke(
+            runner,
+            github,
+            runner.snapshot.identifier,
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(result.next_action, "block", result.reason)
+        self.assertEqual(result.mutation_count, 0)
+        self.assertEqual(runner.mutation_count, 0)
+        self.assertFalse(any(
+            call[:2] == ("issue", "create") for call in runner.calls
+        ))
 
     def test_retry_smoke_executor_creates_one_source_bound_child(self):
         runner, github, decision, source_key = self._retry_planned()
@@ -10974,6 +11581,51 @@ class RepairExecutionTests(unittest.TestCase):
         self.assertIn("--assignee-id", create_call)
         self.assertNotIn("--assignee", create_call)
 
+    def test_post_consumption_reservation_rejects_invalid_member_comment_without_writes(self):
+        mutations = (
+            ("author", lambda comment: comment.__setitem__(
+                "author_type", "agent")),
+            ("body", lambda comment: comment.__setitem__("content", "{}")),
+            ("digest", lambda comment: comment.__setitem__(
+                "content", json.dumps({
+                    "bundle_digest": "0" * 64,
+                    "granted_round": 3,
+                }, sort_keys=True, separators=(",", ":")))),
+            ("round", lambda comment: comment.__setitem__(
+                "content", json.dumps({
+                    "bundle_digest": json.loads(comment["content"])[
+                        "bundle_digest"],
+                    "granted_round": 2,
+                }, sort_keys=True, separators=(",", ":")))),
+        )
+        for name, mutate in mutations:
+            with self.subTest(name=name):
+                runner, github, decision = self._planned()
+                snapshot = load_parent_snapshot(runner, github, "PRO-65")
+                reservation = _build_repair_reservation(snapshot, decision)
+                parent = runner.metadata["PRO-65"]
+                parent.update({
+                    workflow_module.REPAIR_RESERVATION_KEY:
+                        workflow_module._canonical_json(reservation),
+                    "eventra.workflow.attempt": "3",
+                    "eventra.workflow.next_stage": "8",
+                    "eventra.workflow.last_action": decision.action_key,
+                    workflow_module.REPAIR_AUTHORIZATION_CONSUMED_KEY:
+                        FakeRepairRunner.AUTH_UUID,
+                })
+                parent.pop(workflow_module.REPAIR_AUTHORIZATION_KEY)
+                mutate(runner.comments[0])
+                before = runner.committed_mutations
+
+                result = execute_parent_repair(
+                    runner, github, "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+
+                self.assertEqual(result.next_action, "block")
+                self.assertEqual(result.mutation_count, 0)
+                self.assertEqual(runner.committed_mutations, before)
+
     def test_executor_is_the_exact_single_path_for_automatic_rounds_one_and_two(self):
         for current_round in (0, 1):
             with self.subTest(current_round=current_round):
@@ -11975,6 +12627,79 @@ class ParentSnapshotReadTests(unittest.TestCase):
             ),
             runner.calls,
         )
+
+    def test_consumed_repair_authorization_is_loaded_and_reread(self):
+        runner = FakeParentRunner()
+        comment_uuid = "00000000-0000-4000-8000-000000000061"
+        content = json.dumps(
+            {"bundle_digest": "a" * 64, "granted_round": 3},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        runner.metadata["PRO-35"][
+            workflow_module.REPAIR_AUTHORIZATION_CONSUMED_KEY
+        ] = comment_uuid
+        runner.comment_records = [{
+            "id": comment_uuid,
+            "author_type": "member",
+            "content": content,
+        }]
+
+        snapshot = load_parent_snapshot(
+            runner, FakeGitHubRunner(), "PRO-35")
+
+        self.assertEqual(snapshot.consumed_authorization_uuid, comment_uuid)
+        self.assertEqual(
+            snapshot.consumed_authorizing_comment,
+            AuthorizingComment(comment_uuid, "member", content),
+        )
+        scoped_read = (
+            "issue", "comment", "list", "PRO-35", "--thread",
+            comment_uuid, "--full", "--compact", "--output", "json",
+        )
+        self.assertGreaterEqual(runner.calls.count(scoped_read), 2)
+
+    def test_missing_consumed_repair_authorization_fails_closed(self):
+        runner = FakeParentRunner()
+        comment_uuid = "00000000-0000-4000-8000-000000000061"
+        runner.metadata["PRO-35"][
+            workflow_module.REPAIR_AUTHORIZATION_CONSUMED_KEY
+        ] = comment_uuid
+
+        with self.assertRaisesRegex(RuntimeError, "authorizing comment"):
+            load_parent_snapshot(runner, FakeGitHubRunner(), "PRO-35")
+
+    def test_consumed_repair_authorization_drift_fails_closed(self):
+        class DriftingCommentRunner(FakeParentRunner):
+            def __init__(self):
+                super().__init__()
+                self.authorization_reads = 0
+
+            def run(self, args, *, stdin_json=None):
+                if tuple(args)[:4] == (
+                    "issue", "comment", "list", "PRO-35"
+                ):
+                    self.authorization_reads += 1
+                    if self.authorization_reads == 2:
+                        self.comment_records = []
+                return super().run(args, stdin_json=stdin_json)
+
+        runner = DriftingCommentRunner()
+        comment_uuid = "00000000-0000-4000-8000-000000000061"
+        runner.metadata["PRO-35"][
+            workflow_module.REPAIR_AUTHORIZATION_CONSUMED_KEY
+        ] = comment_uuid
+        runner.comment_records = [{
+            "id": comment_uuid,
+            "author_type": "member",
+            "content": '{"bundle_digest":"' + "a" * 64
+                       + '","granted_round":3}',
+        }]
+
+        with self.assertRaisesRegex(
+            RuntimeError, "consumed repair authorization changed"
+        ):
+            load_parent_snapshot(runner, FakeGitHubRunner(), "PRO-35")
 
     def test_missing_or_wrong_parent_authorization_comment_fails_closed(self):
         runner = FakeParentRunner()

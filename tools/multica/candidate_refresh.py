@@ -929,7 +929,8 @@ def _source_authority(payload: dict, state: dict) -> dict:
     return child
 
 
-def _shared_authority(payload: dict, state: dict) -> None:
+def _shared_authority(payload: dict, state: dict, *,
+                      allow_managed_merge: bool = False) -> None:
     parent, assignment = state["parent"], state["assignment"]
     expected = payload["assignment"]
     base_assignment = {key: expected[key] for key in (
@@ -954,7 +955,10 @@ def _shared_authority(payload: dict, state: dict) -> None:
              "control tool identity mismatch")
     pr = state["pr"]
     _require(all(pr.get(k) == v for k, v in payload["pr"].items())
-             and pr.get("state") == "open" and pr.get("merged") is False, "managed PR identity mismatch")
+             and ((pr.get("state") == "open" and pr.get("merged") is False)
+                  or (allow_managed_merge and pr.get("state") == "merged"
+                      and pr.get("merged") is True)),
+             "managed PR identity mismatch")
     prerequisite = state["prerequisite"]
     _require(all(prerequisite.get(k) == v for k, v in payload["prerequisite"].items())
              and prerequisite.get("merged") is True
@@ -1168,6 +1172,7 @@ def admit_refresh(request: RefreshRequest, snapshot: RefreshSnapshot, grant: Ref
 REFRESH_PREFIX = "eventra.refresh."
 REFRESH_FIELDS = frozenset({"version", "request", "request_comment", "request_digest", "authorization_comment",
                             "reservation", "consumed", "adoption", "merge_permission"})
+V2_REFRESH_FIELDS = REFRESH_FIELDS | {"supersession"}
 RESERVATION_STATES = ("reserved", "child_initialized", "child_dispatched", "candidate_registered", "published", "adopted")
 V2_RESERVATION_STATES = ("reserved", "review_cancelled", "gates_cancelled",
                          "child_initialized", "child_dispatched",
@@ -1179,6 +1184,12 @@ V2_RESERVATION_FIELDS = frozenset({
     "fresh_gate_stage", "child_id", "child_identifier", "child_position",
     "prepared", "parent_status_category", "parent_position",
     "parent_projection_digest",
+})
+V2_PUBLICATION_RESERVATION_FIELDS = frozenset({
+    "version", "request_digest", "request_uuid", "authorization_uuid",
+    "action_key", "state", "child_id", "child_identifier",
+    "child_position", "prepared", "parent_status_category",
+    "parent_position", "parent_projection_digest",
 })
 
 
@@ -1209,6 +1220,45 @@ def _refresh_stage(request: RefreshRequest) -> int:
 def _fresh_gate_stage(request: RefreshRequest) -> int:
     payload = _request(request)
     return payload.get("fresh_gate_stage", payload["refresh_stage"] + 1)
+
+
+def _prepared_checkpoint(
+        request: RefreshRequest, prepared: PreparedCandidate) -> dict[str, str]:
+    encoded = canonical_json(asdict(prepared))
+    if refresh_protocol(request) == 1:
+        return asdict(prepared)
+    return {"digest": hashlib.sha256(encoded.encode("utf-8")).hexdigest()}
+
+
+def _v2_publication_reservation(
+        request: RefreshRequest, state: dict, reservation: object) -> dict:
+    _require(type(reservation) is dict
+             and set(reservation) == V2_PUBLICATION_RESERVATION_FIELDS,
+             "invalid v2 publication reservation shape")
+    value = reservation
+    _integer(value["version"], 2)
+    for key in ("request_uuid", "authorization_uuid", "child_id"):
+        _uuid(value[key])
+    _match(value["child_identifier"], _ISSUE)
+    _match(value["parent_projection_digest"], _DIGEST)
+    _require(value["request_digest"] == request.digest
+             and value["action_key"] == refresh_action(request)
+             and value["state"] in {
+                 "candidate_registered", "published", "adopted"}
+             and type(value["child_position"]) is int
+             and type(value["parent_status_category"]) is str
+             and type(value["parent_position"]) is int
+             and state["parent"].get("position") == value["parent_position"],
+             "invalid v2 publication reservation identity")
+    prepared = _object(value["prepared"], "digest")
+    _match(prepared["digest"], _DIGEST)
+    feature = refresh_metadata(state["metadata"])
+    _require(feature is not None and feature.get("reservation") == value
+             and feature.get("request_comment") == value["request_uuid"]
+             and feature.get("authorization_comment") ==
+                 value["authorization_uuid"],
+             "v2 publication reservation binding mismatch")
+    return value
 
 
 def _v2_reservation(request: RefreshRequest, state: dict,
@@ -1378,8 +1428,8 @@ def validate_supersession_initialization_authority(
     payload, state = _request(request), _snapshot(snapshot)
     value = _v2_reservation(
         request, state, reservation, require_projection=False)
-    _require(value["state"] in {"gates_cancelled", "child_initialized",
-                                "child_dispatched"},
+    _require(value["state"] in {
+        "gates_cancelled", "child_initialized", "child_dispatched"},
              "invalid v2 initialization state")
     base_ids = {payload["source"]["child_id"],
                 *(gate["id"] for gate in payload["supersession"]["gates"])}
@@ -1405,6 +1455,7 @@ def validate_supersession_initialization_authority(
         **value, "state": "gates_cancelled", "child_id": None,
         "child_identifier": None, "child_position": None, "prepared": None,
     }
+    restored["metadata"].pop(REFRESH_PREFIX + "supersession", None)
     base_reservation["parent_projection_digest"] = parent_projection_digest(restored)
     restored["metadata"][REFRESH_PREFIX + "reservation"] = canonical_json(
         base_reservation)
@@ -1419,9 +1470,11 @@ def refresh_metadata(metadata: dict[str, str]) -> dict[str, Any] | None:
     values = {k.removeprefix(REFRESH_PREFIX): v for k, v in metadata.items() if k.startswith(REFRESH_PREFIX)}
     if not values:
         return None
-    _require(set(values) <= REFRESH_FIELDS and {"version", "request", "request_digest", "merge_permission"} <= set(values),
-             "incomplete refresh feature metadata")
+    _require({"version", "request", "request_digest", "merge_permission"}
+             <= set(values), "incomplete refresh feature metadata")
     request = parse_request(values["request"])
+    allowed = V2_REFRESH_FIELDS if refresh_protocol(request) == 2 else REFRESH_FIELDS
+    _require(set(values) <= allowed, "incomplete refresh feature metadata")
     _require(values["version"] == str(refresh_protocol(request))
              and values["merge_permission"] == "hold",
              "refresh merge hold is immutable")
@@ -1431,7 +1484,7 @@ def refresh_metadata(metadata: dict[str, str]) -> dict[str, Any] | None:
     for key in ("request_comment", "authorization_comment"):
         if key in values:
             _uuid(values[key])
-    for key in ("reservation", "consumed", "adoption"):
+    for key in ("reservation", "consumed", "adoption", "supersession"):
         if key in values:
             raw = _load_json(values[key], MAX_COMMENT_BYTES)
             _require(type(raw) is dict and values[key] == canonical_json(raw), "noncanonical refresh receipt")
@@ -1561,34 +1614,165 @@ def _reserved_refresh_child(request: RefreshRequest, state: dict) -> None:
 
 
 def _receipt_match(feature: dict, request: RefreshRequest, prepared: PreparedCandidate, *, partial: bool = False) -> None:
-    expected = {"version": 1, "request_digest": request.digest,
+    protocol = refresh_protocol(request)
+    stage = _refresh_stage(request)
+    expected = {"version": protocol, "request_digest": request.digest,
                 "authorization_uuid": feature["authorization_comment"], "child_id": prepared.child_id, "target_sha": prepared.target_sha}
     if not partial or "consumed" in feature:
         consumed = _object(feature.get("consumed"), "version request_digest authorization_uuid child_id target_sha")
-        _integer(consumed["version"], 1)
+        _integer(consumed["version"], protocol)
         _require(consumed == expected and "adoption" in feature, "refresh consumption mismatch")
     if not partial or "adoption" in feature:
         adoption = _object(feature.get("adoption"), "version request_digest authorization_uuid child_id target_sha "
                            "source_sha prerequisite_sha evidence_uuid evidence_digest stage control_tool_sha")
-        _integer(adoption["version"], 1)
-        _integer(adoption["stage"], 2)
+        _integer(adoption["version"], protocol)
+        _integer(adoption["stage"], stage)
         _require(adoption == {**expected, "source_sha": prepared.source_sha, "prerequisite_sha": prepared.prerequisite_sha,
                               "evidence_uuid": prepared.evidence_uuid, "evidence_digest": prepared.evidence_digest,
-                              "stage": 2, "control_tool_sha": request.payload()["control_tool_sha"]}, "refresh adoption mismatch")
+                              "stage": stage, "control_tool_sha": request.payload()["control_tool_sha"]}, "refresh adoption mismatch")
+
+
+def _build_supersession_receipt(
+        request: RefreshRequest, prepared: PreparedCandidate,
+        request_uuid: str, authorization_uuid: str,
+        child_identifier: str) -> dict[str, object]:
+    payload = _request(request)
+    _require(payload["schema_version"] == 2,
+             "supersession receipt requires protocol v2")
+    for value in (request_uuid, authorization_uuid):
+        _uuid(value)
+    _match(child_identifier, _ISSUE)
+    return {
+        "version": 2,
+        "request_digest": request.digest,
+        "request_uuid": request_uuid,
+        "authorization_uuid": authorization_uuid,
+        "gates": [{
+            "id": gate["id"],
+            "identifier": gate["identifier"],
+            "role": gate["role"],
+            "authority_digest": gate["authority_digest"],
+            "cancelled_revision": gate["revision"] + 1,
+        } for gate in payload["supersession"]["gates"]],
+        "source_sha": prepared.source_sha,
+        "target_sha": prepared.target_sha,
+        "pr": payload["pr"],
+        "prerequisite_sha": prepared.prerequisite_sha,
+        "control_tool_sha": payload["control_tool_sha"],
+        "child_id": prepared.child_id,
+        "child_identifier": child_identifier,
+        "evidence_uuid": prepared.evidence_uuid,
+        "evidence_digest": prepared.evidence_digest,
+        "refresh_stage": payload["refresh_stage"],
+        "fresh_gate_stage": payload["fresh_gate_stage"],
+    }
+
+
+def _validate_superseded_gates(
+        request: RefreshRequest, state: dict) -> tuple[dict[str, object], ...]:
+    payload = _request(request)
+    _require(payload["schema_version"] == 2,
+             "superseded gates require protocol v2")
+    records = tuple({
+        "id": gate["id"],
+        "identifier": gate["identifier"],
+        "role": gate["role"],
+        "authority_digest": gate["authority_digest"],
+        "cancelled_revision": gate["revision"] + 1,
+    } for gate in payload["supersession"]["gates"])
+    for frozen, recorded in zip(payload["supersession"]["gates"],
+                                records, strict=True):
+        matches = [item for item in state["children"]
+                   if item.get("detail", {}).get("id") == recorded["id"]]
+        _require(len(matches) == 1, "superseded gate is missing or duplicate")
+        gate = _object(matches[0], "detail metadata evidence comment_manifest")
+        detail = _issue_detail(gate["detail"], "unknown superseded gate field")
+        gate_runs = [run for run in state["runs"]
+                     if run.get("issue_id") == recorded["id"]]
+        _require(detail.get("identifier") == recorded["identifier"]
+                 and detail.get("status") == "cancelled"
+                 and detail.get("status_category") == "cancelled"
+                 and detail.get("revision") == recorded["cancelled_revision"]
+                 and gate["metadata"] == {}
+                 and gate["evidence"] is None
+                 and gate["comment_manifest"] == []
+                 and not gate_runs,
+                 "superseded gate cancellation changed")
+        restored = {
+            **detail,
+            "status": frozen["status"],
+            "status_category": "backlog",
+            "revision": frozen["revision"],
+        }
+        authority = {
+            "detail": {key: value for key, value in restored.items()
+                       if key not in _VOLATILE_DETAIL_FIELDS},
+            "metadata": gate["metadata"],
+            "evidence": gate["evidence"],
+            "comment_manifest": gate["comment_manifest"],
+            "runs": gate_runs,
+        }
+        _require(hashlib.sha256(canonical_json(authority).encode("utf-8")).hexdigest()
+                 == recorded["authority_digest"],
+                 "superseded gate authority changed")
+    return records
+
+
+def _supersession_receipt(
+        feature: dict, request: RefreshRequest, prepared: PreparedCandidate,
+        state: dict) -> dict[str, object]:
+    """Validate the permanent receipt and its still-visible cancelled gates."""
+    refresh_children = [item for item in state["children"]
+                        if item.get("detail", {}).get("id") == prepared.child_id]
+    _require(len(refresh_children) == 1,
+             "refresh receipt child is missing or duplicate")
+    child_identifier = refresh_children[0]["detail"].get("identifier")
+    expected = _build_supersession_receipt(
+        request, prepared, feature["request_comment"],
+        feature["authorization_comment"], child_identifier)
+    receipt = _object(
+        feature.get("supersession"),
+        "version request_digest request_uuid authorization_uuid gates source_sha "
+        "target_sha pr prerequisite_sha control_tool_sha child_id child_identifier "
+        "evidence_uuid evidence_digest refresh_stage fresh_gate_stage",
+    )
+    _integer(receipt["version"], 2)
+    _integer(receipt["refresh_stage"], 3)
+    _integer(receipt["fresh_gate_stage"], 4)
+    _require(type(receipt["gates"]) is list,
+             "refresh supersession gates are malformed")
+    for gate in receipt["gates"]:
+        parsed_gate = _object(
+            gate,
+            "id identifier role authority_digest cancelled_revision")
+        _integer(parsed_gate["cancelled_revision"], 2)
+    _require(receipt == expected, "refresh supersession receipt mismatch")
+    _require(tuple(receipt["gates"]) == _validate_superseded_gates(request, state),
+             "refresh supersession gates changed")
+    return receipt
 
 
 def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> RefreshDecision:
     payload, state = _request(request), _snapshot(snapshot)
-    _shared_authority(payload, state)
+    pre_feature = refresh_metadata(state["metadata"])
+    allow_managed_merge = bool(
+        payload["schema_version"] == 2
+        and pre_feature is not None
+        and "supersession" in pre_feature
+        and "reservation" not in pre_feature
+    )
+    _shared_authority(
+        payload, state, allow_managed_merge=allow_managed_merge)
     initial = None
     if (state["parent"].get("status") == "blocked"
             and not any(key in state["metadata"] for key in
                         (REFRESH_PREFIX + "reservation", REFRESH_PREFIX + "consumed",
-                         REFRESH_PREFIX + "adoption"))):
+                         REFRESH_PREFIX + "adoption",
+                         REFRESH_PREFIX + "supersession"))):
         initial = validate_initial_refresh_progress(request, snapshot)
         if initial.metadata_writes < 4:
             return RefreshDecision("wait", None, "refresh request awaits explicit pause registration")
-    feature = refresh_metadata(state["metadata"])
+    feature = pre_feature
     key = refresh_action(request)
     if feature is None:
         _require(initial is not None and initial.metadata_writes == 0
@@ -1602,7 +1786,8 @@ def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> Refresh
     if "authorization_comment" not in feature:
         _require(initial is not None and initial.metadata_writes in {4, 5}
                  and initial.comment_writes in {0, 1, 2}, "invalid paused refresh prefix")
-        _require(not {"reservation", "consumed", "adoption"} & set(feature)
+        _require(not {"reservation", "consumed", "adoption", "supersession"}
+                 & set(feature)
                  and metadata.get("eventra.workflow.attempt") == "0"
                  and metadata.get("eventra.workflow.next_stage") == "2"
                  and metadata.get("eventra.workflow.last_action") == payload["parent"]["last_action"]
@@ -1624,25 +1809,40 @@ def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> Refresh
     if reservation is None:
         child, prepared = _refresh_child(request, state)
         _require(prepared is not None, "refresh has no completed preparation")
-        _receipt_match(feature, request, prepared)
+        if payload["schema_version"] == 2:
+            _require(not {"adoption", "consumed"} & set(feature),
+                     "v2 refresh has duplicate legacy receipts")
+            _supersession_receipt(feature, request, prepared, state)
+        else:
+            _receipt_match(feature, request, prepared)
         _require(metadata.get("eventra.workflow.attempt") in {"0", "1", "2", "3"}, "refresh attempt mismatch")
         _require(state["parent"].get("status") == "in_progress"
                  and state["parent"].get("status_category") == "in_progress",
                  "adopted parent status changed")
         # Later exact gates/repairs are checked by the existing workflow planner.
-        # The adoption stays tied to Stage 2, never rewritten to a later repair SHA.
-        if len(state["children"]) > 2:
-            later = [item for item in state["children"] if item["detail"]["id"] not in
-                     (payload["source"]["child_id"], prepared.child_id)]
-            _require(len(later) == len(state["children"]) - 2
-                     and all(type(item["detail"]["stage"]) is int and item["detail"]["stage"] >= 3 for item in later),
+        # The adoption stays tied to its request stage, never rewritten to a later repair SHA.
+        base_ids = {payload["source"]["child_id"], prepared.child_id}
+        if payload["schema_version"] == 2:
+            base_ids.update(gate["id"] for gate in payload["supersession"]["gates"])
+        fresh_gate_stage = _fresh_gate_stage(request)
+        if len(state["children"]) > len(base_ids):
+            later = [item for item in state["children"]
+                     if item["detail"]["id"] not in base_ids]
+            _require(len(later) == len(state["children"]) - len(base_ids)
+                     and all(type(item["detail"]["stage"]) is int
+                             and item["detail"]["stage"] >= fresh_gate_stage
+                             for item in later),
                      "invalid post-refresh history")
-            gates = [item for item in later if item["detail"]["stage"] == 3]
+            gates = [item for item in later
+                     if item["detail"]["stage"] == fresh_gate_stage]
             _require(sorted(item["metadata"].get("eventra.phase.kind", "") for item in gates) == ["qa", "review"],
-                     "missing fresh Stage 3 gates")
+                     "missing fresh request-bound gates")
             for gate in gates:
                 role = "independent_reviewer" if gate["metadata"]["eventra.phase.kind"] == "review" else "integration_qa"
-                expected_action = f"2:{payload['parent']['identifier']}:create_gate_stage:0:frontend:{prepared.target_sha}:-:next-stage:3"
+                expected_action = (f"2:{payload['parent']['identifier']}:"
+                                   "create_gate_stage:0:frontend:"
+                                   f"{prepared.target_sha}:-:next-stage:"
+                                   f"{fresh_gate_stage}")
                 _require(gate["metadata"].get("eventra.phase.sha.frontend") == prepared.target_sha
                          and gate["metadata"].get("eventra.phase.attempt") == "0"
                          and gate["metadata"].get("eventra.phase.creation_action") == expected_action
@@ -1654,11 +1854,14 @@ def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> Refresh
                          and gate["detail"]["assignee_id"] == state["assignment"]["roles"][role], "fresh gate provenance mismatch")
             return RefreshDecision("wait", None, "refresh adopted; validate normal gate or repair history")
         _require(metadata.get("eventra.workflow.attempt") == "0"
-                 and metadata.get("eventra.workflow.next_stage") == "3"
+                 and metadata.get("eventra.workflow.next_stage") == str(fresh_gate_stage)
                  and metadata.get("eventra.workflow.last_action") == key
                  and metadata.get("eventra.workflow.frontend_sha") == prepared.target_sha
                  and metadata.get("eventra.workflow.merge_state") == "not_ready"
-                 and state["pr"]["head_sha"] == prepared.target_sha, "adopted candidate mismatch")
+                 and state["pr"]["head_sha"] == prepared.target_sha
+                 and state["pr"].get("state") == "open"
+                 and state["pr"].get("merged") is False,
+                 "adopted candidate mismatch")
         active = [run for run in state["runs"] if run.get("status") in {
             "queued", "dispatched", "running", "waiting_local_directory"
         }]
@@ -1667,17 +1870,28 @@ def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> Refresh
             and run.get("agent_id") == payload["assignment"]["lead_id"]
             for run in active
         ), "adopted refresh has an unexpected active writer")
-        return RefreshDecision("create_gate_stage", None, "adopted refresh requires fresh Stage 3 gates")
+        return RefreshDecision(
+            "create_gate_stage", None,
+            f"adopted refresh requires fresh Stage {fresh_gate_stage} gates")
     if payload["schema_version"] == 2:
-        reservation = _v2_reservation(request, state, reservation)
-        if reservation["state"] in {"reserved", "review_cancelled"}:
+        reservation_state = reservation.get("state")
+        if reservation_state in {
+                "candidate_registered", "published", "adopted"}:
+            reservation = _v2_publication_reservation(
+                request, state, reservation)
+            _validate_superseded_gates(request, state)
+        else:
+            reservation = _v2_reservation(request, state, reservation)
+        if reservation_state in {"reserved", "review_cancelled"}:
             progress = validate_supersession_progress(request, snapshot, reservation)
             reason = ("resume ordered pristine-gate cancellation"
                       if progress.next_role is not None
                       else "pristine gates cancelled; refresh initialization pending")
             return RefreshDecision("resume_refresh", key, reason)
-        validate_supersession_initialization_authority(
-            request, snapshot, reservation)
+        if reservation_state in {
+                "gates_cancelled", "child_initialized", "child_dispatched"}:
+            validate_supersession_initialization_authority(
+                request, snapshot, reservation)
         base_state = "gates_cancelled"
     else:
         reservation = _object(reservation, "version request_digest authorization_uuid action_key state child_id "
@@ -1693,7 +1907,17 @@ def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> Refresh
     _require(reservation["request_digest"] == request.digest and reservation["authorization_uuid"] == feature["authorization_comment"]
              and reservation["action_key"] == key and reservation["state"] in states,
              "reservation identity mismatch")
-    _require(reservation["parent_projection_digest"] == parent_projection_digest(state), "reservation parent projection drift")
+    projected_state = state
+    if (payload["schema_version"] == 2
+            and reservation["state"] == "adopted"
+            and "supersession" in feature):
+        projected_state = _load_json(canonical_json(state), 4_194_304)
+        del projected_state["metadata"][REFRESH_PREFIX + "supersession"]
+        projected_state["parent"]["metadata"] = projected_state["metadata"]
+        projected_state["parent"]["revision"] -= 1
+    _require(reservation["parent_projection_digest"] ==
+             parent_projection_digest(projected_state),
+             "reservation parent projection drift")
     _require(metadata.get("eventra.workflow.attempt") == "0"
              and metadata.get("eventra.workflow.merge_state") == "not_ready"
              and not any(k in metadata for k in ("eventra.workflow.repair_reservation", "eventra.workflow.smoke_reservation")),
@@ -1707,7 +1931,7 @@ def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> Refresh
         _require(reservation["child_id"] is None
                  and reservation["child_identifier"] is None and reservation["child_position"] is None
                  and reservation["prepared"] is None
-                 and not {"adoption", "consumed"} & set(feature)
+                 and not {"adoption", "consumed", "supersession"} & set(feature)
                  and metadata.get("eventra.workflow.next_stage") == str(payload["parent"]["next_stage"])
                  and metadata.get("eventra.workflow.last_action") == payload["parent"]["last_action"]
                  and metadata.get("eventra.workflow.frontend_sha") == payload["source"]["sha"]
@@ -1727,28 +1951,45 @@ def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> Refresh
     _require(len(child_runs) <= 1 and all(run["issue_id"] == child["detail"]["id"]
              and run["agent_id"] == payload["assignment"]["engineer_id"] for run in child_runs), "unexpected active child")
     if reservation["state"] in {"child_initialized", "child_dispatched"}:
-        _require(reservation["prepared"] is None and not {"adoption", "consumed"} & set(feature)
+        _require(reservation["prepared"] is None
+                 and not {"adoption", "consumed", "supersession"} & set(feature)
                  and state["pr"]["head_sha"] == payload["source"]["sha"]
                  and metadata.get("eventra.workflow.frontend_sha") == payload["source"]["sha"], "unregistered head drift")
         if prepared is not None:
             _require(not child_runs, "preparation still has an active writer")
         return RefreshDecision("resume_refresh" if prepared or reservation["state"] == "child_initialized" else "wait",
                                key, "resume preparation registration" if prepared else "refresh preparation pending")
-    _require(prepared is not None and not child_runs and reservation["prepared"] == asdict(prepared), "registered preparation mismatch")
+    _require(prepared is not None and not child_runs
+             and reservation["prepared"] ==
+                 _prepared_checkpoint(request, prepared),
+             "registered preparation mismatch")
     _require(state["pr"]["head_sha"] in {prepared.source_sha, prepared.target_sha}, "unregistered head drift")
     if reservation["state"] == "candidate_registered":
-        _require(not {"adoption", "consumed"} & set(feature)
+        _require(not {"adoption", "consumed", "supersession"} & set(feature)
                  and metadata.get("eventra.workflow.frontend_sha") == prepared.source_sha, "premature adoption")
         return RefreshDecision("publish_refresh", key, "publish or reconcile registered candidate")
     _require(state["pr"]["head_sha"] == prepared.target_sha, "published head mismatch")
     _require(metadata.get("eventra.workflow.frontend_sha") in {prepared.source_sha, prepared.target_sha}, "adoption drift")
-    _receipt_match(feature, request, prepared, partial=True)
-    _require((metadata["eventra.workflow.frontend_sha"] != prepared.target_sha or "adoption" in feature)
-             and ("consumed" not in feature or metadata["eventra.workflow.frontend_sha"] == prepared.target_sha),
-             "illegal partial adoption order")
-    if reservation["state"] == "adopted":
-        _receipt_match(feature, request, prepared)
-        _require(metadata["eventra.workflow.frontend_sha"] == prepared.target_sha, "adoption is incomplete")
+    if payload["schema_version"] == 2:
+        _require(not {"adoption", "consumed"} & set(feature),
+                 "v2 refresh has duplicate legacy receipts")
+        if reservation["state"] == "adopted":
+            if "supersession" in feature:
+                _supersession_receipt(feature, request, prepared, state)
+            _require(metadata["eventra.workflow.frontend_sha"] == prepared.target_sha,
+                     "adoption is incomplete")
+        else:
+            _require("supersession" not in feature,
+                     "supersession receipt precedes adoption")
+    else:
+        _receipt_match(feature, request, prepared, partial=True)
+        _require((metadata["eventra.workflow.frontend_sha"] != prepared.target_sha or "adoption" in feature)
+                 and ("consumed" not in feature or metadata["eventra.workflow.frontend_sha"] == prepared.target_sha),
+                 "illegal partial adoption order")
+        if reservation["state"] == "adopted":
+            _receipt_match(feature, request, prepared)
+            _require(metadata["eventra.workflow.frontend_sha"] == prepared.target_sha,
+                     "adoption is incomplete")
     return RefreshDecision("resume_refresh", key, "resume adoption; gates wait for reservation clearance")
 
 
