@@ -3997,6 +3997,7 @@ def load_parent_snapshot(
             )
             for child in stable_children
             if child["stage"] is not None
+            and str(child["id"]) not in superseded_gate_ids
             and str(child["identifier"]) not in quarantined_keys
         )
         evidence_after = _read_gate_evidence_set(

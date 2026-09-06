@@ -217,14 +217,31 @@ class GitTests(unittest.TestCase):
         from tools.multica import candidate_refresh as contracts
         from tools.multica import refresh_executor
         from tools.multica import workflow
-        from tools.multica.tests.test_candidate_refresh import block, prepared_payload
+        from tools.multica.tests.test_candidate_refresh import prepared_payload
         from tools.multica.tests.test_issue_contracts import issue_detail
         from tools.multica.tests.test_refresh_executor import MemoryRefreshAPI
 
         api = MemoryRefreshAPI()
+        api.use_v2()
         state = api.state
+        roles = state["assignment"]["roles"]
+        roles["backend_engineer"] = uid(22)
+        state["assignment"]["members"] = [
+            {
+                "member_id": identity,
+                "member_type": "agent",
+                "role": "leader" if role == "delivery_lead" else role,
+            }
+            for role, identity in sorted(roles.items())
+        ]
         source_child = state["children"][0]
+        fixture_source = "b" * 40
         source_child["metadata"]["eventra.phase.sha.frontend"] = self.source
+        source_child["metadata"]["eventra.phase.creation_action"] = (
+            source_child["metadata"]["eventra.phase.creation_action"].replace(
+                fixture_source, self.source
+            )
+        )
         source_child["detail"]["metadata"] = copy.deepcopy(
             source_child["metadata"]
         )
@@ -237,6 +254,14 @@ class GitTests(unittest.TestCase):
             ).hexdigest()
         )
         state["metadata"]["eventra.workflow.frontend_sha"] = self.source
+        state["metadata"]["eventra.workflow.last_action"] = state[
+            "metadata"
+        ]["eventra.workflow.last_action"].replace(fixture_source, self.source)
+        for gate in state["children"]:
+            if gate["detail"]["stage"] == 2:
+                gate["detail"]["description"] = gate["detail"][
+                    "description"
+                ].replace(fixture_source, self.source)
         state["parent"]["metadata"] = copy.deepcopy(state["metadata"])
         state["pr"]["head_sha"] = self.source
         state["prerequisite"].update(
@@ -246,7 +271,8 @@ class GitTests(unittest.TestCase):
         )
         state["tool"]["git_version"] = self.version
         api.request = contracts.freeze_refresh_request(
-            contracts.RefreshSnapshot(contracts.canonical_json(state))
+            contracts.RefreshSnapshot(contracts.canonical_json(state)),
+            supersede_pristine_gates=True,
         )
         request = api.request
         source_before = copy.deepcopy(source_child)
@@ -275,9 +301,13 @@ class GitTests(unittest.TestCase):
             contracts.refresh_action(request),
         )
         real_git.publish_staging(request, self.target)
-        refresh_child = state["children"][1]
+        refresh_child = next(
+            child for child in state["children"]
+            if child["metadata"].get("eventra.phase.kind") == "refresh"
+        )
         evidence_payload = prepared_payload(request)
         evidence_payload.update(
+            schema_version=2,
             child_id=refresh_child["detail"]["id"],
             source_sha=self.source,
             prerequisite_sha=self.prerequisite,
@@ -288,9 +318,12 @@ class GitTests(unittest.TestCase):
         evidence_payload["context_receipt"]["candidate_shas"] = {
             "frontend": self.target
         }
+        evidence_payload["context_receipt"]["task_id"] = (
+            refresh_child["detail"]["identifier"]
+        )
         evidence_uuid = uid(93)
         api.add_comment(
-            "PRO-902",
+            refresh_child["detail"]["identifier"],
             contracts.RefreshComment(
                 refresh_child["detail"]["id"],
                 evidence_uuid,
@@ -298,11 +331,17 @@ class GitTests(unittest.TestCase):
                 "agent",
                 1,
                 "Preparation only; no PR publication.\n"
-                + block("prepared", evidence_payload),
+                "```eventra-candidate-refresh-prepared-v2\n"
+                + contracts.canonical_json(evidence_payload)
+                + "\n```",
             ),
         )
         refresh_executor.finish_refresh(
-            api, SyncedGit(), "PRO-902", evidence_uuid, "pass"
+            api,
+            SyncedGit(),
+            refresh_child["detail"]["identifier"],
+            evidence_uuid,
+            "pass",
         )
         result = refresh_executor.execute_refresh(
             api,
@@ -336,11 +375,11 @@ class GitTests(unittest.TestCase):
         action = (
             "2:PRO-900:create_gate_stage:0:frontend:"
             + self.target
-            + ":-:next-stage:3"
+            + ":-:next-stage:4"
         )
         state["metadata"].update(
             {
-                "eventra.workflow.next_stage": "4",
+                "eventra.workflow.next_stage": "5",
                 "eventra.workflow.last_action": action,
             }
         )
@@ -363,7 +402,7 @@ class GitTests(unittest.TestCase):
                 id=uid(40 + index),
                 identifier=identifier,
                 parent_issue_id=uid(2),
-                stage=3,
+                stage=4,
                 project_id=uid(5),
                 assignee_id=state["assignment"]["roles"][role],
                 status="in_review",
@@ -597,9 +636,24 @@ class GitTests(unittest.TestCase):
         self.assertNotIn("deploy", mutation_trace)
         self.assertNotIn("smoke", mutation_trace)
         self.assertEqual(
-            [child["metadata"]["eventra.phase.kind"]
-             for child in state["children"]],
+            [
+                child["metadata"]["eventra.phase.kind"]
+                for child in state["children"]
+                if "eventra.phase.kind" in child["metadata"]
+            ],
             ["implementation", "refresh", "review", "qa"],
+        )
+        superseded_ids = {
+            gate["id"]
+            for gate in request.payload()["supersession"]["gates"]
+        }
+        self.assertEqual(
+            [
+                child["detail"]["status"]
+                for child in state["children"]
+                if child["detail"]["id"] in superseded_ids
+            ],
+            ["cancelled", "cancelled"],
         )
 
     def test_base_drift_blocks_publication(self):
