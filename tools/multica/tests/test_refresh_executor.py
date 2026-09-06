@@ -6,8 +6,9 @@ import importlib
 import importlib.util
 import subprocess
 import tempfile
+import threading
 import unittest
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
@@ -1116,6 +1117,33 @@ class MemoryRefreshAPI:
         if self.fail_operation == "create_child_after":
             raise RuntimeError("injected create after effect")
         return identifier
+
+
+class ConcurrentMemoryRefreshAPI(MemoryRefreshAPI):
+    """Memory boundary with the production lock's non-blocking semantics."""
+
+    def __init__(self):
+        super().__init__()
+        self.executor_entered = threading.Event()
+        self.release_executor = threading.Event()
+        self.pause_next_executor = False
+        self._parent_mutex = threading.Lock()
+
+    @contextmanager
+    def parent_lock(self, parent):
+        if parent != self.state["parent"]["identifier"]:
+            raise RuntimeError("wrong parent lock")
+        if not self._parent_mutex.acquire(blocking=False):
+            raise RuntimeError("refresh authority: parent executor lock is busy")
+        try:
+            if self.pause_next_executor:
+                self.pause_next_executor = False
+                self.executor_entered.set()
+                if not self.release_executor.wait(5):
+                    raise RuntimeError("timed out waiting to release executor")
+            yield
+        finally:
+            self._parent_mutex.release()
 
 
 class StageRequestTests(unittest.TestCase):
@@ -2441,8 +2469,8 @@ class PublishRefreshTests(unittest.TestCase):
 
 class FullRefreshDeliveryTests(unittest.TestCase):
     @staticmethod
-    def pristine_v2_delivery():
-        api = MemoryRefreshAPI()
+    def pristine_v2_delivery(api_factory=MemoryRefreshAPI):
+        api = api_factory()
         api.use_v2()
         roles = api.state["assignment"]["roles"]
         roles["backend_engineer"] = uid(18)
@@ -2849,6 +2877,84 @@ class FullRefreshDeliveryTests(unittest.TestCase):
             )
         self.assertEqual(api.writes, before)
         self.assertEqual(git.managed_push_effects, 0)
+
+    def test_same_action_executors_have_one_writer_child_run_and_publication(self):
+        module = importlib.import_module("tools.multica.refresh_executor")
+        api, git, request = self.pristine_v2_delivery(ConcurrentMemoryRefreshAPI)
+        self.stage_exact_request_and_grant(api)
+        writes_before = copy.deepcopy(api.writes)
+        first_result, first_failure = [], []
+
+        def first_executor():
+            try:
+                first_result.append(module.execute_refresh(
+                    api,
+                    git,
+                    "PRO-900",
+                    uid(12),
+                    uid(13),
+                    contracts.refresh_action(request),
+                ))
+            except Exception as exc:
+                first_failure.append(exc)
+
+        api.pause_next_executor = True
+        worker = threading.Thread(target=first_executor)
+        worker.start()
+        try:
+            self.assertTrue(api.executor_entered.wait(5))
+            with self.assertRaisesRegex(RuntimeError, "lock is busy"):
+                module.execute_refresh(
+                    api,
+                    git,
+                    "PRO-900",
+                    uid(12),
+                    uid(13),
+                    contracts.refresh_action(request),
+                )
+            self.assertEqual(api.writes, writes_before)
+            self.assertEqual(git.managed_push_effects, 0)
+        finally:
+            api.release_executor.set()
+            worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(first_failure, [])
+        self.assertEqual(len(first_result), 1)
+        self.assertEqual(first_result[0].status, "child_dispatched")
+
+        self.finish_exact_preparation(api, git)
+        published = module.execute_refresh(
+            api,
+            git,
+            "PRO-900",
+            uid(12),
+            uid(13),
+            contracts.refresh_action(request),
+        )
+        replayed = module.execute_refresh(
+            api,
+            git,
+            "PRO-900",
+            uid(12),
+            uid(13),
+            contracts.refresh_action(request),
+        )
+        refresh_children = [
+            item for item in api.state["children"]
+            if item["metadata"].get("eventra.phase.kind") == "refresh"
+        ]
+        engineer_runs = [
+            run for run in api.state["runs"]
+            if run["issue_id"] == refresh_children[0]["detail"]["id"]
+        ]
+
+        self.assertEqual(published.status, "adopted")
+        self.assertEqual((replayed.status, replayed.mutation_count), ("adopted", 0))
+        self.assertEqual(len(refresh_children), 1)
+        self.assertEqual(len(engineer_runs), 1)
+        self.assertEqual(api.create_effects, 1)
+        self.assertEqual(git.managed_push_effects, 1)
 
     def _run_delivery(self, *, fail_at=None, fail_after=False):
         from tools.multica.tests.test_candidate_refresh import prepared_payload

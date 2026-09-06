@@ -331,11 +331,12 @@ separate authorities.
 
 ## Candidate refresh control-plane verification
 
-The 2026-09-06 isolated control-plane run is evidence for the helper code only;
-it is not a live refresh approval. Python discovery passed 658 tests. The new
-combined tests cover every baseline-recorded mutation boundary before and after
-its effect, reject incompatible external writes without later effects, and use
-a real temporary Git repository plus bare remote for the complete refresh path.
+The earlier 2026-09-06 isolated control-plane run is evidence for the helper
+code only; it is not a live refresh approval. That prior run passed 658 Python
+tests; current verification totals are recorded with the final branch receipt.
+The new combined tests cover every baseline-recorded mutation boundary before
+and after its effect, reject incompatible external writes without later effects,
+and use a real temporary Git repository plus bare remote for the complete refresh path.
 That path preserves Stage 1, leaves remote `master` unchanged, adopts only the
 staged candidate, requires ordered Stage 2 cancellation, Stage 3 preparation,
 and fresh Stage 4 Reviewer and QA gates, and ends at

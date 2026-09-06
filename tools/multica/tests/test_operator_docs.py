@@ -972,7 +972,7 @@ class OperatorDocsTests(unittest.TestCase):
             ):
                 with self.subTest(fragment=fragment):
                     self.assertIn(fragment, rendered)
-        self.assertIn("658 tests", pilot)
+        self.assertIn("prior run passed 658 Python tests", pilot)
         self.assertIn("every `1..N` boundary", readme)
         self.assertIn("zero errors", pilot)
         self.assertIn("push, merge PR #14, or deploy", pilot)
