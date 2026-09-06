@@ -207,6 +207,28 @@ class SnapshotTests(unittest.TestCase):
 
         self.api._scope()
 
+    def test_cancel_gate_emits_only_scoped_cancel_without_start(self):
+        class MutationBoundary:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, args):
+                self.calls.append(tuple(args))
+                return {"identifier": "PRO-902", "status": "cancelled"}
+
+        runner = MutationBoundary()
+        api = self.module.RefreshAPI(
+            runner, None, self.root, scope=self.scope,
+            prerequisite_pr=self.runner.payload["prerequisite"]["pr_url"],
+        )
+
+        api.cancel_gate("PRO-902")
+
+        self.assertEqual(runner.calls, [(
+            "issue", "status", "PRO-902", "cancelled", "--no-start",
+            "--output", "json", "--profile", "pro-1", "--workspace-id", uid(1),
+        )])
+
     def test_v2_snapshot_binds_complete_pristine_gate_history(self):
         self.runner.add_pristine_gates()
 
@@ -838,10 +860,18 @@ class MemoryRefreshAPI:
         self.writes, self.write_index = [], 0
         self.fail_at, self.fail_after = None, False
         self.fail_operation = None
-        self.create_effects = 0
+        self.create_effects, self.cancel_effects = 0, 0
         self.complete_started_run = False
         self.issue_comments = {}
         self.issue_comment_records = {}
+
+    def use_v2(self):
+        from tools.multica.tests.test_candidate_refresh import pristine_gate_snapshot
+
+        frozen = pristine_gate_snapshot()
+        self.request = contracts.freeze_refresh_request(
+            frozen, supersede_pristine_gates=True)
+        self.state = frozen.state()
 
     def _mutate(self, operation, args, apply):
         self.write_index += 1
@@ -976,13 +1006,39 @@ class MemoryRefreshAPI:
 
         self._mutate("set_status", (issue, status, start, position), apply)
 
+    def cancel_gate(self, issue):
+        payload = self.request.payload()
+        allowed = {gate["identifier"] for gate in payload["supersession"]["gates"]}
+        if issue not in allowed:
+            raise RuntimeError("gate cancellation is not request-bound")
+        gate = next(child for child in self.state["children"]
+                    if child["detail"]["identifier"] == issue)
+
+        def apply():
+            detail = gate["detail"]
+            if detail["status"] == "cancelled":
+                return False
+            detail["status"] = "cancelled"
+            detail["status_category"] = "cancelled"
+            detail["revision"] += 1
+            self.cancel_effects += 1
+            return True
+
+        self._mutate("cancel_gate", (issue,), apply)
+
     def publish_authorization(self):
+        protocol = contracts.refresh_protocol(self.request)
         envelope = {"payload": self.request.payload(), "digest": self.request.digest,
                     "staging_ref": self.request.staging_ref}
-        request_record = comment_record(12, block("request", envelope), author=7, issue=uid(2))
-        grant_record = comment_record(13, block("grant", {"schema_version": 1,
-                                      "request_digest": self.request.digest, "granted_refresh": 1}),
-                                      author=11, issue=uid(2))
+        request_record = comment_record(
+            12, f"```eventra-candidate-refresh-request-v{protocol}\n"
+            + encode(envelope) + "\n```", author=7, issue=uid(2))
+        grant_record = comment_record(
+            13, f"```eventra-candidate-refresh-grant-v{protocol}\n"
+            + encode({"schema_version": protocol,
+                      "request_digest": self.request.digest,
+                      "granted_refresh": 1}) + "\n```",
+            author=11, issue=uid(2))
         grant_record["author_type"] = "member"
         for record in (request_record, grant_record):
             self.state["comments"].append(asdict(contracts.RefreshComment(
@@ -1100,6 +1156,135 @@ class StageRequestTests(unittest.TestCase):
 
 
 class ExecuteRefreshTests(unittest.TestCase):
+    @staticmethod
+    def v2_case():
+        api = MemoryRefreshAPI()
+        api.use_v2()
+        module = importlib.import_module("tools.multica.refresh_executor")
+        module.stage_refresh_request(api, "PRO-900", api.request)
+        api.publish_authorization()
+        api.writes.clear()
+        api.write_index = 0
+        return api, module
+
+    def test_v2_complete_path_cancels_two_gates_and_stops_before_initialization(self):
+        api, module = self.v2_case()
+        source_before = encode(api.state["children"][0])
+        pr_before = copy.deepcopy(api.state["pr"])
+
+        result = module.execute_refresh(
+            api, None, "PRO-900", uid(12), uid(13),
+            contracts.refresh_action(api.request),
+        )
+
+        self.assertEqual((result.status, result.child_identifier),
+                         ("gates_cancelled", ""))
+        self.assertEqual([write for write in api.writes if write[0] == "cancel_gate"], [
+            ("cancel_gate", "PRO-902"), ("cancel_gate", "PRO-903"),
+        ])
+        self.assertEqual(api.cancel_effects, 2)
+        self.assertEqual([child["detail"]["status"] for child in api.state["children"]],
+                         ["done", "cancelled", "cancelled"])
+        self.assertEqual(len(api.state["children"]), 3)
+        self.assertEqual(api.state["runs"], [])
+        self.assertEqual(api.state["pr"], pr_before)
+        self.assertEqual(encode(api.state["children"][0]), source_before)
+        reservation = contracts.refresh_metadata(
+            api.state["metadata"])["reservation"]
+        self.assertEqual(reservation["state"], "gates_cancelled")
+
+    def test_v2_cancellation_failure_boundaries_recover_without_duplicate_effects(self):
+        for fail_at in range(3, 8):
+            for fail_after in (False, True):
+                with self.subTest(fail_at=fail_at, fail_after=fail_after):
+                    api, module = self.v2_case()
+                    source_before = encode(api.state["children"][0])
+                    pr_before = copy.deepcopy(api.state["pr"])
+                    api.fail_at, api.fail_after = fail_at, fail_after
+
+                    if fail_after:
+                        result = module.execute_refresh(
+                            api, None, "PRO-900", uid(12), uid(13),
+                            contracts.refresh_action(api.request),
+                        )
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "before effect"):
+                            module.execute_refresh(
+                                api, None, "PRO-900", uid(12), uid(13),
+                                contracts.refresh_action(api.request),
+                            )
+                        self.assertEqual(len(api.state["children"]), 3)
+                        self.assertEqual(api.state["runs"], [])
+                        self.assertEqual(api.state["pr"], pr_before)
+                        self.assertEqual(encode(api.state["children"][0]), source_before)
+                        api.fail_at = None
+                        result = module.execute_refresh(
+                            api, None, "PRO-900", uid(12), uid(13),
+                            contracts.refresh_action(api.request),
+                        )
+
+                    self.assertEqual(result.status, "gates_cancelled")
+                    self.assertEqual(api.cancel_effects, 2)
+                    self.assertEqual(len([write for write in api.writes
+                                          if write[0] == "cancel_gate"]), 2)
+                    self.assertEqual(len(api.state["children"]), 3)
+                    self.assertEqual(api.state["runs"], [])
+                    self.assertEqual(api.state["pr"], pr_before)
+                    self.assertEqual(encode(api.state["children"][0]), source_before)
+
+    def test_v2_replay_blocks_source_drift_before_any_gate_cancellation(self):
+        for name, mutate in (
+                ("source-title", lambda api:
+                 api.state["children"][0]["detail"].__setitem__("title", "changed")),
+                ("source-run", lambda api: api.state["runs"].append(issue_run(
+                    id=uid(94), issue_id=uid(3), agent_id=uid(8),
+                    workspace_id=uid(1), status="running", completed_at=None,
+                )))):
+            with self.subTest(name=name):
+                api, module = self.v2_case()
+                api.fail_at = 4
+                with self.assertRaisesRegex(RuntimeError, "before effect"):
+                    module.execute_refresh(
+                        api, None, "PRO-900", uid(12), uid(13),
+                        contracts.refresh_action(api.request),
+                    )
+                api.fail_at = None
+                mutate(api)
+                before = len(api.writes)
+
+                with self.assertRaises((ValueError, RuntimeError)):
+                    module.execute_refresh(
+                        api, None, "PRO-900", uid(12), uid(13),
+                        contracts.refresh_action(api.request),
+                    )
+
+                self.assertEqual(len(api.writes), before)
+                self.assertEqual(api.cancel_effects, 0)
+
+    def test_v2_cancellation_never_rewrites_later_lifecycle_state_backward(self):
+        api, module = self.v2_case()
+        module.execute_refresh(
+            api, None, "PRO-900", uid(12), uid(13),
+            contracts.refresh_action(api.request),
+        )
+        reservation = contracts.refresh_metadata(
+            api.state["metadata"])["reservation"]
+        reservation["state"] = "child_initialized"
+        value = contracts.canonical_json(reservation)
+        api.state["metadata"]["eventra.refresh.reservation"] = value
+        api.state["parent"]["metadata"] = copy.deepcopy(api.state["metadata"])
+        before = len(api.writes)
+
+        with self.assertRaises((ValueError, RuntimeError)):
+            module.execute_refresh(
+                api, None, "PRO-900", uid(12), uid(13),
+                contracts.refresh_action(api.request),
+            )
+
+        self.assertEqual(len(api.writes), before)
+        self.assertEqual(contracts.refresh_metadata(
+            api.state["metadata"])["reservation"]["state"], "child_initialized")
+
     def test_create_before_effect_failure_leaves_exact_reserved_checkpoint(self):
         api = MemoryRefreshAPI()
         module = importlib.import_module("tools.multica.refresh_executor")

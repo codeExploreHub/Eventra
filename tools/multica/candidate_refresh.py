@@ -1167,6 +1167,21 @@ REFRESH_PREFIX = "eventra.refresh."
 REFRESH_FIELDS = frozenset({"version", "request", "request_comment", "request_digest", "authorization_comment",
                             "reservation", "consumed", "adoption", "merge_permission"})
 RESERVATION_STATES = ("reserved", "child_initialized", "child_dispatched", "candidate_registered", "published", "adopted")
+V2_RESERVATION_STATES = ("reserved", "review_cancelled", "gates_cancelled")
+V2_RESERVATION_FIELDS = frozenset({
+    "version", "request_digest", "request_uuid", "authorization_uuid",
+    "action_key", "state", "parent_id", "parent_identifier", "source", "pr",
+    "prerequisite", "control_tool_sha", "gates", "refresh_stage",
+    "fresh_gate_stage", "child_id", "child_identifier", "child_position",
+    "prepared", "parent_status_category", "parent_position",
+    "parent_projection_digest",
+})
+
+
+@dataclass(frozen=True)
+class SupersessionProgress:
+    cancelled_roles: tuple[str, ...]
+    next_role: str | None
 
 
 @dataclass(frozen=True)
@@ -1181,6 +1196,152 @@ def refresh_action(request: RefreshRequest) -> str:
     return (f"2:{payload['parent']['identifier']}:create_refresh_stage:0:frontend:"
             f"{payload['source']['sha']}:next-stage:{payload['refresh_stage']}:"
             f"refresh:{payload['schema_version']}:{request.digest}")
+
+
+def _v2_reservation(request: RefreshRequest, state: dict,
+                    reservation: object) -> dict:
+    payload = _request(request)
+    _require(payload["schema_version"] == 2, "supersession requires protocol v2")
+    _require(type(reservation) is dict
+             and set(reservation) == V2_RESERVATION_FIELDS,
+             "invalid v2 reservation shape")
+    value = reservation
+    _integer(value["version"], 2)
+    for key in ("request_uuid", "authorization_uuid", "parent_id"):
+        _uuid(value[key])
+    _match(value["parent_identifier"], _ISSUE)
+    _match(value["control_tool_sha"], _SHA)
+    _match(value["parent_projection_digest"], _DIGEST)
+    _require(value["request_digest"] == request.digest
+             and value["action_key"] == refresh_action(request)
+             and value["state"] in V2_RESERVATION_STATES,
+             "invalid v2 reservation identity")
+    _require(value["parent_id"] == payload["parent"]["id"]
+             and value["parent_identifier"] == payload["parent"]["identifier"]
+             and value["source"] == payload["source"]
+             and value["pr"] == payload["pr"]
+             and value["prerequisite"] == payload["prerequisite"]
+             and value["control_tool_sha"] == payload["control_tool_sha"]
+             and value["gates"] == payload["supersession"]["gates"]
+             and value["refresh_stage"] == payload["refresh_stage"] == 3
+             and value["fresh_gate_stage"] == payload["fresh_gate_stage"] == 4,
+             "v2 reservation authority mismatch")
+    _require(type(value["parent_status_category"]) is str
+             and type(value["parent_position"]) is int
+             and state["parent"].get("position") == value["parent_position"],
+             "v2 reservation parent layout mismatch")
+    feature = refresh_metadata(state["metadata"])
+    _require(feature is not None and feature.get("reservation") == value
+             and feature.get("request_comment") == value["request_uuid"]
+             and feature.get("authorization_comment") == value["authorization_uuid"],
+             "v2 reservation comment binding mismatch")
+    _require(value["parent_projection_digest"] == parent_projection_digest(state),
+             "v2 reservation parent projection drift")
+    if value["state"] in {"reserved", "review_cancelled", "gates_cancelled"}:
+        _require(value["child_id"] is None
+                 and value["child_identifier"] is None
+                 and value["child_position"] is None
+                 and value["prepared"] is None,
+                 "v2 cancellation checkpoint created child authority")
+    return value
+
+
+def validate_supersession_progress(
+        request: RefreshRequest, snapshot: RefreshSnapshot,
+        reservation: object) -> SupersessionProgress:
+    """Accept only the three ordered, request-bound gate cancellation prefixes."""
+    payload, state = _request(request), _snapshot(snapshot)
+    value = _v2_reservation(request, state, reservation)
+    _shared_authority(payload, state)
+    feature = refresh_metadata(state["metadata"])
+    _request_comment(request, state, feature)
+    grants = [item for item in state["comments"]
+              if item.get("comment_uuid") == value["authorization_uuid"]]
+    _require(len(grants) == 1, "missing supersession grant")
+    _grant_in_state(request, state, RefreshComment(**grants[0]))
+    metadata = state["metadata"]
+    _require(metadata.get("eventra.workflow.next_stage") == "2"
+             and metadata.get("eventra.workflow.last_action") ==
+                 payload["parent"]["last_action"]
+             and metadata.get("eventra.workflow.frontend_sha") ==
+                 payload["source"]["sha"]
+             and metadata.get("eventra.workflow.attempt") == "0"
+             and metadata.get("eventra.workflow.merge_state") == "not_ready"
+             and state["parent"].get("status") == "blocked"
+             and state["parent"].get("status_category") ==
+                 value["parent_status_category"]
+             and state["pr"].get("head_sha") == payload["source"]["sha"],
+             "supersession parent authority changed")
+    _require(len(state["children"]) == 3,
+             "supersession child membership changed")
+
+    observed = []
+    for expected in value["gates"]:
+        matches = [item for item in state["children"]
+                   if item.get("detail", {}).get("id") == expected["id"]]
+        _require(len(matches) == 1, "missing or duplicate supersession gate")
+        gate = _object(matches[0], "detail metadata evidence comment_manifest")
+        detail = _issue_detail(gate["detail"], "unknown supersession gate field")
+        _require(detail.get("identifier") == expected["identifier"]
+                 and detail.get("title") == expected["title"]
+                 and detail.get("metadata") == gate["metadata"]
+                 and gate["metadata"] == {}
+                 and gate["evidence"] is None
+                 and gate["comment_manifest"] == [],
+                 "supersession gate history changed")
+        gate_runs = [run for run in state["runs"]
+                     if run.get("issue_id") == expected["id"]]
+        _require(not gate_runs, "supersession gate acquired a run")
+        status = (detail.get("status"), detail.get("status_category"),
+                  detail.get("revision"))
+        _require(status in {("backlog", "backlog", 1),
+                            ("cancelled", "cancelled", 2)},
+                 "supersession gate status is not an exact cancellation effect")
+        restored_detail = {
+            **detail, "status": expected["status"],
+            "status_category": "backlog", "revision": expected["revision"],
+        }
+        authority = {
+            "detail": {key: item for key, item in restored_detail.items()
+                       if key not in _VOLATILE_DETAIL_FIELDS},
+            "metadata": gate["metadata"], "evidence": gate["evidence"],
+            "comment_manifest": gate["comment_manifest"], "runs": gate_runs,
+        }
+        _require(hashlib.sha256(canonical_json(authority).encode("utf-8")).hexdigest()
+                 == expected["authority_digest"],
+                 "supersession gate authority digest changed")
+        observed.append(status[0] == "cancelled")
+
+    _require(observed in ([False, False], [True, False], [True, True]),
+             "gate cancellation is not an ordered prefix")
+    count = observed.count(True)
+    minimum = {"reserved": 0, "review_cancelled": 1, "gates_cancelled": 2}.get(
+        value["state"], 2)
+    maximum = {"reserved": 1, "review_cancelled": 2, "gates_cancelled": 2}.get(
+        value["state"], 2)
+    _require(minimum <= count <= maximum,
+             "gate cancellation contradicts its durable checkpoint")
+
+    frozen = _load_json(canonical_json(state), 4_194_304)
+    del frozen["metadata"][REFRESH_PREFIX + "reservation"]
+    frozen["parent"]["metadata"] = frozen["metadata"]
+    frozen["parent"]["revision"] = payload["parent"]["revision"] + 8
+    for expected in value["gates"]:
+        gate = next(item for item in frozen["children"]
+                    if item["detail"]["id"] == expected["id"])
+        gate["detail"]["status"] = expected["status"]
+        gate["detail"]["status_category"] = "backlog"
+        gate["detail"]["revision"] = expected["revision"]
+    initial = validate_initial_refresh_progress(
+        request, RefreshSnapshot(canonical_json(frozen)))
+    _require(initial.metadata_writes == 6 and initial.comment_writes == 2
+             and initial.request_comment is not None
+             and initial.request_comment.comment_uuid == value["request_uuid"]
+             and initial.grant_comment is not None
+             and initial.grant_comment.comment_uuid == value["authorization_uuid"],
+             "complete frozen authority changed during supersession")
+    roles = ("independent_reviewer", "integration_qa")
+    return SupersessionProgress(roles[:count], None if count == 2 else roles[count])
 
 
 def refresh_metadata(metadata: dict[str, str]) -> dict[str, Any] | None:
@@ -1428,6 +1589,20 @@ def _plan_refresh(request: RefreshRequest, snapshot: RefreshSnapshot) -> Refresh
             for run in active
         ), "adopted refresh has an unexpected active writer")
         return RefreshDecision("create_gate_stage", None, "adopted refresh requires fresh Stage 3 gates")
+    if payload["schema_version"] == 2:
+        progress = validate_supersession_progress(request, snapshot, reservation)
+        active = [run for run in state["runs"] if run["status"] in {
+            "queued", "dispatched", "running", "waiting_local_directory"
+        }]
+        _require(len(active) <= 1 and all(
+            run["issue_id"] == payload["parent"]["id"]
+            and run["agent_id"] == payload["assignment"]["lead_id"]
+            for run in active
+        ), "supersession has an unexpected active writer")
+        reason = ("resume ordered pristine-gate cancellation"
+                  if progress.next_role is not None
+                  else "pristine gates cancelled; refresh initialization pending")
+        return RefreshDecision("resume_refresh", key, reason)
     reservation = _object(reservation, "version request_digest authorization_uuid action_key state child_id "
                           "child_identifier child_position prepared parent_status_category parent_position "
                           "parent_projection_digest")

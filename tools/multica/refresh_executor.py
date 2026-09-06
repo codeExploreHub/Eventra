@@ -146,6 +146,11 @@ class RefreshAPI:
                 args.append("--no-start")
         return self._read(args)
 
+    def cancel_gate(self, issue):
+        """Expose only the no-start cancellation used by v2 supersession."""
+        c._match(issue, c._ISSUE)
+        return self._read(["issue", "status", issue, "cancelled", "--no-start"])
+
     def _tool(self):
         self._scope()
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
@@ -960,6 +965,118 @@ def _resume_publication(api, git, request: c.RefreshRequest,
                                   child["detail"]["identifier"])
 
 
+def _new_reservation(request: c.RefreshRequest, request_uuid: str,
+                     grant_uuid: str, state: dict) -> dict:
+    payload = c._request(request)
+    projected = c._load_json(c.canonical_json(state), 4_194_304)
+    projected["parent"]["revision"] += 1
+    common = {
+        "version": payload["schema_version"], "request_digest": request.digest,
+        "authorization_uuid": grant_uuid, "action_key": c.refresh_action(request),
+        "state": "reserved", "child_id": None, "child_identifier": None,
+        "child_position": None, "prepared": None,
+        "parent_status_category": state["parent"]["status_category"],
+        "parent_position": state["parent"]["position"],
+        "parent_projection_digest": c.parent_projection_digest(projected),
+    }
+    if payload["schema_version"] == 1:
+        return common
+    return {
+        **common, "request_uuid": request_uuid,
+        "parent_id": payload["parent"]["id"],
+        "parent_identifier": payload["parent"]["identifier"],
+        "source": payload["source"], "pr": payload["pr"],
+        "prerequisite": payload["prerequisite"],
+        "control_tool_sha": payload["control_tool_sha"],
+        "gates": payload["supersession"]["gates"],
+        "refresh_stage": payload["refresh_stage"],
+        "fresh_gate_stage": payload["fresh_gate_stage"],
+    }
+
+
+def _v2_cancellation_checkpoint(request: c.RefreshRequest, state: dict,
+                                reservation: dict, checkpoint: str) -> str:
+    _need(checkpoint in {"review_cancelled", "gates_cancelled"},
+          "invalid gate cancellation checkpoint")
+    projected = c._load_json(c.canonical_json(state), 4_194_304)
+    projected["parent"]["revision"] += 1
+    updated = {
+        **reservation, "state": checkpoint,
+        "parent_projection_digest": c.parent_projection_digest(projected),
+    }
+    value = c.canonical_json(updated)
+    prospective = dict(state["metadata"])
+    prospective[c.REFRESH_PREFIX + "reservation"] = value
+    c.validate_metadata_budget(prospective, request=request)
+    return value
+
+
+def _cancel_superseded_gates(api, request: c.RefreshRequest,
+                             reservation: dict) -> tuple[int, dict]:
+    """Reconcile the deterministic Reviewer→QA cancellation prefix."""
+    parent = request.payload()["parent"]["identifier"]
+    mutations = 0
+    while True:
+        state = api.snapshot(parent).state()
+        feature = c.refresh_metadata(state["metadata"])
+        _need(feature is not None and feature.get("reservation") == reservation,
+              "gate cancellation reservation changed")
+        progress = c.validate_supersession_progress(
+            request, c.RefreshSnapshot(c.canonical_json(state)), reservation)
+        if reservation["state"] == "gates_cancelled":
+            _need(progress.next_role is None,
+                  "gate cancellation checkpoint is incomplete")
+            return mutations, reservation
+
+        checkpoint = ("review_cancelled" if reservation["state"] == "reserved"
+                      else "gates_cancelled")
+        role = ("independent_reviewer" if checkpoint == "review_cancelled"
+                else "integration_qa")
+        if role not in progress.cancelled_roles:
+            _need(progress.next_role == role,
+                  "gate cancellation order changed")
+            gate = next((item for item in reservation["gates"]
+                         if item["role"] == role), None)
+            _need(gate is not None, "request-bound gate is missing")
+            failure = None
+            try:
+                api.cancel_gate(gate["identifier"])
+            except RuntimeError as exc:
+                failure = exc
+            after = api.snapshot(parent)
+            observed = c.validate_supersession_progress(
+                request, after, reservation)
+            if role in observed.cancelled_roles:
+                mutations += 1
+                state, progress = after.state(), observed
+            else:
+                _need(observed.next_role == role and failure is not None,
+                      "gate cancellation effect was not uniquely observed")
+                raise failure
+
+        checkpoint_value = _v2_cancellation_checkpoint(
+            request, state, reservation, checkpoint)
+        updated = c._load_json(checkpoint_value, c.MAX_COMMENT_BYTES)
+        failure = None
+        try:
+            api.set_metadata(parent, c.REFRESH_PREFIX + "reservation",
+                             checkpoint_value)
+        except RuntimeError as exc:
+            failure = exc
+        after = api.snapshot(parent)
+        after_feature = c.refresh_metadata(after.state()["metadata"])
+        if after_feature is not None and after_feature.get("reservation") == updated:
+            c.validate_supersession_progress(request, after, updated)
+            mutations += 1
+            reservation = updated
+            continue
+        _need(after_feature is not None
+              and after_feature.get("reservation") == reservation
+              and failure is not None,
+              "gate cancellation checkpoint effect was not uniquely observed")
+        raise failure
+
+
 def execute_refresh(api, git, parent: str, request_uuid: str, grant_uuid: str,
                     expected_action_key: str) -> RefreshExecutionResult:
     """Initialize an authorized refresh under the durable parent reservation."""
@@ -1014,29 +1131,28 @@ def execute_refresh(api, git, parent: str, request_uuid: str, grant_uuid: str,
             c.admit_refresh(request, api.snapshot(parent), progress.grant_comment)
 
             state = api.snapshot(parent).state()
-            projected = c._load_json(c.canonical_json(state), 4_194_304)
-            projected["parent"]["revision"] += 1
-            reservation = {
-                "version": 1, "request_digest": request.digest,
-                "authorization_uuid": grant_uuid, "action_key": action_key,
-                "state": "reserved", "child_id": None, "child_identifier": None,
-                "child_position": None, "prepared": None,
-                "parent_status_category": state["parent"]["status_category"],
-                "parent_position": state["parent"]["position"],
-                "parent_projection_digest": c.parent_projection_digest(projected),
-            }
+            reservation = _new_reservation(
+                request, request_uuid, grant_uuid, state)
             reservation_value = c.canonical_json(reservation)
             prospective = dict(state["metadata"])
             prospective[c.REFRESH_PREFIX + "reservation"] = reservation_value
             c.validate_metadata_budget(prospective, request=request)
-            api.set_metadata(parent, c.REFRESH_PREFIX + "reservation", reservation_value)
-            mutations += 1
+            failure = None
+            try:
+                api.set_metadata(parent, c.REFRESH_PREFIX + "reservation",
+                                 reservation_value)
+            except RuntimeError as exc:
+                failure = exc
             reserved_snapshot = api.snapshot(parent)
             feature = c.refresh_metadata(reserved_snapshot.state()["metadata"])
-            _need(feature is not None and feature.get("reservation") == reservation
-                  and c.parent_projection_digest(reserved_snapshot.state()) ==
-                      reservation["parent_projection_digest"],
-                  "reserved checkpoint was not authoritatively observed")
+            if (feature is None or feature.get("reservation") != reservation
+                    or c.parent_projection_digest(reserved_snapshot.state()) !=
+                       reservation["parent_projection_digest"]):
+                _need(feature is not None and "reservation" not in feature
+                      and failure is not None,
+                      "reserved checkpoint was not authoritatively observed")
+                raise failure
+            mutations += 1
             decision = c.plan_refresh(request, reserved_snapshot)
             _need(decision.kind == "resume_refresh", "reserved checkpoint is not recoverable")
         else:
@@ -1057,7 +1173,18 @@ def execute_refresh(api, git, parent: str, request_uuid: str, grant_uuid: str,
                                reservation.get("child_identifier")]
                 if len(matches) == 1 and matches[0]["detail"].get("status") == "done":
                     return _resume_publication(api, git, request, reservation)
+            if payload["schema_version"] == 2:
+                cancelled, reservation = _cancel_superseded_gates(
+                    api, request, reservation)
+                return RefreshExecutionResult(
+                    action_key, "gates_cancelled", mutations + cancelled, "")
             _initialization_progress(request, state, reservation)
+
+        if payload["schema_version"] == 2:
+            cancelled, reservation = _cancel_superseded_gates(
+                api, request, reservation)
+            return RefreshExecutionResult(
+                action_key, "gates_cancelled", mutations + cancelled, "")
 
         state = api.snapshot(parent).state()
         feature = c.refresh_metadata(state["metadata"])

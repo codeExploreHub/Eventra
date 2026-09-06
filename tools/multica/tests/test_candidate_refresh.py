@@ -120,6 +120,129 @@ class RefreshDecisionTests(unittest.TestCase):
     def decision(self, request, data):
         return self.c.plan_refresh(request, self.c.RefreshSnapshot(encode(data)))
 
+    def test_v2_cancellation_prefixes_are_exact(self):
+        request, data, reservation = v2_reserved_fixture()
+        self.assertEqual(
+            self.c.validate_supersession_progress(
+                request, self.c.RefreshSnapshot(encode(data)), reservation),
+            self.c.SupersessionProgress((), "independent_reviewer"),
+        )
+        cancel_gate_fixture(data, "independent_reviewer")
+        self.assertEqual(
+            self.c.validate_supersession_progress(
+                request, self.c.RefreshSnapshot(encode(data)), reservation),
+            self.c.SupersessionProgress(("independent_reviewer",), "integration_qa"),
+        )
+        reservation["state"] = "review_cancelled"
+        data["metadata"]["eventra.refresh.reservation"] = encode(reservation)
+        data["parent"]["metadata"] = copy.deepcopy(data["metadata"])
+        cancel_gate_fixture(data, "integration_qa")
+        self.assertEqual(
+            self.c.validate_supersession_progress(
+                request, self.c.RefreshSnapshot(encode(data)), reservation),
+            self.c.SupersessionProgress(
+                ("independent_reviewer", "integration_qa"), None),
+        )
+
+    def test_v2_cancellation_rejects_nonprefix_or_changed_gate_authority(self):
+        mutations = []
+        for revision in (0, 3):
+            mutations.append((f"revision-{revision}",
+                              lambda data, reservation, value=revision:
+                              data["children"][1]["detail"].__setitem__("revision", value)))
+        for status in ("todo", "in_progress", "done", "blocked"):
+            def change_status(data, reservation, value=status):
+                detail = data["children"][1]["detail"]
+                detail.update(status=value, status_category=value, revision=2)
+            mutations.append(("status-" + status, change_status))
+        mutations.extend((
+            ("status-category", lambda data, reservation:
+             data["children"][1]["detail"].__setitem__("status_category", "todo")),
+            ("position", lambda data, reservation:
+             data["children"][1]["detail"].__setitem__("position", -999)),
+            ("assignee", lambda data, reservation:
+             data["children"][1]["detail"].__setitem__("assignee_id", uid(17))),
+            ("title", lambda data, reservation:
+             data["children"][1]["detail"].__setitem__("title", "changed")),
+            ("description", lambda data, reservation:
+             data["children"][1]["detail"].__setitem__("description", "changed")),
+            ("metadata", lambda data, reservation:
+             data["children"][1]["metadata"].__setitem__("unexpected", "value")),
+            ("comment", lambda data, reservation:
+             data["children"][1]["comment_manifest"].append({"unexpected": True})),
+            ("run", lambda data, reservation: data["runs"].append({
+                "id": uid(70), "issue_id": uid(14), "agent_id": uid(16),
+                "status": "completed", "created_at": "2026-09-05T01:00:00Z",
+                "activity_at": "2026-09-05T01:01:00Z",
+            })),
+            ("qa-before-review", lambda data, reservation:
+             cancel_gate_fixture(data, "integration_qa")),
+            ("review-resurrected", lambda data, reservation:
+             reservation.__setitem__("state", "review_cancelled")),
+        ))
+        for name, mutate in mutations:
+            request, data, reservation = v2_reserved_fixture()
+            mutate(data, reservation)
+            data["metadata"]["eventra.refresh.reservation"] = encode(reservation)
+            data["parent"]["metadata"] = copy.deepcopy(data["metadata"])
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.c.validate_supersession_progress(
+                    request, self.c.RefreshSnapshot(encode(data)), reservation)
+
+    def test_v2_reservation_shape_and_frozen_gate_binding_are_strict(self):
+        for name, mutate in (
+                ("extra", lambda value: value.__setitem__("extra", True)),
+                ("missing", lambda value: value.pop("gates")),
+                ("v1", lambda value: value.__setitem__("version", 1)),
+                ("request-reconstruction", lambda value:
+                 value["gates"][0].__setitem__("authority_digest", "f" * 64))):
+            request, data, reservation = v2_reserved_fixture()
+            mutate(reservation)
+            data["metadata"]["eventra.refresh.reservation"] = encode(reservation)
+            data["parent"]["metadata"] = copy.deepcopy(data["metadata"])
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.c.validate_supersession_progress(
+                    request, self.c.RefreshSnapshot(encode(data)), reservation)
+
+    def test_v2_cancellation_revalidates_complete_frozen_authority(self):
+        mutations = (
+            ("source-title", lambda data:
+             data["children"][0]["detail"].__setitem__("title", "changed")),
+            ("source-revision", lambda data:
+             data["children"][0]["detail"].__setitem__("revision", 99)),
+            ("source-history", lambda data:
+             data["children"][0]["comment_manifest"].append({
+                 "issue_id": uid(3), "comment_uuid": uid(70),
+                 "author_id": uid(8), "author_type": "agent", "type": "comment",
+                 "revision": 1, "parent_id": None,
+                 "created_at": "2026-09-05T02:00:00Z",
+                 "content_digest": hashlib.sha256(b"new history").hexdigest(),
+             })),
+            ("source-run", lambda data: data["runs"].append({
+                "id": uid(71), "issue_id": uid(3), "agent_id": uid(8),
+                "status": "running", "created_at": "2026-09-05T02:00:00Z",
+                "activity_at": "2026-09-05T02:01:00Z",
+            })),
+        )
+        for name, mutate in mutations:
+            request, data, reservation = v2_reserved_fixture()
+            mutate(data)
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.c.validate_supersession_progress(
+                    request, self.c.RefreshSnapshot(encode(data)), reservation)
+
+    def test_v2_cancellation_phase_rejects_later_lifecycle_state(self):
+        request, data, reservation = v2_reserved_fixture()
+        cancel_gate_fixture(data, "independent_reviewer")
+        cancel_gate_fixture(data, "integration_qa")
+        reservation["state"] = "child_initialized"
+        data["metadata"]["eventra.refresh.reservation"] = encode(reservation)
+        data["parent"]["metadata"] = copy.deepcopy(data["metadata"])
+
+        with self.assertRaises(ValueError):
+            self.c.validate_supersession_progress(
+                request, self.c.RefreshSnapshot(encode(data)), reservation)
+
     def test_entry_has_deterministic_refresh_identity(self):
         request, data = refresh_snapshot_fixture(state="entry")
         result = self.decision(request, data)
@@ -422,6 +545,81 @@ def pristine_gate_snapshot():
                  "git_version": payload["git_version"]},
     }
     return c.RefreshSnapshot(encode(state))
+
+
+def v2_reserved_fixture():
+    """Hand-built admitted v2 reservation; no production reservation builder."""
+    from tools.multica import candidate_refresh as c
+
+    frozen = pristine_gate_snapshot()
+    request = c.freeze_refresh_request(frozen, supersede_pristine_gates=True)
+    data = frozen.state()
+    payload = request.payload()
+    envelope = {"payload": payload, "digest": request.digest,
+                "staging_ref": request.staging_ref}
+    request_record = {
+        "id": uid(12), "issue_id": uid(2), "author_type": "agent",
+        "author_id": uid(7), "revision": 1, "type": "comment",
+        "created_at": "2026-09-05T01:01:00Z",
+        "content": "```eventra-candidate-refresh-request-v2\n"
+                   + encode(envelope) + "\n```",
+    }
+    grant_record = {
+        "id": uid(13), "issue_id": uid(2), "author_type": "member",
+        "author_id": uid(11), "revision": 1, "type": "comment",
+        "created_at": "2026-09-05T01:02:00Z",
+        "content": "```eventra-candidate-refresh-grant-v2\n"
+                   + encode({"schema_version": 2, "request_digest": request.digest,
+                             "granted_refresh": 1}) + "\n```",
+    }
+    data["metadata"].update({
+        "eventra.refresh.request": encode(envelope),
+        "eventra.refresh.version": "2",
+        "eventra.refresh.merge_permission": "hold",
+        "eventra.refresh.request_digest": request.digest,
+        "eventra.refresh.request_comment": uid(12),
+        "eventra.refresh.authorization_comment": uid(13),
+    })
+    data["comments"] = [
+        {"issue_id": uid(2), "comment_uuid": record["id"],
+         "author_id": record["author_id"], "author_type": record["author_type"],
+         "revision": 1, "content": record["content"]}
+        for record in (request_record, grant_record)
+    ]
+    data["comment_manifest"] = c.comment_manifest(
+        [request_record, grant_record], uid(2))
+    data["parent"]["revision"] = payload["parent"]["revision"] + 9
+    projected = copy.deepcopy(data)
+    reservation = {
+        "version": 2, "request_digest": request.digest,
+        "request_uuid": uid(12), "authorization_uuid": uid(13),
+        "action_key": c.refresh_action(request), "state": "reserved",
+        "parent_id": payload["parent"]["id"],
+        "parent_identifier": payload["parent"]["identifier"],
+        "source": payload["source"], "pr": payload["pr"],
+        "prerequisite": payload["prerequisite"],
+        "control_tool_sha": payload["control_tool_sha"],
+        "gates": payload["supersession"]["gates"],
+        "refresh_stage": 3, "fresh_gate_stage": 4,
+        "child_id": None, "child_identifier": None,
+        "child_position": None, "prepared": None,
+        "parent_status_category": data["parent"]["status_category"],
+        "parent_position": data["parent"]["position"],
+        "parent_projection_digest": c.parent_projection_digest(projected),
+    }
+    data["metadata"]["eventra.refresh.reservation"] = encode(reservation)
+    data["parent"]["metadata"] = copy.deepcopy(data["metadata"])
+    return request, data, reservation
+
+
+def cancel_gate_fixture(data, role):
+    """Apply only the observed Multica no-start cancellation effect."""
+    assignee = {"independent_reviewer": uid(16), "integration_qa": uid(17)}[role]
+    gate = next(child for child in data["children"]
+                if child["detail"]["assignee_id"] == assignee)
+    gate["detail"]["status"] = "cancelled"
+    gate["detail"]["status_category"] = "cancelled"
+    gate["detail"]["revision"] += 1
 
 
 def encode(value):
