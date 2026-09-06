@@ -227,12 +227,21 @@ def comment_manifest_digest(records: object, issue_id: str) -> str:
 
 def build_request(payload: dict[str, object]) -> RefreshRequest:
     """Validate the entire immutable request before deriving its ref name."""
-    value = _object(payload, "schema_version workspace_id parent source pr prerequisite assignment baseline "
-                    "refresh_stage refresh_generation staging_ref_prefix tree_transform "
-                    "merge_permission control_tool_sha git_version")
+    _require(type(payload) is dict, "invalid refresh fields")
+    version = payload.get("schema_version")
+    _integer(version)
+    _require(version in {1, 2}, "unsupported refresh request version")
+    names = ("schema_version workspace_id parent source pr prerequisite assignment baseline "
+             "refresh_stage refresh_generation staging_ref_prefix tree_transform "
+             "merge_permission control_tool_sha git_version")
+    if version == 2:
+        names += " fresh_gate_stage supersession"
+    value = _object(payload, names)
     encoded = _size(canonical_json(value), MAX_REQUEST_BYTES)
-    _integer(value["schema_version"], 1)
-    _integer(value["refresh_stage"], 2)
+    _integer(value["schema_version"], version)
+    _integer(value["refresh_stage"], 2 if version == 1 else 3)
+    if version == 2:
+        _integer(value["fresh_gate_stage"], 4)
     _integer(value["refresh_generation"], 1)
     _uuid(value["workspace_id"])
     _match(value["control_tool_sha"], _SHA)
@@ -277,10 +286,52 @@ def build_request(payload: dict[str, object]) -> RefreshRequest:
     for key in ("merge_sha", "base_sha"):
         _match(prerequisite[key], _SHA)
     _require(prerequisite["merge_sha"] != source["sha"])
-    assignment = _object(value["assignment"], "project_id squad_id lead_id engineer_id")
+    assignment_fields = "project_id squad_id lead_id engineer_id"
+    if version == 2:
+        assignment_fields += " reviewer_id integration_qa_id"
+    assignment = _object(value["assignment"], assignment_fields)
     for identity in assignment.values():
         _uuid(identity)
-    _require(assignment["lead_id"] != assignment["engineer_id"])
+    if version == 1:
+        _require(assignment["lead_id"] != assignment["engineer_id"])
+    else:
+        role_ids = [assignment[key] for key in (
+            "lead_id", "engineer_id", "reviewer_id", "integration_qa_id")]
+        _require(len(set(role_ids)) == len(role_ids)
+                 and assignment["project_id"] != assignment["squad_id"],
+                 "aliased refresh assignments")
+    if version == 2:
+        supersession = _object(value["supersession"], "gate_stage mode gates")
+        _integer(supersession["gate_stage"], 2)
+        _require(supersession["mode"] == "cancel-pristine-gates-v1")
+        gates = supersession["gates"]
+        _require(type(gates) is list and len(gates) == 2,
+                 "invalid supersession gates")
+        roles = ("independent_reviewer", "integration_qa")
+        seen_ids, seen_identifiers, seen_digests = set(), set(), set()
+        for gate, role in zip(gates, roles, strict=True):
+            gate = _object(gate, "role id identifier title revision status authority_digest")
+            _require(gate["role"] == role)
+            _uuid(gate["id"])
+            _match(gate["identifier"], _ISSUE)
+            _require(gate["id"] not in {parent["id"], source["child_id"]}
+                     and gate["id"] not in seen_ids
+                     and gate["identifier"] not in {
+                         parent["identifier"], source["child_identifier"]}
+                     and gate["identifier"] not in seen_identifiers,
+                     "duplicate supersession gate")
+            expected_title = (f"{parent['identifier']} frontend review"
+                              if role == "independent_reviewer"
+                              else f"{parent['identifier']} frontend QA")
+            _require(gate["title"] == expected_title)
+            _integer(gate["revision"], 1)
+            _require(gate["status"] == "backlog")
+            _match(gate["authority_digest"], _DIGEST)
+            _require(gate["authority_digest"] not in seen_digests,
+                     "duplicate supersession authority")
+            seen_ids.add(gate["id"])
+            seen_identifiers.add(gate["identifier"])
+            seen_digests.add(gate["authority_digest"])
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
     staging_ref = STAGING_PREFIX + digest
     _size(canonical_json({"payload": value, "digest": digest, "staging_ref": staging_ref}),
@@ -303,6 +354,24 @@ def _request(request: RefreshRequest) -> dict[str, Any]:
     checked = build_request(request.payload())
     _require(checked == request, "unvalidated refresh request")
     return checked.payload()
+
+
+def refresh_protocol(request: RefreshRequest) -> int:
+    """Return the validated wire protocol version for one immutable request."""
+    return _request(request)["schema_version"]
+
+
+def supersession_preview(request: RefreshRequest) -> tuple[dict[str, object], ...]:
+    """Return non-authorizing display fields already bound by a v2 request."""
+    payload = _request(request)
+    if payload["schema_version"] == 1:
+        return ()
+    source_sha = payload["source"]["sha"]
+    return tuple({
+        "identifier": gate["identifier"], "role": gate["role"],
+        "title": gate["title"], "status": gate["status"],
+        "revision": gate["revision"], "stale_candidate_sha": source_sha,
+    } for gate in payload["supersession"]["gates"])
 
 
 def validate_metadata_budget(metadata: object, *, request: RefreshRequest | None = None) -> None:
@@ -524,15 +593,98 @@ def _issue_detail(value: object, reason: str) -> dict[str, object]:
     return detail
 
 
-def authority_projection(snapshot: RefreshSnapshot) -> dict[str, object]:
+def _pristine_gate_records(state: dict[str, Any]) -> list[dict[str, object]]:
+    parent, assignment = state["parent"], state["assignment"]
+    sources = [child for child in state["children"]
+               if child.get("detail", {}).get("stage") == 1]
+    _require(len(sources) == 1 and len(state["children"]) == 3,
+             "refresh requires one source and two pristine gates")
+    source = sources[0]
+    source_sha = source.get("metadata", {}).get("eventra.phase.sha.frontend")
+    evidence_uuid = source.get("metadata", {}).get("eventra.phase.evidence_comment")
+    _match(source_sha, _SHA)
+    _uuid(evidence_uuid)
+    pr_url = state.get("pr", {}).get("url")
+    _match(pr_url, _PR)
+    action = (f"2:{parent.get('identifier')}:create_gate_stage:0:frontend:"
+              f"{source_sha}:-:next-stage:2")
+    roles = assignment.get("roles")
+    _require(type(roles) is dict, "missing gate assignments")
+    result = []
+    for role, suffix in (("independent_reviewer", "review"),
+                         ("integration_qa", "QA")):
+        assignee_id = roles.get(role)
+        _uuid(assignee_id)
+        matches = [child for child in state["children"]
+                   if child.get("detail", {}).get("stage") == 2
+                   and child.get("detail", {}).get("assignee_id") == assignee_id]
+        _require(len(matches) == 1, "missing or duplicate pristine gate role")
+        gate = _object(matches[0], "detail metadata evidence comment_manifest")
+        detail = _issue_detail(gate["detail"], "unknown pristine gate field")
+        expected_title = f"{parent.get('identifier')} frontend {suffix}"
+        expected = {
+            "parent_issue_id": parent.get("id"),
+            "workspace_id": parent.get("workspace_id"),
+            "stage": 2,
+            "project_id": assignment.get("project_id"),
+            "assignee_type": "agent",
+            "assignee_id": assignee_id,
+            "revision": 1,
+            "status": "backlog",
+            "status_category": "backlog",
+            "title": expected_title,
+        }
+        _require(all(type(detail.get(key)) is type(value)
+                     and detail.get(key) == value for key, value in expected.items()),
+                 "pristine gate authority mismatch")
+        _require(gate["metadata"] == {} and gate["evidence"] is None
+                 and gate["comment_manifest"] == [],
+                 "pristine gate has history")
+        description = detail.get("description")
+        _require(type(description) is str, "invalid pristine gate description")
+        markers = (
+            f"- Parent: {parent.get('identifier')}",
+            f"- Candidate SHA: `{source_sha}`",
+            f"- Managed PR: `{pr_url}`",
+            f"- Stage action: `{action}`",
+            f"- Implementation evidence: comment `{evidence_uuid}`",
+        )
+        _require(all(marker in description for marker in markers),
+                 "pristine gate description mismatch")
+        gate_runs = [run for run in state["runs"]
+                     if run.get("issue_id") == detail["id"]]
+        _require(not gate_runs, "pristine gate has a run")
+        authority = {
+            "detail": {key: value for key, value in detail.items()
+                       if key not in _VOLATILE_DETAIL_FIELDS},
+            "metadata": gate["metadata"], "evidence": gate["evidence"],
+            "comment_manifest": gate["comment_manifest"], "runs": gate_runs,
+        }
+        result.append({
+            "role": role, "id": detail["id"],
+            "identifier": detail["identifier"], "title": detail["title"],
+            "revision": detail["revision"], "status": detail["status"],
+            "authority_digest": hashlib.sha256(
+                canonical_json(authority).encode("utf-8")).hexdigest(),
+        })
+    return result
+
+
+def authority_projection(snapshot: RefreshSnapshot, *,
+                         supersede_pristine_gates: bool = False) -> dict[str, object]:
     """Return the complete stable authority that a new refresh request freezes."""
     state = _snapshot(snapshot)
     parent = _issue_detail(state["parent"], "unknown parent authority field")
     _require(parent["metadata"] == state["metadata"], "parent metadata echo conflict")
     _require(parent["parent_issue_id"] is None and parent["status"] == "blocked",
              "refresh freeze requires blocked parent")
-    _require(len(state["children"]) == 1, "refresh freeze requires one source child")
-    source = _object(state["children"][0], "detail metadata evidence")
+    sources = [child for child in state["children"]
+               if child.get("detail", {}).get("stage") == 1]
+    _require(len(sources) == 1, "refresh freeze requires one source child")
+    if not supersede_pristine_gates:
+        _require(len(state["children"]) == 1,
+                 "refresh freeze requires one source child")
+    source = _object(sources[0], "detail metadata evidence")
     detail = _issue_detail(source["detail"], "unknown source authority field")
     _require(detail["metadata"] == source["metadata"], "source metadata echo conflict")
     _require(detail["parent_issue_id"] == parent["id"] and detail["stage"] == 1
@@ -553,11 +705,19 @@ def authority_projection(snapshot: RefreshSnapshot) -> dict[str, object]:
         "assignment": state["assignment"], "pr": state["pr"],
         "prerequisite": state["prerequisite"], "tool": state["tool"],
     }
+    if supersede_pristine_gates:
+        projection["supersession"] = {
+            "mode": "cancel-pristine-gates-v1",
+            "gates": _pristine_gate_records(state),
+        }
     return _load_json(canonical_json(projection), 4_194_304)
 
 
-def authority_digest(snapshot: RefreshSnapshot) -> str:
-    return hashlib.sha256(canonical_json(authority_projection(snapshot)).encode("utf-8")).hexdigest()
+def authority_digest(snapshot: RefreshSnapshot, *,
+                     supersede_pristine_gates: bool = False) -> str:
+    projection = authority_projection(
+        snapshot, supersede_pristine_gates=supersede_pristine_gates)
+    return hashlib.sha256(canonical_json(projection).encode("utf-8")).hexdigest()
 
 
 def _snapshot(snapshot: RefreshSnapshot) -> dict[str, Any]:
@@ -691,8 +851,17 @@ def _source_authority(payload: dict, state: dict) -> dict:
 def _shared_authority(payload: dict, state: dict) -> None:
     parent, assignment = state["parent"], state["assignment"]
     expected = payload["assignment"]
+    base_assignment = {key: expected[key] for key in (
+        "project_id", "squad_id", "lead_id", "engineer_id")}
     _require(assignment.get("workspace_id") == payload["workspace_id"]
-             and all(assignment.get(k) == v for k, v in expected.items()), "assignment authority mismatch")
+             and all(assignment.get(k) == v for k, v in base_assignment.items()),
+             "assignment authority mismatch")
+    if payload["schema_version"] == 2:
+        roles = assignment.get("roles")
+        _require(type(roles) is dict
+                 and roles.get("independent_reviewer") == expected["reviewer_id"]
+                 and roles.get("integration_qa") == expected["integration_qa_id"],
+                 "gate assignment authority mismatch")
     _require(parent.get("workspace_id") == payload["workspace_id"]
              and parent.get("id") == payload["parent"]["id"]
              and parent.get("identifier") == payload["parent"]["identifier"]
@@ -727,7 +896,13 @@ def _entry_authority(payload: dict, state: dict) -> None:
     _require(not any(k.startswith(("eventra.refresh.", "eventra.repair.", "eventra.smoke."))
                      or (k.startswith("eventra.workflow.") and k not in required) for k in metadata),
              "refresh entry has reservations, consumption or unknown authority")
-    _require(len(state["children"]) == 1, "refresh requires a unique Stage 1 and no later children")
+    if payload["schema_version"] == 1:
+        _require(len(state["children"]) == 1,
+                 "refresh requires a unique Stage 1 and no later children")
+    else:
+        expected_gates = payload["supersession"]["gates"]
+        _require(_pristine_gate_records(state) == expected_gates,
+                 "pristine gate authority changed")
     _require(state["pr"].get("head_sha") == payload["source"]["sha"], "managed head drift")
     active = [run for run in state["runs"] if run.get("status") in
               {"queued", "dispatched", "running", "waiting_local_directory"}]
@@ -736,19 +911,27 @@ def _entry_authority(payload: dict, state: dict) -> None:
              "active child or nonunique Lead writer")
 
 
-def freeze_refresh_request(snapshot: RefreshSnapshot) -> RefreshRequest:
-    """Build request-v1 only from one canonical, trusted, pre-registration snapshot."""
+def freeze_refresh_request(snapshot: RefreshSnapshot, *,
+                           supersede_pristine_gates: bool = False) -> RefreshRequest:
+    """Build a versioned request from one trusted pre-registration snapshot."""
     state = _snapshot(snapshot)
-    authority = authority_digest(snapshot)
-    source = _object(state["children"][0], "detail metadata evidence")
+    _require(type(supersede_pristine_gates) is bool,
+             "invalid supersession selection")
+    authority = authority_digest(
+        snapshot, supersede_pristine_gates=supersede_pristine_gates)
+    sources = [child for child in state["children"]
+               if child.get("detail", {}).get("stage") == 1]
+    _require(len(sources) == 1, "refresh freeze requires one source child")
+    source = _object(sources[0], "detail metadata evidence")
     detail, source_metadata, evidence = source["detail"], source["metadata"], source["evidence"]
     _require(type(evidence) is dict, "missing source evidence")
     parent, metadata, assignment = state["parent"], state["metadata"], state["assignment"]
     required_metadata = {"eventra.workflow.attempt", "eventra.workflow.next_stage",
                          "eventra.workflow.merge_state", "eventra.workflow.last_action"}
     _require(required_metadata <= set(metadata), "refresh entry metadata mismatch")
+    protocol = 2 if supersede_pristine_gates else 1
     payload = {
-        "schema_version": 1,
+        "schema_version": protocol,
         "workspace_id": parent["workspace_id"],
         "parent": {"id": parent["id"], "identifier": parent["identifier"],
                    "revision": parent["revision"], "stage": 1,
@@ -762,14 +945,26 @@ def freeze_refresh_request(snapshot: RefreshSnapshot) -> RefreshRequest:
                    "evidence_digest": hashlib.sha256(evidence["content"].encode("utf-8")).hexdigest()},
         "pr": {key: state["pr"][key] for key in ("url", "repository", "head_ref", "base_ref")},
         "prerequisite": {key: state["prerequisite"][key] for key in ("pr_url", "merge_sha", "base_sha")},
-        "assignment": {key: assignment[key] for key in ("project_id", "squad_id", "lead_id", "engineer_id")},
+        "assignment": {key: assignment[key] for key in (
+            "project_id", "squad_id", "lead_id", "engineer_id")},
         "baseline": {"authority_digest": authority,
                      "comments_digest": hashlib.sha256(canonical_json(state["comment_manifest"]).encode("utf-8")).hexdigest()},
-        "refresh_stage": 2, "refresh_generation": 1,
+        "refresh_stage": 2 if protocol == 1 else 3,
+        "refresh_generation": 1,
         "staging_ref_prefix": STAGING_PREFIX, "tree_transform": "clean-two-parent-merge-v1",
         "merge_permission": "hold", "control_tool_sha": state["tool"]["sha"],
         "git_version": state["tool"]["git_version"],
     }
+    if protocol == 2:
+        payload["assignment"].update({
+            "reviewer_id": assignment["roles"]["independent_reviewer"],
+            "integration_qa_id": assignment["roles"]["integration_qa"],
+        })
+        payload["fresh_gate_stage"] = 4
+        payload["supersession"] = {
+            "gate_stage": 2, "mode": "cancel-pristine-gates-v1",
+            "gates": _pristine_gate_records(state),
+        }
     request = build_request(payload)
     _entry_authority(payload, state)
     validate_metadata_budget(metadata, request=request)
@@ -900,7 +1095,8 @@ class RefreshDecision:
 def refresh_action(request: RefreshRequest) -> str:
     payload = _request(request)
     return (f"2:{payload['parent']['identifier']}:create_refresh_stage:0:frontend:"
-            f"{payload['source']['sha']}:next-stage:2:refresh:1:{request.digest}")
+            f"{payload['source']['sha']}:next-stage:{payload['refresh_stage']}:"
+            f"refresh:{payload['schema_version']}:{request.digest}")
 
 
 def refresh_metadata(metadata: dict[str, str]) -> dict[str, Any] | None:

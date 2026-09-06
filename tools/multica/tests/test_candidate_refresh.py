@@ -310,6 +310,112 @@ def request_payload():
     }
 
 
+def v2_request_payload():
+    payload = request_payload()
+    payload.update({
+        "schema_version": 2,
+        "refresh_stage": 3,
+        "fresh_gate_stage": 4,
+        "supersession": {
+            "gate_stage": 2,
+            "mode": "cancel-pristine-gates-v1",
+            "gates": [
+                {"role": "independent_reviewer", "id": uid(14),
+                 "identifier": "PRO-902", "title": "PRO-900 frontend review",
+                 "revision": 1, "status": "backlog", "authority_digest": "3" * 64},
+                {"role": "integration_qa", "id": uid(15),
+                 "identifier": "PRO-903", "title": "PRO-900 frontend QA",
+                 "revision": 1, "status": "backlog", "authority_digest": "4" * 64},
+            ],
+        },
+    })
+    payload["assignment"].update({
+        "reviewer_id": uid(16), "integration_qa_id": uid(17),
+    })
+    return payload
+
+
+def pristine_gate_snapshot():
+    from tools.multica import candidate_refresh as c
+    from tools.multica.tests.test_issue_contracts import issue_detail
+
+    payload = request_payload()
+    evidence_content = "Original Stage 1 PASS for " + payload["source"]["sha"]
+    evidence = {"issue_id": uid(3), "comment_uuid": uid(4),
+                "author_id": uid(8), "author_type": "agent", "revision": 1,
+                "content": evidence_content}
+    metadata = {
+        "eventra.workflow.version": "2",
+        "eventra.workflow.classification": "frontend-only",
+        "eventra.workflow.attempt": "0",
+        "eventra.workflow.next_stage": "2",
+        "eventra.workflow.merge_state": "not_ready",
+        "eventra.workflow.frontend_sha": payload["source"]["sha"],
+        "eventra.workflow.last_action": payload["parent"]["last_action"],
+    }
+    source_metadata = {
+        "eventra.workflow.version": "2", "eventra.phase.kind": "implementation",
+        "eventra.phase.attempt": "0", "eventra.phase.result": "pass",
+        "eventra.phase.sha.frontend": payload["source"]["sha"],
+        "eventra.phase.evidence_comment": uid(4),
+        "eventra.phase.pr": payload["pr"]["url"],
+        "eventra.phase.creation_action": payload["parent"]["last_action"],
+        "eventra.phase.target": "repository:frontend",
+        "eventra.phase.role": "frontend_engineer",
+        "eventra.phase.failure_repositories": "[]",
+    }
+    gate_action = ("2:PRO-900:create_gate_stage:0:frontend:" + payload["source"]["sha"]
+                   + ":-:next-stage:2")
+    def gate(number, role, title, assignee):
+        description = (f"## Exact-SHA scope\n\n- Parent: PRO-900\n- Role: {role}\n"
+                       f"- Candidate SHA: `{payload['source']['sha']}`\n"
+                       f"- Managed PR: `{payload['pr']['url']}`\n"
+                       f"- Stage action: `{gate_action}`\n"
+                       f"- Implementation evidence: comment `{uid(4)}`")
+        detail = issue_detail(
+            id=uid(number), identifier=f"PRO-{888 + number}", parent_issue_id=uid(2),
+            stage=2, assignee_id=assignee, project_id=uid(5), revision=1,
+            status="backlog", status_category="backlog", workspace_id=uid(1), title=title,
+            description=description,
+        )
+        detail["metadata"] = {}
+        return {"detail": detail, "metadata": {}, "evidence": None,
+                "comment_manifest": []}
+    parent = issue_detail(
+        id=uid(2), identifier="PRO-900", parent_issue_id=None, stage=None,
+        assignee_id=uid(6), assignee_type="squad", project_id=uid(5),
+        revision=7, status="blocked", workspace_id=uid(1),
+    )
+    parent["metadata"] = copy.deepcopy(metadata)
+    source = issue_detail(
+        id=uid(3), identifier="PRO-901", parent_issue_id=uid(2), stage=1,
+        assignee_id=uid(8), project_id=uid(5), revision=8, status="done",
+        workspace_id=uid(1),
+    )
+    source["metadata"] = copy.deepcopy(source_metadata)
+    roles = {"delivery_lead": uid(7), "frontend_engineer": uid(8),
+             "independent_reviewer": uid(16), "integration_qa": uid(17)}
+    state = {
+        "parent": parent, "metadata": metadata,
+        "children": [
+            {"detail": source, "metadata": source_metadata, "evidence": evidence},
+            gate(14, "independent_reviewer", "PRO-900 frontend review", uid(16)),
+            gate(15, "integration_qa", "PRO-900 frontend QA", uid(17)),
+        ],
+        "runs": [], "comments": [], "comment_manifest": [],
+        "pr": {**payload["pr"], "head_sha": payload["source"]["sha"],
+               "state": "open", "merged": False},
+        "prerequisite": {**payload["prerequisite"], "merged": True,
+                         "ancestor_sha": payload["prerequisite"]["merge_sha"]},
+        "assignment": {**payload["assignment"], "workspace_id": uid(1),
+                       "roles": roles, "projects": {"frontend": uid(5), "backend": uid(30)},
+                       "members": []},
+        "tool": {"sha": payload["control_tool_sha"],
+                 "git_version": payload["git_version"]},
+    }
+    return c.RefreshSnapshot(encode(state))
+
+
 def encode(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -358,6 +464,66 @@ class ContractCase(unittest.TestCase):
 
 
 class RequestTests(ContractCase):
+    def test_v1_protocol_and_action_remain_unchanged(self):
+        expected = ("2:PRO-900:create_refresh_stage:0:frontend:" + "b" * 40
+                    + ":next-stage:2:refresh:1:" + self.request.digest)
+
+        self.assertEqual(self.api.refresh_protocol(self.request), 1)
+        self.assertEqual(self.api.supersession_preview(self.request), ())
+        self.assertEqual(self.api.refresh_action(self.request), expected)
+        self.assertEqual(self.request.payload(), request_payload())
+
+    def test_v2_request_binds_exact_pristine_gate_pair(self):
+        request = self.api.freeze_refresh_request(
+            pristine_gate_snapshot(), supersede_pristine_gates=True)
+        payload = request.payload()
+
+        self.assertEqual(self.api.refresh_protocol(request), 2)
+        self.assertEqual(payload["refresh_stage"], 3)
+        self.assertEqual(payload["fresh_gate_stage"], 4)
+        self.assertEqual(
+            [gate["role"] for gate in payload["supersession"]["gates"]],
+            ["independent_reviewer", "integration_qa"],
+        )
+        self.assertEqual(self.api.supersession_preview(request), (
+            {"identifier": "PRO-902", "role": "independent_reviewer",
+             "title": "PRO-900 frontend review", "status": "backlog",
+             "revision": 1, "stale_candidate_sha": "b" * 40},
+            {"identifier": "PRO-903", "role": "integration_qa",
+             "title": "PRO-900 frontend QA", "status": "backlog",
+             "revision": 1, "stale_candidate_sha": "b" * 40},
+        ))
+
+    def test_v2_wire_shape_is_strict(self):
+        base = v2_request_payload()
+        cases = []
+        extra = copy.deepcopy(base); extra["supersession"]["extra"] = 1; cases.append(extra)
+        missing = copy.deepcopy(base); del missing["fresh_gate_stage"]; cases.append(missing)
+        reversed_roles = copy.deepcopy(base)
+        reversed_roles["supersession"]["gates"].reverse(); cases.append(reversed_roles)
+        duplicate = copy.deepcopy(base)
+        duplicate["supersession"]["gates"][1]["role"] = "independent_reviewer"; cases.append(duplicate)
+        wrong_title = copy.deepcopy(base)
+        wrong_title["supersession"]["gates"][0]["title"] = "PRO-900 review"; cases.append(wrong_title)
+        wrong_revision = copy.deepcopy(base)
+        wrong_revision["supersession"]["gates"][0]["revision"] = 2; cases.append(wrong_revision)
+        wrong_status = copy.deepcopy(base)
+        wrong_status["supersession"]["gates"][1]["status"] = "todo"; cases.append(wrong_status)
+        duplicate_digest = copy.deepcopy(base)
+        duplicate_digest["supersession"]["gates"][1]["authority_digest"] = "3" * 64
+        cases.append(duplicate_digest)
+        duplicate_id = copy.deepcopy(base)
+        duplicate_id["supersession"]["gates"][1]["id"] = uid(14); cases.append(duplicate_id)
+        invalid_uuid = copy.deepcopy(base)
+        invalid_uuid["supersession"]["gates"][0]["id"] = "not-a-uuid"; cases.append(invalid_uuid)
+        extra_gate_field = copy.deepcopy(base)
+        extra_gate_field["supersession"]["gates"][0]["extra"] = True
+        cases.append(extra_gate_field)
+        wrong_stage = copy.deepcopy(base); wrong_stage["refresh_stage"] = 2; cases.append(wrong_stage)
+        for payload in cases:
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                self.api.build_request(payload)
+
     def test_request_baseline_participates_in_digest(self):
         payload = request_payload()
         expected = hashlib.sha256(encode(payload).encode()).hexdigest()
