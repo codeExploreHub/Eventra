@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-06
 
-**Status:** Approved in conversation; written review pending
+**Status:** Approved
 **Base:** PR #17 head `21078feb54adbe1c9fece2e692624369c9f204d2`
 
 ## 1. Context
