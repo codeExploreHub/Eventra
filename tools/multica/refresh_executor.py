@@ -116,7 +116,7 @@ class RefreshAPI:
 
     def create_child(self, *, parent, stage, title, project_id, assignee_id, description):
         c._match(parent, c._ISSUE)
-        _need(stage == 2, "invalid refresh stage")
+        _need(stage in {2, 3}, "invalid refresh stage")
         for value in (project_id, assignee_id):
             c._uuid(value)
         c._size(title, 512)
@@ -452,24 +452,27 @@ def _initialization_progress(request: c.RefreshRequest, state: dict, reservation
     """Classify only the fixed write prefix following one durable checkpoint."""
     payload = c._request(request)
     action_key = c.refresh_action(request)
-    reservation_fields = {
-        "version", "request_digest", "authorization_uuid", "action_key", "state",
-        "child_id", "child_identifier", "prepared", "parent_status_category",
-        "parent_position", "child_position", "parent_projection_digest",
-    }
+    protocol = payload["schema_version"]
+    reservation_fields = (c.V2_RESERVATION_FIELDS if protocol == 2
+                          else RESERVATION_FIELDS)
     _need(type(reservation) is dict and set(reservation) == reservation_fields,
           "invalid initialization checkpoint shape")
     feature = c.refresh_metadata(state["metadata"])
+    expected_request_uuid = reservation.get(
+        "request_uuid", None if feature is None else feature.get("request_comment"))
     _need(feature is not None and feature.get("request_comment") is not None
+          and feature.get("request_comment") == expected_request_uuid
           and feature.get("authorization_comment") == reservation["authorization_uuid"]
           and feature.get("reservation") == reservation,
           "refresh checkpoint identity changed")
-    _need(reservation["version"] == 1 and reservation["request_digest"] == request.digest
+    base_state = "gates_cancelled" if protocol == 2 else "reserved"
+    _need(reservation["version"] == protocol
+          and reservation["request_digest"] == request.digest
           and reservation["action_key"] == action_key and reservation["prepared"] is None
           and type(reservation.get("parent_status_category")) is str
           and type(reservation.get("parent_position")) is int
           and state["parent"].get("position") == reservation["parent_position"]
-          and reservation["state"] in {"reserved", "child_initialized", "child_dispatched"},
+          and reservation["state"] in {base_state, "child_initialized", "child_dispatched"},
           "invalid initialization checkpoint")
     c._shared_authority(payload, state)
     c._request_comment(request, state, feature)
@@ -477,12 +480,19 @@ def _initialization_progress(request: c.RefreshRequest, state: dict, reservation
               if item.get("comment_uuid") == reservation["authorization_uuid"]]
     _need(len(grants) == 1, "missing refresh grant")
     c._grant_in_state(request, state, c.RefreshComment(**grants[0]))
+    if protocol == 2:
+        c.validate_supersession_initialization_authority(
+            request, c.RefreshSnapshot(c.canonical_json(state)), reservation)
 
     title = f"{payload['parent']['identifier']}: prepare candidate refresh"
-    description = c.canonical_json({"schema_version": 1, "request_digest": request.digest,
+    description = c.canonical_json({"schema_version": protocol,
+                                    "request_digest": request.digest,
                                     "action_key": action_key})
+    base_ids = {payload["source"]["child_id"]}
+    if protocol == 2:
+        base_ids.update(gate["id"] for gate in payload["supersession"]["gates"])
     later = [item for item in state["children"]
-             if item["detail"]["id"] != payload["source"]["child_id"]]
+             if item["detail"]["id"] not in base_ids]
     _need(len(later) <= 1, "duplicate refresh child")
     child = later[0] if later else None
     child_prefix = 0
@@ -490,7 +500,8 @@ def _initialization_progress(request: c.RefreshRequest, state: dict, reservation
         detail = child["detail"]
         expected = {
             "parent_issue_id": payload["parent"]["id"], "workspace_id": payload["workspace_id"],
-            "stage": 2, "project_id": payload["assignment"]["project_id"],
+            "stage": c._refresh_stage(request),
+            "project_id": payload["assignment"]["project_id"],
             "assignee_type": "agent", "assignee_id": payload["assignment"]["engineer_id"],
             "title": title, "description": description,
         }
@@ -508,9 +519,9 @@ def _initialization_progress(request: c.RefreshRequest, state: dict, reservation
     base_action = payload["parent"]["last_action"]
     parent_cases = [
         (base_next, base_action, payload["parent"]["status"]),
-        ("3", base_action, payload["parent"]["status"]),
-        ("3", action_key, payload["parent"]["status"]),
-        ("3", action_key, "in_progress"),
+        (str(c._fresh_gate_stage(request)), base_action, payload["parent"]["status"]),
+        (str(c._fresh_gate_stage(request)), action_key, payload["parent"]["status"]),
+        (str(c._fresh_gate_stage(request)), action_key, "in_progress"),
     ]
     observed_parent = (metadata.get("eventra.workflow.next_stage"),
                        metadata.get("eventra.workflow.last_action"), parent.get("status"))
@@ -520,7 +531,7 @@ def _initialization_progress(request: c.RefreshRequest, state: dict, reservation
         reservation["parent_status_category"] if parent_prefix < 3 else "in_progress"),
         "parent status category does not match the verified transition")
 
-    if reservation["state"] == "reserved":
+    if reservation["state"] == base_state:
         _need(reservation["child_id"] is None and reservation["child_identifier"] is None,
               "reserved child binding is premature")
         _need(reservation["child_position"] is None,
@@ -552,7 +563,7 @@ def _initialization_progress(request: c.RefreshRequest, state: dict, reservation
     _need(len(child_runs) <= 1 and all(run["agent_id"] == payload["assignment"]["engineer_id"]
                                       for run in child_runs)
           and len(active) == len(parent_runs) + len(active_child_runs), "unexpected refresh run")
-    if reservation["state"] == "reserved":
+    if reservation["state"] == base_state:
         _need(not child_runs and (child is None or child["detail"]["status"] == "backlog"),
               "reserved child started before initialization checkpoint")
     elif reservation["state"] == "child_initialized":
@@ -571,15 +582,14 @@ def _checkpoint_value(request: c.RefreshRequest, authorization_uuid: str, state:
     projected = c._load_json(c.canonical_json(state), 4_194_304)
     projected["parent"]["revision"] += 1
     reservation = {
-        "version": 1, "request_digest": request.digest,
-        "authorization_uuid": authorization_uuid, "action_key": c.refresh_action(request),
-        "state": checkpoint,
+        **previous, "version": c.refresh_protocol(request),
+        "request_digest": request.digest,
+        "authorization_uuid": authorization_uuid,
+        "action_key": c.refresh_action(request), "state": checkpoint,
         "child_id": None if child is None else child["detail"]["id"],
         "child_identifier": None if child is None else child["detail"]["identifier"],
         "child_position": None if child is None else child["detail"]["position"],
         "prepared": None,
-        "parent_status_category": previous["parent_status_category"],
-        "parent_position": previous["parent_position"],
         "parent_projection_digest": c.parent_projection_digest(projected),
     }
     return c.canonical_json(reservation)
@@ -1164,27 +1174,35 @@ def execute_refresh(api, git, parent: str, request_uuid: str, grant_uuid: str,
                   and reservation.get("authorization_uuid") == grant_uuid
                   and reservation.get("action_key") == action_key,
                   "invalid refresh initialization checkpoint")
-            if reservation.get("state") in {
-                    "candidate_registered", "published", "adopted"}:
-                return _resume_publication(api, git, request, reservation)
-            if reservation.get("state") == "child_dispatched":
-                matches = [item for item in state["children"]
-                           if item["detail"].get("identifier") ==
-                               reservation.get("child_identifier")]
-                if len(matches) == 1 and matches[0]["detail"].get("status") == "done":
-                    return _resume_publication(api, git, request, reservation)
             if payload["schema_version"] == 2:
-                cancelled, reservation = _cancel_superseded_gates(
-                    api, request, reservation)
-                return RefreshExecutionResult(
-                    action_key, "gates_cancelled", mutations + cancelled, "")
+                if reservation.get("state") in {
+                        "reserved", "review_cancelled"}:
+                    cancelled, reservation = _cancel_superseded_gates(
+                        api, request, reservation)
+                    mutations += cancelled
+                    state = api.snapshot(parent).state()
+                else:
+                    _need(reservation.get("state") in {
+                        "gates_cancelled", "child_initialized", "child_dispatched"
+                    }, "v2 publication is not available during initialization")
+            else:
+                if reservation.get("state") in {
+                        "candidate_registered", "published", "adopted"}:
+                    return _resume_publication(api, git, request, reservation)
+                if reservation.get("state") == "child_dispatched":
+                    matches = [item for item in state["children"]
+                               if item["detail"].get("identifier") ==
+                                   reservation.get("child_identifier")]
+                    if len(matches) == 1 and matches[0]["detail"].get("status") == "done":
+                        return _resume_publication(api, git, request, reservation)
             _initialization_progress(request, state, reservation)
 
-        if payload["schema_version"] == 2:
+        if (payload["schema_version"] == 2
+                and reservation["state"] in {
+                    "reserved", "review_cancelled"}):
             cancelled, reservation = _cancel_superseded_gates(
                 api, request, reservation)
-            return RefreshExecutionResult(
-                action_key, "gates_cancelled", mutations + cancelled, "")
+            mutations += cancelled
 
         state = api.snapshot(parent).state()
         feature = c.refresh_metadata(state["metadata"])
@@ -1195,12 +1213,13 @@ def execute_refresh(api, git, parent: str, request_uuid: str, grant_uuid: str,
                                           progress["child"]["detail"]["identifier"])
         if progress["child"] is None:
             title = f"{parent}: prepare candidate refresh"
-            description = c.canonical_json({"schema_version": 1, "request_digest": request.digest,
+            description = c.canonical_json({"schema_version": payload["schema_version"],
+                                            "request_digest": request.digest,
                                             "action_key": action_key})
             failure = None
             try:
                 api.create_child(
-                    parent=parent, stage=2, title=title,
+                    parent=parent, stage=c._refresh_stage(request), title=title,
                     project_id=payload["assignment"]["project_id"],
                     assignee_id=payload["assignment"]["engineer_id"], description=description,
                 )
@@ -1238,7 +1257,8 @@ def execute_refresh(api, git, parent: str, request_uuid: str, grant_uuid: str,
             raise failure
 
         parent_writes = [
-            ("metadata", "eventra.workflow.next_stage", "3"),
+            ("metadata", "eventra.workflow.next_stage",
+             str(c._fresh_gate_stage(request))),
             ("metadata", "eventra.workflow.last_action", action_key),
             ("status", "in_progress", "no-start"),
         ]
@@ -1264,7 +1284,8 @@ def execute_refresh(api, git, parent: str, request_uuid: str, grant_uuid: str,
                   "parent initialization effect was not uniquely observed")
             raise failure
 
-        if reservation["state"] == "reserved":
+        base_state = "gates_cancelled" if payload["schema_version"] == 2 else "reserved"
+        if reservation["state"] == base_state:
             initialized_value = _checkpoint_value(
                 request, grant_uuid, state, "child_initialized", progress["child"], reservation)
             initialized = c._load_json(initialized_value, c.MAX_COMMENT_BYTES)
@@ -1340,7 +1361,8 @@ def finish_refresh(api, git, child: str, evidence_uuid: str,
         prepared = None
         if result == "pass":
             prepared = c.parse_prepared(evidence, request, reservation.get("child_id"))
-            body = c._block(evidence.content, "prepared")
+            body = c._block(
+                evidence.content, "prepared", protocol=c.refresh_protocol(request))
             _need(body["context_receipt"]["task_id"] == child,
                   "prepared context is not scoped to the authoritative child")
             target_sha = prepared.target_sha

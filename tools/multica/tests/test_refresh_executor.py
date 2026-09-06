@@ -229,6 +229,34 @@ class SnapshotTests(unittest.TestCase):
             "--output", "json", "--profile", "pro-1", "--workspace-id", uid(1),
         )])
 
+    def test_create_child_accepts_only_request_stage_domain(self):
+        class MutationBoundary:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, args):
+                self.calls.append(tuple(args))
+                return {"identifier": "PRO-904"}
+
+        runner = MutationBoundary()
+        api = self.module.RefreshAPI(
+            runner, None, self.root, scope=self.scope,
+            prerequisite_pr=self.runner.payload["prerequisite"]["pr_url"],
+        )
+        api.create_child(
+            parent="PRO-900", stage=3, title="PRO-900: prepare candidate refresh",
+            project_id=uid(5), assignee_id=uid(8), description="{}",
+        )
+        before = len(runner.calls)
+
+        with self.assertRaisesRegex(RuntimeError, "invalid refresh stage"):
+            api.create_child(
+                parent="PRO-900", stage=4, title="invalid",
+                project_id=uid(5), assignee_id=uid(8), description="{}",
+            )
+
+        self.assertEqual(len(runner.calls), before)
+
     def test_v2_snapshot_binds_complete_pristine_gate_history(self):
         self.runner.add_pristine_gates()
 
@@ -1055,21 +1083,23 @@ class MemoryRefreshAPI:
         self.write_index += 1
         if self.fail_at == self.write_index and not self.fail_after:
             raise RuntimeError("injected before effect")
-        if parent != "PRO-900" or stage != 2:
+        expected_stage = self.request.payload()["refresh_stage"]
+        if parent != "PRO-900" or stage != expected_stage:
             raise RuntimeError("invalid child scope")
-        child = issue_detail(id=uid(90), identifier="PRO-902", parent_issue_id=uid(2), stage=stage,
+        identifier = "PRO-902" if expected_stage == 2 else "PRO-904"
+        child = issue_detail(id=uid(90), identifier=identifier, parent_issue_id=uid(2), stage=stage,
                              status="backlog", project_id=project_id, assignee_id=assignee_id,
                              workspace_id=uid(1), description=description, title=title, revision=1)
         child["metadata"] = {}
         self.state["children"].append({"detail": child, "metadata": {}, "evidence": None,
                                        "comment_manifest": []})
         self.create_effects += 1
-        self.writes.append(("create_child", parent, "PRO-902"))
+        self.writes.append(("create_child", parent, identifier))
         if self.fail_at == self.write_index and self.fail_after:
             raise RuntimeError("injected after effect")
         if self.fail_operation == "create_child_after":
             raise RuntimeError("injected create after effect")
-        return "PRO-902"
+        return identifier
 
 
 class StageRequestTests(unittest.TestCase):
@@ -1155,43 +1185,55 @@ class StageRequestTests(unittest.TestCase):
         return importlib.import_module("tools.multica.refresh_executor")
 
 
+def admitted_v2_execution():
+    """Reach granted v2 admission through the public staging contract."""
+    api = MemoryRefreshAPI()
+    api.use_v2()
+    module = importlib.import_module("tools.multica.refresh_executor")
+    module.stage_refresh_request(api, "PRO-900", api.request)
+    api.publish_authorization()
+    api.writes.clear()
+    api.write_index = 0
+    return api, MemoryRefreshGit(api.request, api), api.request
+
+
 class ExecuteRefreshTests(unittest.TestCase):
     @staticmethod
     def v2_case():
-        api = MemoryRefreshAPI()
-        api.use_v2()
+        api, _, _ = admitted_v2_execution()
         module = importlib.import_module("tools.multica.refresh_executor")
-        module.stage_refresh_request(api, "PRO-900", api.request)
-        api.publish_authorization()
-        api.writes.clear()
-        api.write_index = 0
         return api, module
 
-    def test_v2_complete_path_cancels_two_gates_and_stops_before_initialization(self):
-        api, module = self.v2_case()
+    def test_v2_initializes_stage_three_only_after_both_gates_cancel(self):
+        api, git, request = admitted_v2_execution()
+        module = importlib.import_module("tools.multica.refresh_executor")
         source_before = encode(api.state["children"][0])
         pr_before = copy.deepcopy(api.state["pr"])
 
         result = module.execute_refresh(
-            api, None, "PRO-900", uid(12), uid(13),
-            contracts.refresh_action(api.request),
+            api, git, "PRO-900", uid(12), uid(13),
+            contracts.refresh_action(request),
         )
 
         self.assertEqual((result.status, result.child_identifier),
-                         ("gates_cancelled", ""))
+                         ("child_dispatched", "PRO-904"))
         self.assertEqual([write for write in api.writes if write[0] == "cancel_gate"], [
             ("cancel_gate", "PRO-902"), ("cancel_gate", "PRO-903"),
         ])
         self.assertEqual(api.cancel_effects, 2)
-        self.assertEqual([child["detail"]["status"] for child in api.state["children"]],
-                         ["done", "cancelled", "cancelled"])
-        self.assertEqual(len(api.state["children"]), 3)
-        self.assertEqual(api.state["runs"], [])
+        refresh_children = [child for child in api.state["children"]
+                            if child["metadata"].get("eventra.phase.kind") == "refresh"]
+        self.assertEqual([child["detail"]["stage"] for child in refresh_children], [3])
+        self.assertEqual(refresh_children[0]["metadata"]["eventra.refresh.version"], "2")
+        self.assertEqual(api.state["metadata"]["eventra.workflow.next_stage"], "4")
+        self.assertEqual(sum(write[0] == "set_status" and write[3] is True
+                             for write in api.writes), 1)
+        self.assertEqual(len(api.state["runs"]), 1)
         self.assertEqual(api.state["pr"], pr_before)
         self.assertEqual(encode(api.state["children"][0]), source_before)
         reservation = contracts.refresh_metadata(
             api.state["metadata"])["reservation"]
-        self.assertEqual(reservation["state"], "gates_cancelled")
+        self.assertEqual(reservation["state"], "child_dispatched")
 
     def test_v2_cancellation_failure_boundaries_recover_without_duplicate_effects(self):
         for fail_at in range(3, 8):
@@ -1223,14 +1265,77 @@ class ExecuteRefreshTests(unittest.TestCase):
                             contracts.refresh_action(api.request),
                         )
 
-                    self.assertEqual(result.status, "gates_cancelled")
+                    self.assertEqual(result.status, "child_dispatched")
                     self.assertEqual(api.cancel_effects, 2)
                     self.assertEqual(len([write for write in api.writes
                                           if write[0] == "cancel_gate"]), 2)
-                    self.assertEqual(len(api.state["children"]), 3)
-                    self.assertEqual(api.state["runs"], [])
+                    self.assertEqual(len(api.state["children"]), 4)
+                    self.assertEqual(len(api.state["runs"]), 1)
                     self.assertEqual(api.state["pr"], pr_before)
                     self.assertEqual(encode(api.state["children"][0]), source_before)
+
+    def test_v2_every_initialization_boundary_recovers_one_stage_three_child_and_run(self):
+        for fail_at in range(1, 19):
+            for fail_after in (False, True):
+                with self.subTest(fail_at=fail_at, fail_after=fail_after):
+                    api, git, request = admitted_v2_execution()
+                    module = importlib.import_module("tools.multica.refresh_executor")
+                    source_before = encode(api.state["children"][0])
+                    api.fail_operation = "create_child"
+                    with self.assertRaisesRegex(RuntimeError, "create before effect"):
+                        module.execute_refresh(
+                            api, git, "PRO-900", uid(12), uid(13),
+                            contracts.refresh_action(request),
+                        )
+                    api.fail_operation = None
+                    self.assertEqual(contracts.refresh_metadata(
+                        api.state["metadata"])["reservation"]["state"],
+                        "gates_cancelled")
+                    self.assertEqual(len(api.state["children"]), 3)
+                    api.writes.clear()
+                    api.write_index = 0
+                    api.fail_at, api.fail_after = fail_at, fail_after
+
+                    if fail_at == 1 or not fail_after:
+                        with self.assertRaisesRegex(RuntimeError,
+                                                    "before effect|after effect"):
+                            module.execute_refresh(
+                                api, git, "PRO-900", uid(12), uid(13),
+                                contracts.refresh_action(request),
+                            )
+                        api.fail_at = None
+                        result = module.execute_refresh(
+                            api, git, "PRO-900", uid(12), uid(13),
+                            contracts.refresh_action(request),
+                        )
+                    else:
+                        result = module.execute_refresh(
+                            api, git, "PRO-900", uid(12), uid(13),
+                            contracts.refresh_action(request),
+                        )
+
+                    action = ("2:PRO-900:create_refresh_stage:0:frontend:"
+                              + "b" * 40 + ":next-stage:3:refresh:2:"
+                              + request.digest)
+                    refresh_children = [item for item in api.state["children"]
+                                        if item["metadata"].get(
+                                            "eventra.phase.kind") == "refresh"]
+                    self.assertEqual(result.status, "child_dispatched")
+                    self.assertEqual(len(refresh_children), 1)
+                    self.assertEqual(refresh_children[0]["detail"]["stage"], 3)
+                    self.assertEqual(refresh_children[0]["metadata"][
+                        "eventra.phase.creation_action"], action)
+                    self.assertEqual(api.state["metadata"][
+                        "eventra.workflow.next_stage"], "4")
+                    self.assertEqual(api.create_effects, 1)
+                    child_runs = [run for run in api.state["runs"]
+                                  if run["issue_id"] ==
+                                  refresh_children[0]["detail"]["id"]]
+                    self.assertEqual(len(child_runs), 1)
+                    self.assertEqual(len(api.writes), 18)
+                    self.assertEqual(api.cancel_effects, 2)
+                    self.assertEqual(encode(api.state["children"][0]), source_before)
+
 
     def test_v2_replay_blocks_source_drift_before_any_gate_cancellation(self):
         for name, mutate in (
@@ -1263,10 +1368,13 @@ class ExecuteRefreshTests(unittest.TestCase):
 
     def test_v2_cancellation_never_rewrites_later_lifecycle_state_backward(self):
         api, module = self.v2_case()
-        module.execute_refresh(
-            api, None, "PRO-900", uid(12), uid(13),
-            contracts.refresh_action(api.request),
-        )
+        api.fail_operation = "create_child"
+        with self.assertRaisesRegex(RuntimeError, "create before effect"):
+            module.execute_refresh(
+                api, None, "PRO-900", uid(12), uid(13),
+                contracts.refresh_action(api.request),
+            )
+        api.fail_operation = None
         reservation = contracts.refresh_metadata(
             api.state["metadata"])["reservation"]
         reservation["state"] = "child_initialized"
@@ -1345,6 +1453,12 @@ class ExecuteRefreshTests(unittest.TestCase):
         action = contracts.refresh_action(api.request)
         child = api.state["children"][1]
         self.assertEqual(result.status, "child_dispatched")
+        self.assertEqual(child["detail"]["stage"], 2)
+        self.assertEqual(
+            action,
+            "2:PRO-900:create_refresh_stage:0:frontend:" + "b" * 40
+            + ":next-stage:2:refresh:1:" + api.request.digest,
+        )
         self.assertEqual(child["metadata"], {
             "eventra.workflow.version": "2",
             "eventra.phase.kind": "refresh",
@@ -1588,6 +1702,142 @@ class FinishRefreshTests(unittest.TestCase):
         api.add_comment("PRO-902", evidence)
         git = MemoryRefreshGit(api.request)
         return api, module, git, child, evidence_uuid
+
+    @staticmethod
+    def v2_nonpass_case(outcome):
+        api, git, request = admitted_v2_execution()
+        module = importlib.import_module("tools.multica.refresh_executor")
+        module.execute_refresh(
+            api, git, "PRO-900", uid(12), uid(13),
+            contracts.refresh_action(request),
+        )
+        child = next(item for item in api.state["children"]
+                     if item["metadata"].get("eventra.phase.kind") == "refresh")
+        payload = {
+            "schema_version": 2,
+            "request_digest": request.digest,
+            "child_id": child["detail"]["id"],
+            "source_sha": "b" * 40,
+            "prerequisite_sha": "d" * 40,
+            "result": outcome,
+            "commands": {
+                "build": {"argv": ["npm", "run", "build"], "exit_code": 1},
+            },
+            "reason": "required build could not complete",
+        }
+        evidence_uuid = uid(94)
+        evidence = contracts.RefreshComment(
+            child["detail"]["id"], evidence_uuid,
+            request.payload()["assignment"]["engineer_id"], "agent", 1,
+            "Preparation did not pass.\n"
+            "```eventra-candidate-refresh-outcome-v2\n"
+            + encode(payload) + "\n```",
+        )
+        api.add_comment(child["detail"]["identifier"], evidence)
+        return api, module, git, child, evidence_uuid
+
+    def test_v2_finish_accepts_only_stage_three_protocol_two_preparation(self):
+        from tools.multica.tests.test_candidate_refresh import prepared_payload
+
+        api, git, request = admitted_v2_execution()
+        module = importlib.import_module("tools.multica.refresh_executor")
+        module.execute_refresh(
+            api, git, "PRO-900", uid(12), uid(13),
+            contracts.refresh_action(request),
+        )
+        child = next(item for item in api.state["children"]
+                     if item["metadata"].get("eventra.phase.kind") == "refresh")
+        payload = prepared_payload(request)
+        payload["schema_version"] = 2
+        payload["child_id"] = child["detail"]["id"]
+        payload["context_receipt"]["task_id"] = child["detail"]["identifier"]
+        evidence_uuid = uid(93)
+        evidence = contracts.RefreshComment(
+            child["detail"]["id"], evidence_uuid,
+            request.payload()["assignment"]["engineer_id"], "agent", 1,
+            "Preparation only; no PR publication.\n"
+            "```eventra-candidate-refresh-prepared-v2\n"
+            + encode(payload) + "\n```",
+        )
+        api.add_comment(child["detail"]["identifier"], evidence)
+
+        result = module.finish_refresh(
+            api, git, child["detail"]["identifier"], evidence_uuid, "pass")
+
+        self.assertEqual((result.status, result.child_identifier),
+                         ("prepared", "PRO-904"))
+        self.assertEqual(child["detail"]["stage"], 3)
+        self.assertEqual(child["detail"]["status"], "done")
+        self.assertEqual(child["metadata"]["eventra.refresh.version"], "2")
+        self.assertEqual(api.state["metadata"]["eventra.workflow.next_stage"], "4")
+
+        wrong_stage = copy.deepcopy(api.state)
+        wrong_child = next(item for item in wrong_stage["children"]
+                           if item["metadata"].get("eventra.phase.kind") == "refresh")
+        wrong_child["detail"]["stage"] = 2
+        api.state = wrong_stage
+        before = len(api.writes)
+        with self.assertRaises((ValueError, RuntimeError)):
+            module.finish_refresh(
+                api, git, child["detail"]["identifier"], evidence_uuid, "pass")
+        self.assertEqual(len(api.writes), before)
+
+    def test_v1_finish_rejects_stage_three_without_writes(self):
+        api, module, git, child, evidence_uuid = self.pass_case()
+        child["detail"]["stage"] = 3
+        before = len(api.writes)
+
+        with self.assertRaises((ValueError, RuntimeError)):
+            module.finish_refresh(
+                api, git, child["detail"]["identifier"], evidence_uuid, "pass")
+
+        self.assertEqual(len(api.writes), before)
+
+    def test_v2_non_pass_outcomes_use_protocol_two_without_publication(self):
+        for outcome in ("fail", "blocked"):
+            with self.subTest(outcome=outcome):
+                api, module, git, child, evidence_uuid = self.v2_nonpass_case(outcome)
+                managed_before = api.state["pr"]["head_sha"]
+                api.writes.clear()
+
+                result = module.finish_refresh(
+                    api, git, child["detail"]["identifier"], evidence_uuid, outcome)
+
+                self.assertEqual((result.status, result.child_identifier),
+                                 (outcome, "PRO-904"))
+                self.assertEqual(child["detail"]["stage"], 3)
+                self.assertEqual(child["detail"]["status"], "done")
+                self.assertEqual(child["metadata"]["eventra.refresh.version"], "2")
+                self.assertEqual(child["metadata"]["eventra.phase.result"], outcome)
+                self.assertEqual(api.state["pr"]["head_sha"], managed_before)
+                self.assertEqual(git.verify_calls, [])
+
+    def test_v2_non_pass_recovers_every_write_boundary(self):
+        for outcome in ("fail", "blocked"):
+            for fail_at in range(1, 5):
+                for fail_after in (False, True):
+                    with self.subTest(outcome=outcome, fail_at=fail_at,
+                                      fail_after=fail_after):
+                        api, module, git, child, evidence_uuid = (
+                            self.v2_nonpass_case(outcome))
+                        api.writes.clear()
+                        api.write_index = 0
+                        api.fail_at, api.fail_after = fail_at, fail_after
+
+                        if fail_after:
+                            result = module.finish_refresh(
+                                api, git, "PRO-904", evidence_uuid, outcome)
+                        else:
+                            with self.assertRaisesRegex(RuntimeError, "before effect"):
+                                module.finish_refresh(
+                                    api, git, "PRO-904", evidence_uuid, outcome)
+                            result = module.finish_refresh(
+                                api, git, "PRO-904", evidence_uuid, outcome)
+
+                        self.assertEqual((result.status, len(api.writes)),
+                                         (outcome, 4))
+                        self.assertEqual(child["detail"]["status"], "done")
+                        self.assertEqual(git.verify_calls, [])
 
     def test_prepared_pass_does_not_publish_managed_pr(self):
         api, module, git, child, evidence_uuid = self.pass_case()

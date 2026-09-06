@@ -120,6 +120,20 @@ class RefreshDecisionTests(unittest.TestCase):
     def decision(self, request, data):
         return self.c.plan_refresh(request, self.c.RefreshSnapshot(encode(data)))
 
+    def test_refresh_and_fresh_gate_stages_are_request_bound(self):
+        v1, _ = refresh_snapshot_fixture(state="entry")
+        v2 = self.c.freeze_refresh_request(
+            pristine_gate_snapshot(), supersede_pristine_gates=True)
+
+        self.assertEqual(
+            (self.c._refresh_stage(v1), self.c._fresh_gate_stage(v1)),
+            (2, 3),
+        )
+        self.assertEqual(
+            (self.c._refresh_stage(v2), self.c._fresh_gate_stage(v2)),
+            (3, 4),
+        )
+
     def test_v2_cancellation_prefixes_are_exact(self):
         request, data, reservation = v2_reserved_fixture()
         self.assertEqual(
