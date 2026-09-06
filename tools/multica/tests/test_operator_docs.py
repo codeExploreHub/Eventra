@@ -492,8 +492,8 @@ class OperatorDocsTests(unittest.TestCase):
             "task_id must equal the refresh child identifier",
             "--verified-id",
             "push only TARGET_SHA:STAGING_REF",
-            "eventra-candidate-refresh-prepared-v1",
-            "eventra-candidate-refresh-outcome-v1",
+            "eventra-candidate-refresh-prepared-v2",
+            "eventra-candidate-refresh-outcome-v2",
             "tools.multica.workflow finish-refresh",
             "Never update the managed PR branch",
             "runtime_workspace",
@@ -528,7 +528,7 @@ class OperatorDocsTests(unittest.TestCase):
                     "EVENTRA_REFRESH_DEPLOYMENT_FILE",
                     "plan-refresh", "stage-refresh-request",
                     "execute-parent-refresh", "finish-refresh",
-                    "fresh Stage 3", "merge hold",
+                    "fresh Stage 4", "merge hold",
                     "prepared PASS is not QA",
                     "independent control-plane",
                 ):
@@ -962,9 +962,9 @@ class OperatorDocsTests(unittest.TestCase):
 
         for rendered in (readme, pilot):
             for fragment in (
-                "658 tests",
                 "real temporary Git",
                 "Stage 3",
+                "Stage 4",
                 "human merge",
                 "34",
                 "12",
@@ -972,6 +972,7 @@ class OperatorDocsTests(unittest.TestCase):
             ):
                 with self.subTest(fragment=fragment):
                     self.assertIn(fragment, rendered)
+        self.assertIn("658 tests", pilot)
         self.assertIn("every `1..N` boundary", readme)
         self.assertIn("zero errors", pilot)
         self.assertIn("push, merge PR #14, or deploy", pilot)

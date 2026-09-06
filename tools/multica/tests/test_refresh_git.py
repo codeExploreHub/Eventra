@@ -1,6 +1,7 @@
 """Exercise Git guards against real local object graphs and bare remotes."""
 
 import copy
+import hashlib
 import importlib
 import importlib.util
 import os
@@ -230,6 +231,11 @@ class GitTests(unittest.TestCase):
         source_child["evidence"]["content"] = (
             "Original Stage 1 PASS for " + self.source
         )
+        source_child["comment_manifest"][0]["content_digest"] = (
+            hashlib.sha256(
+                source_child["evidence"]["content"].encode("utf-8")
+            ).hexdigest()
+        )
         state["metadata"]["eventra.workflow.frontend_sha"] = self.source
         state["parent"]["metadata"] = copy.deepcopy(state["metadata"])
         state["pr"]["head_sha"] = self.source
@@ -364,21 +370,28 @@ class GitTests(unittest.TestCase):
                 workspace_id=uid(1),
             )
             detail["metadata"] = copy.deepcopy(metadata)
+            evidence_uuid = uid(42 + index)
+            evidence_record = {
+                "id": evidence_uuid,
+                "issue_id": detail["id"],
+                "author_id": detail["assignee_id"],
+                "author_type": "agent",
+                "type": "comment",
+                "revision": 1,
+                "created_at": "2026-09-05T03:00:00Z",
+                "content": kind + " PASS for " + self.target,
+            }
             state["children"].append(
                 {
                     "detail": detail,
                     "metadata": metadata,
                     "evidence": None,
+                    "comment_manifest": contracts.comment_manifest(
+                        [evidence_record], detail["id"]
+                    ),
                 }
             )
-            evidence_uuid = uid(42 + index)
-            gate_comments[identifier] = [{
-                "id": evidence_uuid,
-                "issue_id": detail["id"],
-                "author_id": detail["assignee_id"],
-                "author_type": "agent",
-                "content": kind + " PASS for " + self.target,
-            }]
+            gate_comments[identifier] = [evidence_record]
         state["parent"]["metadata"] = copy.deepcopy(state["metadata"])
 
         class GateRunner:
@@ -507,6 +520,19 @@ class GitTests(unittest.TestCase):
                             child["metadata"]
                         )
                         child["detail"]["revision"] += 1
+                        if key == "eventra.phase.evidence_comment":
+                            record = next(
+                                item for item in gate_comments[call[3]]
+                                if item["id"] == value
+                            )
+                            child["evidence"] = {
+                                "issue_id": record["issue_id"],
+                                "comment_uuid": record["id"],
+                                "author_id": record["author_id"],
+                                "author_type": record["author_type"],
+                                "revision": record["revision"],
+                                "content": record["content"],
+                            }
                     return {"ok": True}
                 if call[:2] == ("issue", "status"):
                     child = self._child(call[2])

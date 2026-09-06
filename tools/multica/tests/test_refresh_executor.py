@@ -2441,6 +2441,156 @@ class PublishRefreshTests(unittest.TestCase):
 
 class FullRefreshDeliveryTests(unittest.TestCase):
     @staticmethod
+    def pristine_v2_delivery():
+        api = MemoryRefreshAPI()
+        api.use_v2()
+        roles = api.state["assignment"]["roles"]
+        roles["backend_engineer"] = uid(18)
+        api.state["assignment"]["members"] = [
+            {
+                "member_id": identity,
+                "member_type": "agent",
+                "role": "leader" if role == "delivery_lead" else role,
+            }
+            for role, identity in sorted(roles.items())
+        ]
+        api.request = contracts.freeze_refresh_request(
+            contracts.RefreshSnapshot(
+                contracts.canonical_json(api.state)
+            ),
+            supersede_pristine_gates=True,
+        )
+        return api, MemoryRefreshGit(api.request, api), api.request
+
+    @staticmethod
+    def stage_exact_request_and_grant(api):
+        module = importlib.import_module("tools.multica.refresh_executor")
+        module.stage_refresh_request(api, "PRO-900", api.request)
+        api.publish_authorization()
+
+    @staticmethod
+    def finish_exact_preparation(api, git):
+        from tools.multica.tests.test_candidate_refresh import prepared_payload
+
+        module = importlib.import_module("tools.multica.refresh_executor")
+        child = next(
+            item for item in api.state["children"]
+            if item["metadata"].get("eventra.phase.kind") == "refresh"
+        )
+        payload = prepared_payload(api.request)
+        payload["schema_version"] = 2
+        payload["child_id"] = child["detail"]["id"]
+        payload["context_receipt"]["task_id"] = (
+            child["detail"]["identifier"]
+        )
+        evidence_uuid = uid(93)
+        api.add_comment(
+            child["detail"]["identifier"],
+            contracts.RefreshComment(
+                child["detail"]["id"],
+                evidence_uuid,
+                api.request.payload()["assignment"]["engineer_id"],
+                "agent",
+                1,
+                "Preparation only; no PR publication.\n"
+                "```eventra-candidate-refresh-prepared-v2\n"
+                + encode(payload)
+                + "\n```",
+            ),
+        )
+        module.finish_refresh(
+            api,
+            git,
+            child["detail"]["identifier"],
+            evidence_uuid,
+            "pass",
+        )
+        return child
+
+    @staticmethod
+    def create_fresh_stage_four_gates(api):
+        state = api.state
+        stage = int(state["metadata"]["eventra.workflow.next_stage"])
+        attempt = state["metadata"]["eventra.workflow.attempt"]
+        candidate_sha = state["metadata"]["eventra.workflow.frontend_sha"]
+        action = (
+            f"2:PRO-900:create_gate_stage:{attempt}:frontend:"
+            f"{candidate_sha}:-:next-stage:{stage}"
+        )
+        state["metadata"].update({
+            "eventra.workflow.next_stage": str(stage + 1),
+            "eventra.workflow.last_action": action,
+        })
+        gate_ids = []
+        for index, (kind, role) in enumerate((
+            ("review", "independent_reviewer"),
+            ("qa", "integration_qa"),
+        )):
+            child_id = uid(140 + index)
+            evidence_uuid = uid(240 + index)
+            identifier = f"PRO-{940 + index}"
+            evidence_content = f"fresh Stage 4 {kind} PASS"
+            record = comment_record(
+                240 + index,
+                evidence_content,
+                author=1,
+                issue=child_id,
+            )
+            record["author_id"] = state["assignment"]["roles"][role]
+            metadata = {
+                "eventra.workflow.version": "2",
+                "eventra.phase.kind": kind,
+                "eventra.phase.attempt": attempt,
+                "eventra.phase.result": "pass",
+                "eventra.phase.sha.frontend": candidate_sha,
+                "eventra.phase.creation_action": action,
+                "eventra.phase.target": "repository:frontend",
+                "eventra.phase.role": role,
+                "eventra.phase.evidence_comment": evidence_uuid,
+                "eventra.phase.failure_repositories": "[]",
+            }
+            detail = issue_detail(
+                id=child_id,
+                identifier=identifier,
+                parent_issue_id=state["parent"]["id"],
+                stage=stage,
+                project_id=state["assignment"]["projects"]["frontend"],
+                assignee_id=state["assignment"]["roles"][role],
+                status="done",
+                workspace_id=state["parent"]["workspace_id"],
+            )
+            detail["metadata"] = copy.deepcopy(metadata)
+            state["children"].append({
+                "detail": detail,
+                "metadata": metadata,
+                "evidence": {
+                    "issue_id": child_id,
+                    "comment_uuid": evidence_uuid,
+                    "author_id": state["assignment"]["roles"][role],
+                    "author_type": "agent",
+                    "revision": 1,
+                    "content": evidence_content,
+                },
+                "comment_manifest": contracts.comment_manifest(
+                    [record], child_id
+                ),
+            })
+            gate_ids.append(child_id)
+        state["parent"]["metadata"] = copy.deepcopy(state["metadata"])
+        return tuple(gate_ids)
+
+    @staticmethod
+    def plan_parent(api):
+        from tools.multica import workflow
+        from tools.multica.tests.test_workflow import RefreshWorkflowTests
+
+        fixture = RefreshWorkflowTests(
+            "test_v2_only_stage_four_gates_count_for_pass_or_repair"
+        )
+        fixture.setUp()
+        return workflow.decide_parent_action(fixture.parent(api.state))
+
+    @staticmethod
     def _retry_injected(api, call):
         try:
             return call()
@@ -2451,6 +2601,254 @@ class FullRefreshDeliveryTests(unittest.TestCase):
             if api.fail_at is None or api.write_index < api.fail_at:
                 raise
             return call()
+
+    def _run_v2_delivery(self, *, fail_at=None, fail_after=False):
+        module = importlib.import_module("tools.multica.refresh_executor")
+        api, git, request = self.pristine_v2_delivery()
+        api.fail_at, api.fail_after = fail_at, fail_after
+        self._retry_injected(
+            api,
+            lambda: module.stage_refresh_request(api, "PRO-900", request),
+        )
+        api.publish_authorization()
+        self._retry_injected(api, lambda: module.execute_refresh(
+            api,
+            git,
+            "PRO-900",
+            uid(12),
+            uid(13),
+            contracts.refresh_action(request),
+        ))
+
+        from tools.multica.tests.test_candidate_refresh import prepared_payload
+
+        child = next(
+            item for item in api.state["children"]
+            if item["metadata"].get("eventra.phase.kind") == "refresh"
+        )
+        payload = prepared_payload(request)
+        payload["schema_version"] = 2
+        payload["child_id"] = child["detail"]["id"]
+        payload["context_receipt"]["task_id"] = child["detail"]["identifier"]
+        evidence_uuid = uid(93)
+        api.add_comment(
+            child["detail"]["identifier"],
+            contracts.RefreshComment(
+                child["detail"]["id"],
+                evidence_uuid,
+                request.payload()["assignment"]["engineer_id"],
+                "agent",
+                1,
+                "Preparation only; no PR publication.\n"
+                "```eventra-candidate-refresh-prepared-v2\n"
+                + encode(payload)
+                + "\n```",
+            ),
+        )
+        self._retry_injected(api, lambda: module.finish_refresh(
+            api,
+            git,
+            child["detail"]["identifier"],
+            evidence_uuid,
+            "pass",
+        ))
+        self._retry_injected(api, lambda: module.execute_refresh(
+            api,
+            git,
+            "PRO-900",
+            uid(12),
+            uid(13),
+            contracts.refresh_action(request),
+        ))
+        gate_ids = self.create_fresh_stage_four_gates(api)
+        return api, git, request, gate_ids
+
+    def test_v2_full_delivery_preserves_history_and_stops_at_merge_hold(self):
+        module = importlib.import_module("tools.multica.refresh_executor")
+        api, git, request = self.pristine_v2_delivery()
+        source_before = copy.deepcopy(api.state["children"][0])
+
+        self.stage_exact_request_and_grant(api)
+        module.execute_refresh(
+            api,
+            git,
+            "PRO-900",
+            uid(12),
+            uid(13),
+            contracts.refresh_action(request),
+        )
+        self.finish_exact_preparation(api, git)
+        module.execute_refresh(
+            api,
+            git,
+            "PRO-900",
+            uid(12),
+            uid(13),
+            contracts.refresh_action(request),
+        )
+        gate_ids = self.create_fresh_stage_four_gates(api)
+
+        decision = self.plan_parent(api)
+        feature = contracts.refresh_metadata(api.state["metadata"])
+        old_gates = [
+            item for item in api.state["children"]
+            if item["detail"]["id"]
+            in {gate["id"] for gate in request.payload()["supersession"]["gates"]}
+        ]
+        refresh_children = [
+            item for item in api.state["children"]
+            if item["metadata"].get("eventra.phase.kind") == "refresh"
+        ]
+        engineer_runs = [
+            run for run in api.state["runs"]
+            if run["issue_id"] == refresh_children[0]["detail"]["id"]
+        ]
+
+        self.assertEqual((decision.kind, decision.reason), (
+            "noop", "human merge approval required"
+        ))
+        self.assertEqual(api.state["children"][0], source_before)
+        self.assertEqual([item["detail"]["status"] for item in old_gates], [
+            "cancelled", "cancelled"
+        ])
+        self.assertEqual(len(refresh_children), 1)
+        self.assertEqual(len(engineer_runs), 1)
+        self.assertEqual(gate_ids, (uid(140), uid(141)))
+        self.assertIn("supersession", feature)
+        self.assertNotIn("reservation", feature)
+        self.assertEqual(api.cancel_effects, 2)
+        self.assertEqual(git.managed_push_effects, 1)
+
+    def test_every_recorded_v2_write_boundary_converges_exactly(self):
+        baseline_api, baseline_git, _, baseline_gate_ids = (
+            self._run_v2_delivery()
+        )
+        expected_state = copy.deepcopy(baseline_api.state)
+        expected_writes = copy.deepcopy(baseline_api.writes)
+        expected_receipt = baseline_api.state["metadata"][
+            "eventra.refresh.supersession"
+        ]
+        total_writes = baseline_api.write_index
+
+        self.assertGreater(total_writes, 0)
+        for fail_at in range(1, total_writes + 1):
+            for fail_after in (False, True):
+                with self.subTest(fail_at=fail_at, fail_after=fail_after):
+                    api, git, _, gate_ids = self._run_v2_delivery(
+                        fail_at=fail_at,
+                        fail_after=fail_after,
+                    )
+                    refresh_children = [
+                        item for item in api.state["children"]
+                        if item["metadata"].get("eventra.phase.kind")
+                        == "refresh"
+                    ]
+                    engineer_runs = [
+                        run for run in api.state["runs"]
+                        if run["issue_id"]
+                        == refresh_children[0]["detail"]["id"]
+                    ]
+                    self.assertEqual(api.state, expected_state)
+                    self.assertEqual(api.writes, expected_writes)
+                    self.assertEqual(gate_ids, baseline_gate_ids)
+                    self.assertEqual(
+                        api.state["metadata"][
+                            "eventra.refresh.supersession"
+                        ],
+                        expected_receipt,
+                    )
+                    self.assertEqual(api.cancel_effects, 2)
+                    self.assertEqual(len(refresh_children), 1)
+                    self.assertEqual(len(engineer_runs), 1)
+                    self.assertEqual(git.managed_push_effects, 1)
+
+    def test_v2_drift_and_competing_executor_fail_closed(self):
+        module = importlib.import_module("tools.multica.refresh_executor")
+
+        for label, mutate in {
+            "changed current base": lambda api: api.state[
+                "prerequisite"
+            ].__setitem__("base_sha", "a" * 40),
+            "changed prerequisite ancestry": lambda api: api.state[
+                "prerequisite"
+            ].__setitem__("ancestor_sha", "a" * 40),
+            "changed managed PR head": lambda api: api.state["pr"].__setitem__(
+                "head_sha", "a" * 40
+            ),
+        }.items():
+            with self.subTest(label=label):
+                api, git, request = self.pristine_v2_delivery()
+                self.stage_exact_request_and_grant(api)
+                mutate(api)
+                before = copy.deepcopy(api.writes)
+
+                with self.assertRaises((RuntimeError, ValueError)):
+                    module.execute_refresh(
+                        api,
+                        git,
+                        "PRO-900",
+                        uid(12),
+                        uid(13),
+                        contracts.refresh_action(request),
+                    )
+
+                self.assertEqual(api.writes, before)
+                self.assertEqual(git.managed_push_effects, 0)
+
+        api, git, request = self.pristine_v2_delivery()
+        self.stage_exact_request_and_grant(api)
+        api.fail_at = api.write_index + 2
+        api.fail_after = False
+        with self.assertRaises(RuntimeError):
+            module.execute_refresh(
+                api,
+                git,
+                "PRO-900",
+                uid(12),
+                uid(13),
+                contracts.refresh_action(request),
+            )
+        before = copy.deepcopy(api.writes)
+        with self.assertRaises((RuntimeError, ValueError)):
+            module.execute_refresh(
+                api,
+                git,
+                "PRO-900",
+                uid(12),
+                uid(13),
+                contracts.refresh_action(request) + ":different",
+            )
+        self.assertEqual(api.writes, before)
+
+        api.fail_at = None
+        module.execute_refresh(
+            api,
+            git,
+            "PRO-900",
+            uid(12),
+            uid(13),
+            contracts.refresh_action(request),
+        )
+        self.finish_exact_preparation(api, git)
+        old_gate = next(
+            item for item in api.state["children"]
+            if item["detail"]["id"]
+            == request.payload()["supersession"]["gates"][0]["id"]
+        )
+        old_gate["detail"]["status"] = "backlog"
+        old_gate["detail"]["status_category"] = "backlog"
+        before = copy.deepcopy(api.writes)
+        with self.assertRaises((RuntimeError, ValueError)):
+            module.execute_refresh(
+                api,
+                git,
+                "PRO-900",
+                uid(12),
+                uid(13),
+                contracts.refresh_action(request),
+            )
+        self.assertEqual(api.writes, before)
+        self.assertEqual(git.managed_push_effects, 0)
 
     def _run_delivery(self, *, fail_at=None, fail_after=False):
         from tools.multica.tests.test_candidate_refresh import prepared_payload
