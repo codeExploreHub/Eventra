@@ -206,6 +206,34 @@ merged control SHA, parent identifier, protocol version 2, request digest, actio
 key, and the two old gate UUIDs. A temporary read-only preflight record cannot be
 used for mutation.
 
+The outer deployment record remains schema version 1. Its `mutation_contract`
+accepts either the existing exact v1 object or the following exact v2 object; no
+partial or extra fields are accepted:
+
+```json
+{
+  "contract_version": 2,
+  "refresh_protocol": 2,
+  "parent_identifier": "PRO-122",
+  "request_digest": "64 lowercase hex characters",
+  "action_key": "exact refresh action",
+  "superseded_gate_ids": ["Reviewer UUID", "Integration QA UUID"],
+  "comment_create_parent_revision_delta": 1,
+  "metadata_change_parent_revision_delta": 1,
+  "metadata_same_value_parent_revision_delta": 0,
+  "status_no_start_preserves_position": true,
+  "status_category_tracks_status": true,
+  "start_creates_single_run": true
+}
+```
+
+The UUID array uses the same role order as the request. Read-only planning accepts
+`mutation_contract=null`; every mutating command first proves that a v2 request
+matches all five request-specific contract fields. The request/grant comment UUIDs
+are not known when the contract is installed and are instead bound by the existing
+staging and execution protocol. The current v1 mutation contract remains
+byte-for-byte valid and cannot authorize a v2 request.
+
 Live execution can begin only after PR #17 and the supersession implementation PR
 are merged. The prerequisite used for the live request must be the merged
 supersession implementation PR, or a later explicitly approved cumulative control
