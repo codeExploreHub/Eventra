@@ -16,6 +16,7 @@ import {
   Lock
 } from "lucide-react";
 import { createProject } from "@/lib/api";
+import { canFallbackToLocalStorage } from "@/lib/submission-fallback.mjs";
 
 function getAuthSnapshot() {
   try {
@@ -97,8 +98,7 @@ export default function SubmitProjectPage() {
     } catch (err) {
       // Only fall back to localStorage for network/server errors (status >= 500 or no response)
       // Do not silently save on 4xx validation errors from the server
-      const isNetworkError = !err?.status || err?.status >= 500;
-      if (isNetworkError && typeof window !== "undefined") {
+      if (canFallbackToLocalStorage(err) && typeof window !== "undefined") {
         try {
           const storedProjects = JSON.parse(localStorage.getItem("eventra_custom_projects") || "[]");
           const newProj = {
