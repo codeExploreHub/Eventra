@@ -32,6 +32,15 @@ From the frontend worktree run `npm run test:local-contract`,
 `scripts/smoke-local.sh`. Inspect a reported port collision before taking any
 action; never terminate an unknown process.
 
+Post-merge Smoke is classification-aware. Frontend-only checks the exact
+frontend SHA with focused regressions, the local contract, and port 3000; it
+does not require a backend handoff. Backend-only checks the exact backend SHA
+with the backend tests and health/API Smoke on port 8080; it does not require
+the frontend. Cross-stack checks both exact SHAs, starts the backend first, and
+runs the full frontend-to-backend Smoke. Integration QA performs every route in
+owned external detached temporary worktrees and never changes a
+Multica-managed task worktree branch.
+
 ## Environment and secret policy
 
 Committed development defaults are safe and available in every worktree. The
@@ -73,12 +82,13 @@ second merge fails after the first succeeds, stop immediately: do not deploy,
 auto-revert, or continue. Mark the parent Issue blocked and escalate the
 partial merge with the exact merge evidence.
 
-For cross-stack QA, this Project supplies only the frontend exact-SHA worktree.
+For cross-stack QA, this Project supplies only the frontend exact-SHA resource.
 The verified backend exact SHA must already be running on port 8080 from an
 active backend child in **Eventra Backend Local Development** on the same
 daemon. Integration QA records the backend service SHA and readiness handoff
-before testing the frontend. Lack of a verifiable matching service blocks the
-gate.
+before testing the frontend from an external detached temporary worktree. Lack
+of a verifiable matching service blocks the gate. This requirement applies only
+to cross-stack work, never to frontend-only Smoke.
 
 ## Automated workflow state
 

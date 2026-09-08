@@ -695,6 +695,11 @@ class ProvisionerTests(unittest.TestCase):
         self.assertIn("exactly one repository SHA", rendered)
         self.assertIn("`--kind integration_qa`", rendered)
         self.assertIn("full candidate SHA set", rendered)
+        self.assertIn("Frontend-only Smoke", rendered)
+        self.assertIn("Backend-only Smoke", rendered)
+        self.assertIn("Cross-stack Smoke", rendered)
+        self.assertIn("git worktree add --detach TEMP_DIR FULL_SHA", rendered)
+        self.assertNotIn("git switch --detach FULL_SHA", rendered)
 
     def _dry_run_cli_output(self, runner):
         stdout = io.StringIO()

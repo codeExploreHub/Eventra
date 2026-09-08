@@ -133,6 +133,8 @@ class OperatorDocsTests(unittest.TestCase):
             ("qa", "fail", False, True, ("backend",), True),
             ("integration_qa", "pass", True, True, (), False),
             ("integration_qa", "fail", True, True, ("frontend",), True),
+            ("smoke", "pass", True, False, (), False),
+            ("smoke", "pass", False, True, (), False),
             ("smoke", "pass", True, True, (), False),
         }
         self.assertEqual(identities, expected)
@@ -535,7 +537,7 @@ class OperatorDocsTests(unittest.TestCase):
             self.assertIn("exact merged candidate SHA map", rendered)
             self.assertIn("single serialized Delivery Lead", rendered)
             self.assertIn("not generic CAS or transaction safety", rendered)
-            self.assertIn("starts Integration QA", rendered)
+            self.assertIn("before starting Integration QA", rendered)
 
         self.assertIn("Do not create smoke children manually", lead)
 
@@ -624,22 +626,44 @@ class OperatorDocsTests(unittest.TestCase):
             with self.subTest(role="lead", fragment=fragment):
                 self.assertIn(fragment, " ".join(lead.split()))
 
-        for role, rendered in (("reviewer", reviewer), ("qa", qa)):
-            normalized = " ".join(rendered.split())
-            for fragment in (
-                "git switch --detach FULL_SHA",
-                "FETCH_HEAD",
-                "runtime-managed `AGENTS.md`, `.agent_context/`, and `.multica/`",
-                "authoritative control repository",
-            ):
-                with self.subTest(role=role, fragment=fragment):
-                    self.assertIn(fragment, normalized)
+        reviewer_normalized = " ".join(reviewer.split())
+        for fragment in (
+            "git switch --detach FULL_SHA",
+            "FETCH_HEAD",
+            "runtime-managed `AGENTS.md`, `.agent_context/`, and `.multica/`",
+            "authoritative control repository",
+        ):
+            with self.subTest(role="reviewer", fragment=fragment):
+                self.assertIn(fragment, reviewer_normalized)
+
+        qa_normalized = " ".join(qa.split())
+        for fragment in (
+            "git worktree add --detach TEMP_DIR FULL_SHA",
+            "Never switch, detach, reset, clean, or stash the Multica-managed task worktree",
+            "Frontend-only Smoke",
+            "Backend-only Smoke",
+            "Cross-stack Smoke",
+            "port `3000`",
+            "port `8080`",
+            "authoritative control repository",
+        ):
+            with self.subTest(role="qa", fragment=fragment):
+                self.assertIn(fragment, qa_normalized)
+        self.assertNotIn("git switch --detach FULL_SHA", qa_normalized)
 
         for role, rendered in (("squad", squad), ("runbook", readme)):
             normalized = " ".join(rendered.split())
             with self.subTest(role=role):
                 self.assertIn("tools.multica.workflow finish-parent", normalized)
                 self.assertIn("directly to `done`", normalized)
+
+        for role, rendered in (("lead", lead), ("runbook", readme)):
+            normalized = " ".join(rendered.split())
+            with self.subTest(role=role):
+                self.assertIn(
+                    "commits the parent action and clears the reservation before starting Integration QA",
+                    normalized,
+                )
 
     def test_runbook_documents_watcher_and_one_time_pro_35_recovery(self):
         readme = Path("tools/multica/README.md").read_text()
