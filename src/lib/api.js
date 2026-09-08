@@ -41,7 +41,9 @@ async function fetchAPI(endpoint, options = {}) {
       localStorage.removeItem("eventra_token");
       localStorage.removeItem("eventra_user");
       window.location.href = "/login";
-      throw new Error("Session expired. Please log in again.");
+      throw Object.assign(new Error("Session expired. Please log in again."), {
+        status: res.status,
+      });
     }
 
     if (!res.ok) {
@@ -50,7 +52,9 @@ async function fetchAPI(endpoint, options = {}) {
         const errorJson = await res.json();
         errText = errorJson.message || errorJson.error || errText;
       } catch (e) {}
-      throw new Error(`API Error ${res.status}: ${errText}`);
+      throw Object.assign(new Error(`API Error ${res.status}: ${errText}`), {
+        status: res.status,
+      });
     }
 
     return await res.json();
