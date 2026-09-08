@@ -8316,9 +8316,10 @@ def finish_phase(
                 detail,
                 value,
             )
-        except (RuntimeError, TypeError, ValueError):
+        except (RuntimeError, TypeError, ValueError) as error:
             raise RuntimeError(
-                f"phase authority changed {boundary} metadata mutation"
+                f"phase authority read failed {boundary} metadata mutation: "
+                f"{error}"
             ) from None
         if (
             current_parent_authority != authority_envelope
@@ -8331,9 +8332,17 @@ def finish_phase(
         require_stable_implementation_pr(f"{boundary} metadata mutation")
 
     metadata_mutations = 0
-    if controlled_before != wanted:
-        for key, item in wanted.items():
-            require_stable_write_authority("before")
+    pending_metadata = [
+        (key, item)
+        for key, item in wanted.items()
+        if controlled_before.get(key) != item
+    ]
+    pending_metadata.sort(
+        key=lambda pair: pair[0] == "eventra.phase.result"
+    )
+    if pending_metadata:
+        require_stable_write_authority("before")
+        for key, item in pending_metadata:
             runner.run(
                 [
                     "issue",
@@ -8351,7 +8360,7 @@ def finish_phase(
                 ]
             )
             metadata_mutations += 1
-            require_stable_write_authority("after")
+        require_stable_write_authority("after")
     expected_authority = _controlled_phase_authority(before)
     expected_authority.update(wanted)
     observed_authorities = tuple(
