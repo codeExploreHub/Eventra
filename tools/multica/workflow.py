@@ -20,6 +20,7 @@ from typing import Literal, Sequence
 from .blueprint import build_multi_repo_blueprint
 from . import candidate_refresh as refresh
 from . import refresh_executor
+from .candidate_purity import validate_candidate
 from .refresh_git import RefreshGit
 from .contracts import (
     parse_agent_list,
@@ -8585,6 +8586,13 @@ def build_workflow_parser() -> argparse.ArgumentParser:
         choices=("frontend", "backend"),
         default=[],
     )
+    validate = subparsers.add_parser("validate-candidate")
+    validate.add_argument(
+        "--repository", required=True, choices=("frontend", "backend")
+    )
+    validate.add_argument("--repository-root", required=True)
+    validate.add_argument("--base-sha", required=True)
+    validate.add_argument("--candidate-sha", required=True)
     plan_parent = subparsers.add_parser("plan-parent")
     plan_parent.add_argument("parent")
     plan_refresh = subparsers.add_parser("plan-refresh")
@@ -8799,6 +8807,21 @@ def print_refresh_execution_result(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_workflow_parser().parse_args(argv)
+    if args.command == "validate-candidate":
+        try:
+            receipt = validate_candidate(
+                args.repository_root,
+                args.repository,
+                args.base_sha,
+                args.candidate_sha,
+            )
+        except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+            print(_canonical_json({"decision": "blocked", "reason": str(exc)}))
+            return 2
+        print(
+            _canonical_json(receipt)
+        )
+        return 0
     runner = MulticaRunner()
     if args.command == "finish-phase":
         github = GitHubRunner()
