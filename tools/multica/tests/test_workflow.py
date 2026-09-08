@@ -7384,6 +7384,7 @@ class FakeRepairRunner:
         self.authority_drift_after_status = None
         self.authority_drift_after_parent_metadata_key = None
         self.authority_drift_after_parent_delete_key = None
+        self.hard_interrupt_after_parent_delete_key = None
         self.authority_drift_after_child_metadata_write = None
         self.corrupt_created_title = False
         self.suppress_status_run = False
@@ -7707,6 +7708,10 @@ class FakeRepairRunner:
             if key == self.authority_drift_after_parent_delete_key:
                 self.authority_drift_after_parent_delete_key = None
                 self._apply_authority_drift("members")
+            if key == self.hard_interrupt_after_parent_delete_key:
+                raise KeyboardInterrupt(
+                    "injected hard interruption after parent metadata delete"
+                )
             self._maybe_lose_ack(f"delete:{identifier}:{key}")
             return {"ok": True}
         if call[:2] == ("issue", "status"):
@@ -8105,6 +8110,47 @@ class SmokeExecutionTests(unittest.TestCase):
             workflow_module.SMOKE_RESERVATION_KEY,
             runner.metadata["PRO-65"],
         )
+        self.assertEqual(
+            len([item for item in runner.children if item["stage"] == 3]),
+            1,
+        )
+
+    def test_replay_starts_committed_backlog_child_after_reservation_clear_crash(self):
+        runner, github, decision = self._planned()
+        runner.hard_interrupt_after_parent_delete_key = (
+            workflow_module.SMOKE_RESERVATION_KEY
+        )
+
+        with self.assertRaisesRegex(
+            KeyboardInterrupt,
+            "after parent metadata delete",
+        ):
+            execute_parent_smoke(
+                runner,
+                github,
+                "PRO-65",
+                expected_action_key=decision.action_key,
+            )
+
+        child = next(item for item in runner.children if item["stage"] == 3)
+        self.assertEqual(child["status"], "backlog")
+        self.assertEqual(runner.runs[child["identifier"]], [])
+        self.assertNotIn(
+            workflow_module.SMOKE_RESERVATION_KEY,
+            runner.metadata["PRO-65"],
+        )
+        runner.hard_interrupt_after_parent_delete_key = None
+
+        replay = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(replay.next_action, "smoke", replay.reason)
+        self.assertEqual(child["status"], "todo")
+        self.assertEqual(len(runner.runs[child["identifier"]]), 1)
         self.assertEqual(
             len([item for item in runner.children if item["stage"] == 3]),
             1,

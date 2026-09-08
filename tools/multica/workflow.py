@@ -5565,7 +5565,7 @@ def _start_committed_smoke_child(
     runner: MulticaRunner,
     github: GitHubRunner,
     parent_key: str,
-    reservation: dict[str, object],
+    action_key: str,
     effects: list[int],
 ) -> SmokeExecutionResult:
     """Start a smoke child only after its parent assignment is committed."""
@@ -5575,7 +5575,7 @@ def _start_committed_smoke_child(
         item for item in snapshot.children if item.stage == snapshot.next_stage - 1
     )
     if (
-        snapshot.last_action != reservation["action_key"]
+        snapshot.last_action != action_key
         or _smoke_assignment_problem(snapshot, current) is not None
     ):
         raise RuntimeError("smoke executor convergence verification failed")
@@ -5630,7 +5630,7 @@ def _start_committed_smoke_child(
             parent_key,
             "smoke",
             "exact merged smoke child was committed and promoted",
-            str(reservation["action_key"]),
+            action_key,
             effects[0],
             child_key,
         )
@@ -5646,7 +5646,7 @@ def _start_committed_smoke_child(
         parent_key,
         "noop",
         "exact merged smoke action is already committed",
-        str(reservation["action_key"]),
+        action_key,
         effects[0],
         child_key,
     )
@@ -5752,7 +5752,7 @@ def _reconcile_committed_smoke_reservation(
             runner,
             github,
             parent_key,
-            reservation,
+            str(reservation["action_key"]),
             effects,
         )
     return SmokeExecutionResult(
@@ -5871,7 +5871,7 @@ def _resume_smoke_reservation(
         runner,
         github,
         parent_key,
-        reservation,
+        str(reservation["action_key"]),
         effects,
     )
 
@@ -5933,13 +5933,12 @@ def execute_parent_smoke(
             )
             if _smoke_assignment_problem(snapshot, current) is not None:
                 raise RuntimeError("recorded smoke assignment is conflicting")
-            return SmokeExecutionResult(
+            return _start_committed_smoke_child(
+                runner,
+                github,
                 parent_key,
-                "noop",
-                "exact smoke action is already committed",
                 expected_action_key,
-                0,
-                current[0].issue_key,
+                effects,
             )
         decision = decide_parent_action(snapshot)
         if (
