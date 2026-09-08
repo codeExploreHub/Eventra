@@ -1084,7 +1084,7 @@ class PhaseCompletionTests(unittest.TestCase):
         self.assertEqual(result.status, "done")
         self.assertEqual(result.kind, "implementation")
         self.assertEqual(result.result, "pass")
-        self.assertEqual(result.mutation_count, 9)
+        self.assertEqual(result.mutation_count, 3)
         status_index = runner.calls.index(
             (
                 "issue", "status", "PRO-36", "done", "--no-start", "--output", "json"
@@ -1098,6 +1098,72 @@ class PhaseCompletionTests(unittest.TestCase):
         self.assertEqual(runner._post_write_metadata_reads, 2)
         self.assertEqual(runner._post_done_metadata_reads, 2)
         self.assertEqual(runner._post_done_detail_reads, 2)
+
+    def test_finish_phase_writes_only_differences_and_result_last(self):
+        runner = FakeWorkflowRunner()
+
+        result = finish_phase(runner, "PRO-36", implementation_completion())
+
+        metadata_sets = [
+            call
+            for call in runner.calls
+            if call[:3] == ("issue", "metadata", "set")
+        ]
+        self.assertEqual(
+            [call[5] for call in metadata_sets],
+            ["eventra.phase.evidence_comment", "eventra.phase.result"],
+        )
+        self.assertEqual(result.mutation_count, 3)
+
+    def test_finish_phase_retries_an_exact_batch_after_authority_read_failure(self):
+        class OneTransientAuthorityFailure(FakeWorkflowRunner):
+            def __init__(self):
+                super().__init__()
+                self.failed_once = False
+
+            def run(self, args, *, stdin_json=None):
+                call = tuple(args)
+                if (
+                    not self.failed_once
+                    and call == ("issue", "get", PARENT_ID, "--output", "json")
+                    and self.metadata.get("eventra.phase.result") == "pass"
+                    and self.metadata.get("eventra.phase.evidence_comment")
+                    == COMMENT_ID
+                ):
+                    self.failed_once = True
+                    raise RuntimeError("Multica command failed with exit 2")
+                return super().run(args, stdin_json=stdin_json)
+
+        runner = OneTransientAuthorityFailure()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "phase authority read failed after metadata mutation: "
+            "Multica command failed with exit 2",
+        ):
+            finish_phase(runner, "PRO-36", implementation_completion())
+
+        self.assertEqual(runner.issue["status"], "in_review")
+        self.assertEqual(
+            {
+                key: item
+                for key, item in runner.metadata.items()
+                if key in workflow_module.CONTROLLED_PHASE_KEYS
+            },
+            build_phase_metadata(implementation_completion()),
+        )
+        retry_start = len(runner.calls)
+
+        result = finish_phase(runner, "PRO-36", implementation_completion())
+
+        self.assertEqual(result.status, "done")
+        self.assertEqual(result.mutation_count, 1)
+        self.assertFalse(
+            any(
+                call[:3] == ("issue", "metadata", "set")
+                for call in runner.calls[retry_start:]
+            )
+        )
 
     def test_finish_phase_accepts_live_backend_seed_and_replacement(self):
         runner = FakeWorkflowRunner()
@@ -1159,7 +1225,7 @@ class PhaseCompletionTests(unittest.TestCase):
             result = finish_phase(runner, "PRO-36", completion)
 
         self.assertEqual(result.status, "done")
-        self.assertEqual(result.mutation_count, 9)
+        self.assertEqual(result.mutation_count, 6)
         self.assertEqual(
             runner.metadata["eventra.phase.sha.backend"],
             replacement_sha,
@@ -1287,8 +1353,8 @@ class PhaseCompletionTests(unittest.TestCase):
                 else:
                     self.assertEqual(len(status_calls), 1)
 
-    def test_finish_phase_rechecks_parent_authority_after_every_metadata_write(self):
-        for boundary in range(1, 9):
+    def test_finish_phase_rechecks_parent_authority_after_metadata_batch(self):
+        for boundary in range(1, 3):
             with self.subTest(boundary=boundary):
                 runner = FakeWorkflowRunner()
                 runner.after_metadata_set_number = boundary
@@ -1305,7 +1371,7 @@ class PhaseCompletionTests(unittest.TestCase):
                     for call in runner.calls
                     if call[:3] == ("issue", "metadata", "set")
                 )
-                self.assertEqual(len(metadata_sets), boundary)
+                self.assertEqual(len(metadata_sets), 2)
                 self.assertFalse(
                     any(call[:2] == ("issue", "status") for call in runner.calls)
                 )
@@ -1368,7 +1434,7 @@ class PhaseCompletionTests(unittest.TestCase):
                     for call in runner.calls
                     if call[:3] == ("issue", "metadata", "set")
                 )
-                self.assertEqual(len(metadata_sets), 1)
+                self.assertEqual(len(metadata_sets), 2)
                 self.assertFalse(
                     any(call[:2] == ("issue", "status") for call in runner.calls)
                 )
@@ -2490,7 +2556,7 @@ class PhaseCompletionTests(unittest.TestCase):
             print_phase_result(result)
         self.assertEqual(
             output.getvalue(),
-            "issue=PRO-36 status=done kind=implementation result=pass mutations=9\n",
+            "issue=PRO-36 status=done kind=implementation result=pass mutations=3\n",
         )
         self.assertNotIn(FRONTEND_SHA, output.getvalue())
         self.assertNotIn(FRONTEND_PR, output.getvalue())
@@ -5146,7 +5212,7 @@ class ParentDecisionTests(unittest.TestCase):
                         runner.mutation_count,
                         frozenset(call[2] for call in github.calls),
                     ),
-                    ("done", 9, frozenset((FRONTEND_PR, backend_pr))),
+                    ("done", 4, frozenset((FRONTEND_PR, backend_pr))),
                 )
 
     def test_source_equal_repair_completion_blocks_unaffected_head_drift(self):
