@@ -480,6 +480,21 @@ class OperatorDocsTests(unittest.TestCase):
                 self.assertIn("done means phase execution finished", rendered)
                 self.assertIn("pass|fail|blocked", rendered)
 
+    def test_business_candidate_publication_requires_independent_purity_receipt(self):
+        instructions = Path("tools/multica/instructions")
+        lead = " ".join((instructions / "delivery_lead.md").read_text().split())
+        for name in ("frontend_engineer.md", "backend_engineer.md"):
+            rendered = " ".join((instructions / name).read_text().split())
+            with self.subTest(role=name):
+                self.assertIn("tools.multica.workflow validate-candidate", rendered)
+                self.assertIn("assigned base SHA", rendered)
+                self.assertIn("receipt_digest", rendered)
+                self.assertIn("FULL_SHA:refs/heads/", rendered)
+                self.assertIn("never the runtime HEAD", rendered)
+        self.assertIn("independently rerun `validate-candidate`", lead)
+        self.assertIn("receipt_digest", lead)
+        self.assertIn("refuse publication authorization", lead.lower())
+
     def test_frontend_engineer_documents_candidate_refresh_as_a_separate_flow(self):
         raw = Path("tools/multica/instructions/frontend_engineer.md").read_text()
         rendered = " ".join(raw.split())

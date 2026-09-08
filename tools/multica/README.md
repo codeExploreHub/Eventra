@@ -13,6 +13,21 @@ CLI. Eventra remains on this operational adapter while
 `eventra_manifest(workspace)` supplies an immutable generic compatibility
 fixture; live migration waits for compatibility pilots and separate approval.
 
+Business candidate publication has a local fail-closed purity gate. Both
+Engineer roles and Delivery Lead independently run the same helper against the
+original assigned base and exact candidate SHA before any push authorization:
+
+```bash
+python3 -B -m tools.multica.workflow validate-candidate --repository backend --repository-root /absolute/path/to/repository --base-sha FULL_BASE_SHA --candidate-sha FULL_CANDIDATE_SHA
+```
+
+The canonical JSON receipt binds repository origin, base, candidate, complete
+changed path set, and `receipt_digest`. The command rejects a mismatched origin,
+non-descendants, empty diffs,
+and runtime artifacts including root `.worktrees/`, `.multica/`,
+`.agent_context/`, and `AGENTS.md`. Publication uses only the validated SHA via
+an exact `FULL_SHA:refs/heads/MANAGED_BRANCH` refspec, never a runtime HEAD.
+
 ## Inputs and safe execution
 
 The provisioner requires a Multica `runtime_id` and `daemon_id`:

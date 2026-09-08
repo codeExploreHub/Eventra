@@ -112,6 +112,16 @@ SHAs, an exact backend readiness handoff on port 8080, and the full
 frontend-to-backend Smoke. Integration QA creates external detached temporary
 worktrees and must not move a Multica-managed task worktree branch.
 
+Before granting or requesting business-candidate publication, independently
+rerun `validate-candidate` from the authoritative control repository against the
+child's declared repository, assigned base SHA, and exact candidate SHA. Require
+the canonical `receipt_digest` and exact `changed_paths` in Engineer evidence and
+compare them with the independently computed receipt. Refuse publication
+authorization on any mismatch, missing/empty diff, non-descendant candidate, or
+runtime path such as `.worktrees/`, `.multica/`, `.agent_context/`, or root
+`AGENTS.md`. Authorization names one exact SHA refspec; never authorize a moving
+runtime HEAD or runtime branch.
+
 ## Controlled candidate refresh
 
 Candidate refresh is a distinct control-plane transaction, not an ordinary

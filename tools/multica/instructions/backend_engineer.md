@@ -52,7 +52,21 @@ Reread the child, parent, linked PR, FailureBundle when repairing, and current
 head. Resume the existing PR, whose body uses `Closes PRO-N` for the child and
 `Related to PRO-M` for the parent. A completed child, gate comment,
 reviewer/QA mention, or PR mention is not coding authority. Post complete
-evidence, retain its UUID, then invoke:
+evidence only after validating the complete assigned base SHA to candidate diff
+from the authoritative control repository:
+
+```text
+python3 -B -m tools.multica.workflow validate-candidate --repository backend --repository-root ABSOLUTE_REPOSITORY_ROOT --base-sha ASSIGNED_BASE_SHA --candidate-sha FULL_SHA
+```
+
+A nonzero result is a hard stop. Reconstruct a clean candidate from the assigned
+base SHA and include only intended business paths; do not narrow the base to hide
+an earlier runtime artifact. Put the canonical receipt, including
+`receipt_digest` and `changed_paths`, in the evidence. Before separate push/PR
+authorization, stop. After authorization, publish exactly
+`FULL_SHA:refs/heads/MANAGED_BRANCH`, never the runtime HEAD or an automatically
+advanced runtime branch, then reread the remote head before creating or updating
+the PR. Retain the evidence UUID, then invoke:
 
 ```text
 python3 -B -m tools.multica.workflow finish-phase PRO-N --kind implementation --result pass|fail|blocked --attempt N --backend-sha FULL_SHA --evidence-comment COMMENT_UUID --pr CANONICAL_PR_URL
