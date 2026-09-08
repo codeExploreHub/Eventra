@@ -5652,6 +5652,119 @@ def _start_committed_smoke_child(
     )
 
 
+def _reconcile_committed_smoke_reservation(
+    runner: MulticaRunner,
+    github: GitHubRunner,
+    parent_key: str,
+    reservation: dict[str, object],
+    effects: list[int],
+) -> SmokeExecutionResult | None:
+    """Clear a reservation whose exact smoke assignment already committed."""
+
+    first = load_parent_snapshot(runner, github, parent_key)
+    if (
+        first.last_action != reservation["action_key"]
+        and first.next_stage != int(reservation["next_stage"]) + 1
+    ):
+        return None
+    second = load_parent_snapshot(runner, github, parent_key)
+    if first != second:
+        raise RuntimeError("committed smoke authority changed during read")
+    if (
+        first.smoke_reservation != reservation
+        or first.last_action != reservation["action_key"]
+        or first.next_stage != int(reservation["next_stage"]) + 1
+        or first.attempt != reservation["attempt"]
+    ):
+        raise RuntimeError("committed smoke reservation conflicts")
+    if reservation["mode"] == "retry" and (
+        first.consumed_smoke_retry_authorization_uuid
+        != reservation["authorization_comment_uuid"]
+    ):
+        raise RuntimeError("committed smoke retry authorization conflicts")
+    current = tuple(
+        item for item in first.children if item.stage == int(reservation["next_stage"])
+    )
+    problem = _smoke_assignment_problem(first, current)
+    if problem is not None:
+        raise RuntimeError(problem)
+    child_key = current[0].issue_key
+
+    def observed_child_state() -> tuple[dict[str, object], list[dict[str, object]]]:
+        detail = parse_issue_detail(
+            runner.run(["issue", "get", child_key, "--output", "json"]),
+            child_key,
+        )
+        runs = parse_issue_runs(
+            runner.run(["issue", "runs", child_key, "--output", "json"]),
+            str(detail["id"]),
+        )
+        return detail, runs
+
+    child_first = observed_child_state()
+    child_second = observed_child_state()
+    if child_first != child_second:
+        raise RuntimeError("committed smoke child changed during read")
+    detail, runs = child_first
+    if detail["status"] != current[0].status:
+        raise RuntimeError("committed smoke child status conflicts")
+    active = [item for item in runs if item["status"] in ACTIVE_RUN_STATUSES]
+    should_start = detail["status"] == "backlog" and not runs
+    if detail["status"] == "backlog" and runs:
+        raise RuntimeError("backlog smoke child unexpectedly has agent runs")
+    if detail["status"] in {"todo", "in_progress", "in_review"} and len(active) != 1:
+        raise RuntimeError("active smoke child must have exactly one active run")
+    if detail["status"] in {"done", "blocked", "cancelled"} and (
+        active or not runs
+    ):
+        raise RuntimeError("terminal smoke child run state conflicts")
+    if detail["status"] not in {
+        "backlog",
+        "todo",
+        "in_progress",
+        "in_review",
+        "done",
+        "blocked",
+        "cancelled",
+    }:
+        raise RuntimeError("committed smoke child status conflicts")
+
+    effects[0] += _metadata_delete_observed(
+        runner, parent_key, SMOKE_RESERVATION_KEY
+    )
+    _require_stable_parent_control_authority(
+        runner,
+        parent_key,
+        reservation_key=SMOKE_RESERVATION_KEY,
+        reservation_value=None,
+    )
+    final = load_parent_snapshot(runner, github, parent_key)
+    final_current = tuple(
+        item for item in final.children if item.stage == final.next_stage - 1
+    )
+    if (
+        final.last_action != reservation["action_key"]
+        or _smoke_assignment_problem(final, final_current) is not None
+    ):
+        raise RuntimeError("committed smoke reconciliation verification failed")
+    if should_start:
+        return _start_committed_smoke_child(
+            runner,
+            github,
+            parent_key,
+            reservation,
+            effects,
+        )
+    return SmokeExecutionResult(
+        parent_key,
+        "noop",
+        "exact smoke action was already committed; stale reservation was cleared",
+        str(reservation["action_key"]),
+        effects[0],
+        child_key,
+    )
+
+
 def _resume_smoke_reservation(
     runner: MulticaRunner,
     github: GitHubRunner,
@@ -5788,6 +5901,22 @@ def execute_parent_smoke(
             reservation = _decode_smoke_reservation(reservation_text)
             if reservation["action_key"] != expected_action_key:
                 raise RuntimeError("smoke reservation conflicts with expected action")
+            committed_hint = (
+                raw_parent_metadata.get("eventra.workflow.last_action")
+                == expected_action_key
+                and raw_parent_metadata.get("eventra.workflow.next_stage")
+                == str(int(reservation["next_stage"]) + 1)
+            )
+            if committed_hint:
+                reconciled = _reconcile_committed_smoke_reservation(
+                    runner,
+                    github,
+                    parent_key,
+                    reservation,
+                    effects,
+                )
+                if reconciled is not None:
+                    return reconciled
             return _resume_smoke_reservation(
                 runner,
                 github,
