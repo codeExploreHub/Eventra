@@ -7,14 +7,20 @@ import csv
 import hashlib
 import io
 import json
+import os
+import pwd
 import re
 import subprocess
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Literal, Sequence
 
 from .blueprint import build_multi_repo_blueprint
+from . import candidate_refresh as refresh
+from . import refresh_executor
+from .refresh_git import RefreshGit
 from .contracts import (
     parse_agent_list,
     parse_project_list,
@@ -113,6 +119,24 @@ REPAIR_PROVENANCE_KEYS = frozenset(
         "eventra.repair.source_candidates",
     }
 )
+REFRESH_MUTATION_CONTRACT_V1 = {
+    "comment_create_parent_revision_delta": 1,
+    "metadata_change_parent_revision_delta": 1,
+    "metadata_same_value_parent_revision_delta": 0,
+    "status_no_start_preserves_position": True,
+    "status_category_tracks_status": True,
+    "start_creates_single_run": True,
+}
+REFRESH_MUTATION_CONTRACT = REFRESH_MUTATION_CONTRACT_V1
+_REFRESH_MUTATION_CONTRACT_V2_FIELDS = frozenset({
+    "contract_version", "refresh_protocol", "parent_identifier",
+    "request_digest", "action_key", "superseded_gate_ids",
+    *REFRESH_MUTATION_CONTRACT_V1,
+})
+TRUSTED_REFRESH_DEPLOYMENT_FILE = (
+    Path(pwd.getpwuid(os.getuid()).pw_dir)
+    / ".config" / "eventra" / "refresh-deployment.json"
+)
 
 
 @dataclass(frozen=True)
@@ -149,6 +173,150 @@ class ParentCompletionResult:
 
 
 @dataclass(frozen=True)
+class RefreshDeployment:
+    profile: str
+    workspace_id: str
+    control_root: Path
+    frontend_root: Path
+    approved_control_sha: str
+    mutation_contract: dict[str, object] | None
+
+
+def _refresh_mutation_contract_shape(contract: object) -> bool:
+    if type(contract) is not dict:
+        return False
+    if set(contract) == set(REFRESH_MUTATION_CONTRACT_V1):
+        return all(
+            type(contract[key]) is type(expected) and contract[key] == expected
+            for key, expected in REFRESH_MUTATION_CONTRACT_V1.items())
+    if set(contract) != _REFRESH_MUTATION_CONTRACT_V2_FIELDS:
+        return False
+    gates = contract["superseded_gate_ids"]
+    return (
+        type(contract["contract_version"]) is int
+        and contract["contract_version"] == 2
+        and type(contract["refresh_protocol"]) is int
+        and contract["refresh_protocol"] == 2
+        and type(contract["parent_identifier"]) is str
+        and ISSUE_KEY_PATTERN.fullmatch(contract["parent_identifier"]) is not None
+        and type(contract["request_digest"]) is str
+        and re.fullmatch(r"[0-9a-f]{64}", contract["request_digest"]) is not None
+        and type(contract["action_key"]) is str and bool(contract["action_key"])
+        and type(gates) is list and len(gates) == 2
+        and len(set(gates)) == 2 and all(_is_uuid(gate) for gate in gates)
+        and all(type(contract[key]) is type(expected)
+                and contract[key] == expected
+                for key, expected in REFRESH_MUTATION_CONTRACT_V1.items())
+    )
+
+
+def _require_refresh_mutation_contract(
+    deployment: RefreshDeployment,
+    request: refresh.RefreshRequest,
+    parent: str,
+) -> None:
+    """Require the trusted deployment contract for this exact request."""
+    payload = request.payload()
+    contract = deployment.mutation_contract
+    protocol = refresh.refresh_protocol(request)
+    valid = _refresh_mutation_contract_shape(contract)
+    if protocol == 1:
+        valid = valid and contract == REFRESH_MUTATION_CONTRACT_V1
+    else:
+        expected_gate_ids = [gate["id"] for gate in payload["supersession"]["gates"]]
+        valid = valid and contract == {
+            **REFRESH_MUTATION_CONTRACT_V1,
+            "contract_version": 2,
+            "refresh_protocol": 2,
+            "parent_identifier": payload["parent"]["identifier"],
+            "request_digest": request.digest,
+            "action_key": refresh.refresh_action(request),
+            "superseded_gate_ids": expected_gate_ids,
+        }
+    if (not valid or type(parent) is not str
+            or parent != payload["parent"]["identifier"]
+            or deployment.workspace_id != payload["workspace_id"]
+            or deployment.approved_control_sha != payload["control_tool_sha"]):
+        raise RuntimeError(
+            "refresh deployment mutation contract does not authorize request")
+
+
+def _load_refresh_deployment(*, mutation: bool) -> RefreshDeployment:
+    """Load one explicit deployment record; never infer a live scope."""
+
+    filename = os.environ.get("EVENTRA_REFRESH_DEPLOYMENT_FILE")
+    if type(filename) is not str or not filename or not Path(filename).is_absolute():
+        raise RuntimeError("refresh deployment file is not explicitly configured")
+    try:
+        configured_path = Path(filename)
+        path = configured_path.resolve(strict=True)
+        if not path.is_file() or path.stat().st_size > 8_192:
+            raise RuntimeError
+        raw = refresh._load_json(path.read_text(encoding="utf-8"), 8_192)
+    except (OSError, UnicodeError, ValueError, RuntimeError):
+        raise RuntimeError("refresh deployment file is invalid") from None
+    if mutation:
+        trusted = TRUSTED_REFRESH_DEPLOYMENT_FILE.resolve(strict=False)
+        file_stat = path.stat()
+        parent_stat = path.parent.stat()
+        mode = file_stat.st_mode
+        trust_chain = (
+            configured_path,
+            *configured_path.parents[:3],
+        )
+        if (not configured_path.is_absolute()
+                or configured_path != TRUSTED_REFRESH_DEPLOYMENT_FILE
+                or any(item.is_symlink() for item in trust_chain)
+                or path != trusted
+                or file_stat.st_uid != os.getuid() or mode & 0o022
+                or file_stat.st_nlink != 1
+                or parent_stat.st_uid != os.getuid()
+                or parent_stat.st_mode & 0o022):
+            raise RuntimeError(
+                "refresh mutation requires the trusted deployment path")
+    fields = {
+        "schema_version", "profile", "workspace_id", "control_root",
+        "frontend_root", "approved_control_sha", "mutation_contract",
+    }
+    if (type(raw) is not dict
+            or set(raw) != fields
+            or type(raw["schema_version"]) is not int
+            or raw["schema_version"] != 1):
+        raise RuntimeError("refresh deployment file is invalid")
+    try:
+        profile = raw["profile"]
+        workspace_id = raw["workspace_id"]
+        control_sha = raw["approved_control_sha"]
+        if (not refresh_executor.valid_profile_name(profile)
+                or not _is_uuid(workspace_id)
+                or type(control_sha) is not str
+                or SHA_PATTERN.fullmatch(control_sha) is None):
+            raise RuntimeError
+        roots = []
+        for key in ("control_root", "frontend_root"):
+            value = raw[key]
+            if type(value) is not str or not Path(value).is_absolute():
+                raise RuntimeError
+            root = Path(value).resolve(strict=True)
+            if not root.is_dir():
+                raise RuntimeError
+            roots.append(root)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise RuntimeError("refresh deployment file is invalid") from None
+    contract = raw["mutation_contract"]
+    contract_matches = _refresh_mutation_contract_shape(contract)
+    if contract is not None and not contract_matches:
+        raise RuntimeError("refresh deployment mutation contract is invalid")
+    if mutation and not contract_matches:
+        raise RuntimeError("refresh deployment mutation contract is not approved")
+    if mutation and any(path.is_relative_to(root) for root in roots):
+        raise RuntimeError(
+            "refresh deployment file must be outside configured checkouts")
+    return RefreshDeployment(
+        profile, workspace_id, roots[0], roots[1], control_sha, contract)
+
+
+@dataclass(frozen=True)
 class PhaseSnapshot:
     issue_key: str
     stage: int
@@ -176,6 +344,7 @@ class PhaseSnapshot:
     assignee_id: str = ""
     assignee_type: str = "agent"
     workflow_version: int = 2
+    refresh_provenance: str | None = None
 
 
 @dataclass(frozen=True)
@@ -219,6 +388,7 @@ class ParentSnapshot:
     authorization_comment_uuid: str = ""
     consumed_authorization_uuid: str = ""
     authorizing_comment: AuthorizingComment | None = None
+    consumed_authorizing_comment: AuthorizingComment | None = None
     smoke_retry_authorization_comment_uuid: str = ""
     consumed_smoke_retry_authorization_uuid: str = ""
     smoke_retry_authorizing_comment: AuthorizingComment | None = None
@@ -235,6 +405,7 @@ class ParentSnapshot:
     delivery_lead_id: str = ""
     delivery_squad_leader_id: str = ""
     delivery_squad_members: tuple[tuple[str, str, str], ...] = ()
+    refresh_state: refresh.RefreshSnapshot | None = None
 
 
 @dataclass(frozen=True)
@@ -248,6 +419,9 @@ class ParentDecision:
         "retry_smoke_stage",
         "complete_parent",
         "block_parent",
+        "create_refresh_stage",
+        "resume_refresh",
+        "publish_refresh",
     ]
     action_key: str | None
     reason: str
@@ -309,6 +483,9 @@ class WorkflowSnapshot:
     delivery_lead_id: str = ""
     delivery_squad_leader_id: str = ""
     delivery_squad_members: tuple[tuple[str, str, str], ...] = ()
+    refresh_reservation_state: str = ""
+    refresh_hold_reason: str = ""
+    refresh_metadata_malformed: bool = False
 
     def first_terminal_run_needing_transition(
         self,
@@ -332,7 +509,7 @@ class WorkflowSnapshot:
 
 @dataclass(frozen=True)
 class RecoveryDecision:
-    kind: Literal["noop", "rerun_child", "rerun_parent"]
+    kind: Literal["noop", "rerun_child", "rerun_parent", "block"]
     issue_key: str | None
     reason: str
 
@@ -819,6 +996,25 @@ def _work_repository_coverage(
 
 
 def _attempt_history_is_consistent(snapshot: ParentSnapshot) -> bool:
+    refresh_phases = tuple(item for item in snapshot.children if item.kind == "refresh" or item.refresh_provenance is not None)
+    if refresh_phases:
+        refresh_stage = 2
+        if snapshot.refresh_state is not None:
+            try:
+                feature = refresh.refresh_metadata(
+                    snapshot.refresh_state.state()["metadata"])
+                request = refresh.parse_request(feature["request"])
+                refresh_stage = refresh._refresh_stage(request)
+            except (ValueError, TypeError, KeyError, AttributeError):
+                return False
+        if (len(refresh_phases) != 1 or refresh_phases[0].kind != "refresh"
+                or refresh_phases[0].stage != refresh_stage
+                or refresh_phases[0].attempt != 0
+                or refresh_phases[0].refresh_provenance is None or snapshot.refresh_state is None):
+            return False
+        decision = _refresh_workflow_decision(snapshot)
+        if decision is not None and decision.kind == "block_parent":
+            return False
     completed = tuple(item for item in snapshot.children if item.status == "done")
     if not completed:
         return snapshot.attempt == 0
@@ -1145,15 +1341,13 @@ def _failure_bundle(
     return payload
 
 
-def _repair_authorization_matches(
-    snapshot: ParentSnapshot,
+def _repair_authorization_comment_matches(
+    comment_uuid: str,
+    comment: AuthorizingComment | None,
     bundle: dict[str, object],
 ) -> bool:
-    comment_uuid = snapshot.authorization_comment_uuid
-    comment = snapshot.authorizing_comment
     if (
         not _is_uuid(comment_uuid)
-        or bool(snapshot.consumed_authorization_uuid)
         or not isinstance(comment, AuthorizingComment)
         or comment.comment_uuid != comment_uuid
         or comment.author_type != "member"
@@ -1177,6 +1371,20 @@ def _repair_authorization_matches(
             sort_keys=True,
             separators=(",", ":"),
             allow_nan=False,
+        )
+    )
+
+
+def _repair_authorization_matches(
+    snapshot: ParentSnapshot,
+    bundle: dict[str, object],
+) -> bool:
+    return (
+        not snapshot.consumed_authorization_uuid
+        and _repair_authorization_comment_matches(
+            snapshot.authorization_comment_uuid,
+            snapshot.authorizing_comment,
+            bundle,
         )
     )
 
@@ -1405,6 +1613,13 @@ def _current_repair_provenance_problem(
     digest = str(bundle["digest"])
     if expected_action != snapshot.last_action or digests != {digest}:
         return "current repair bundle or creation action is not canonical"
+    if (snapshot.attempt == 3
+            and not _repair_authorization_comment_matches(
+                authorization_uuid,
+                snapshot.consumed_authorizing_comment,
+                bundle,
+            )):
+        return "historical round-three member authorization is invalid"
     expected_specs = {
         str(spec["repository"]): spec for spec in specs
     }
@@ -1446,6 +1661,256 @@ def _current_repair_provenance_problem(
     )
 
 
+def _historical_repair_chain_problem(
+    snapshot: ParentSnapshot,
+    authorizing_gates: tuple[PhaseSnapshot, ...],
+    initial_gate_stage: int,
+) -> str | None:
+    """Revalidate every completed repair between initial and merge gates."""
+    if not authorizing_gates:
+        return "merged refresh has no authorizing gate set"
+    gate_stage = authorizing_gates[0].stage
+    gate_attempts = {item.attempt for item in authorizing_gates}
+    if gate_stage == initial_gate_stage:
+        return (None if gate_attempts == {0}
+                else "initial refresh gate attempt is conflicting")
+    if len(gate_attempts) != 1:
+        return "post-repair gate attempt is conflicting"
+    target_attempt = next(iter(gate_attempts))
+    if target_attempt not in {1, 2, 3}:
+        return "post-repair gate attempt is outside the repair budget"
+
+    previous_gate_stage = initial_gate_stage
+    for repair_round in range(1, target_attempt + 1):
+        repairs = tuple(item for item in snapshot.children
+                        if item.kind == "repair"
+                        and item.attempt == repair_round)
+        if (not repairs or len({item.stage for item in repairs}) != 1
+                or repairs[0].stage != previous_gate_stage + 1):
+            return "historical repair Stage chain is incomplete"
+        repair_stage = repairs[0].stage
+        if any(item.status != "done" or item.result != "pass"
+               for item in repairs):
+            return "historical repair did not complete with PASS"
+        source_sets = {item.repair_source_candidates for item in repairs}
+        if len(source_sets) != 1:
+            return "historical repair source candidates are conflicting"
+        source_candidates = dict(next(iter(source_sets)))
+        replacement_candidates = dict(source_candidates)
+        for item in repairs:
+            repository = item.repair_repository
+            replacement = (item.frontend_sha if repository == "frontend"
+                           else item.backend_sha)
+            if repository not in replacement_candidates or replacement is None:
+                return "historical repair replacement is incomplete"
+            replacement_candidates[repository] = replacement
+        pull_requests = tuple(
+            replace(
+                item,
+                head_sha=replacement_candidates.get(
+                    item.repository, item.head_sha),
+                state="open",
+            )
+            for item in snapshot.pull_requests
+        )
+        repair_snapshot = replace(
+            snapshot,
+            attempt=repair_round,
+            next_stage=repair_stage + 1,
+            last_action=repairs[0].creation_action,
+            candidate_frontend_sha=replacement_candidates.get("frontend"),
+            candidate_backend_sha=replacement_candidates.get("backend"),
+            pull_requests=pull_requests,
+        )
+        problem = _current_repair_provenance_problem(
+            repair_snapshot, repairs)
+        if problem is not None:
+            return problem
+
+        next_gate_stage = repair_stage + 1
+        round_gates = tuple(item for item in snapshot.children
+                            if item.stage == next_gate_stage)
+        gate_snapshot = replace(
+            repair_snapshot,
+            next_stage=next_gate_stage + 1,
+            last_action=None,
+        )
+        if (not round_gates
+                or any(item.status != "done" for item in round_gates)
+                or any(item.result not in PHASE_RESULTS
+                       for item in round_gates)
+                or not _historical_gate_identity_matches(
+                    gate_snapshot, round_gates)):
+            return "post-repair gate history is incomplete or conflicting"
+        if (repair_round < target_attempt
+                and all(item.result == "pass" for item in round_gates)):
+            return "passing gate history cannot source another repair"
+        previous_gate_stage = next_gate_stage
+
+    if (previous_gate_stage != gate_stage
+            or {item.issue_key for item in authorizing_gates}
+            != {item.issue_key for item in round_gates}):
+        return "authorizing gate set is not the end of the repair chain"
+    return None
+
+
+def _historical_round_three_authorization_problem(
+    snapshot: ParentSnapshot,
+) -> str | None:
+    repairs = tuple(item for item in snapshot.children
+                    if item.kind == "repair" and item.attempt == 3)
+    if not repairs:
+        return (None if not snapshot.consumed_authorization_uuid
+                else "consumed round-three authorization lacks repair history")
+    if (len({item.stage for item in repairs}) != 1
+            or len({item.creation_action for item in repairs}) != 1):
+        return "round-three repair history is incomplete or conflicting"
+    repair_stage = repairs[0].stage
+    historical = replace(
+        snapshot,
+        attempt=3,
+        next_stage=repair_stage + 1,
+        last_action=repairs[0].creation_action,
+        repair_reservation=None,
+    )
+    return _current_repair_provenance_problem(historical, repairs)
+
+
+def _refresh_workflow_decision(snapshot: ParentSnapshot) -> ParentDecision | None:
+    """Bind the specialized authority to this exact outer snapshot before routing."""
+    if snapshot.refresh_state is None:
+        if any(item.kind == "refresh" or item.refresh_provenance is not None for item in snapshot.children):
+            return ParentDecision("block_parent", None, "refresh history lacks authoritative provenance")
+        return None
+    try:
+        state = snapshot.refresh_state.state()
+        feature = refresh.refresh_metadata(state["metadata"])
+        if feature is None:
+            raise ValueError("missing feature marker")
+        request = refresh.parse_request(feature["request"])
+        metadata, parent, assignment, pr = state["metadata"], state["parent"], state["assignment"], state["pr"]
+        expected = {"identifier": parent["identifier"], "parent_id": parent["id"],
+                    "workflow_version": int(metadata["eventra.workflow.version"]),
+                    "classification": metadata["eventra.workflow.classification"],
+                    "attempt": int(metadata["eventra.workflow.attempt"]), "next_stage": int(metadata["eventra.workflow.next_stage"]),
+                    "last_action": metadata["eventra.workflow.last_action"], "merge_state": metadata["eventra.workflow.merge_state"],
+                    "candidate_frontend_sha": metadata["eventra.workflow.frontend_sha"], "candidate_backend_sha": None,
+                    "parent_status": parent["status"], "parent_project_id": parent["project_id"],
+                    "parent_assignee_id": parent["assignee_id"], "parent_assignee_type": parent["assignee_type"],
+                    "delivery_squad_id": assignment["squad_id"], "delivery_lead_id": assignment["lead_id"],
+                    "delivery_squad_leader_id": assignment["lead_id"],
+                    "assignment_agent_ids": tuple(sorted((role, identity) for role, identity in assignment["roles"].items()
+                                                         if role != "delivery_lead")),
+                    "assignment_project_ids": tuple(sorted(assignment["projects"].items())),
+                    "delivery_squad_members": tuple(sorted((item["member_id"], item["member_type"], item["role"])
+                                                           for item in assignment["members"]))}
+        if any(getattr(snapshot, key) != value for key, value in expected.items()):
+            raise ValueError("outer authority mismatch")
+        decision = refresh.plan_refresh(request, snapshot.refresh_state)
+        if decision.kind == "block":
+            return ParentDecision("block_parent", None, decision.reason)
+        superseded_ids = _request_bound_superseded_gate_ids(
+            snapshot.refresh_state)
+        phases = tuple(
+            _phase_snapshot(item["detail"], item["metadata"])
+            for item in state["children"]
+            if item["detail"]["id"] not in superseded_ids
+        )
+        if (sorted(phases, key=lambda item: item.issue_key) != sorted(snapshot.children, key=lambda item: item.issue_key)
+                or len(snapshot.pull_requests) != 1 or snapshot.pull_requests[0].repository != "frontend"
+                or snapshot.pull_requests[0].url != pr["url"] or snapshot.pull_requests[0].head_sha != pr["head_sha"]
+                or snapshot.pull_requests[0].state != pr["state"]):
+            raise ValueError("outer child or PR authority mismatch")
+        if decision.kind == "create_gate_stage":
+            return _parent_decision(snapshot, "create_gate_stage", decision.reason)
+        if decision.kind == "wait":
+            completed_history = (
+                "reservation" not in feature
+                and ({"adoption", "consumed"} <= set(feature)
+                     or "supersession" in feature)
+            )
+            if (completed_history
+                    and decision.reason == "refresh adopted; validate normal gate or repair history"):
+                return None  # Normal exact gate/repair checks still run below.
+            return ParentDecision("noop", None, decision.reason)
+        return ParentDecision(decision.kind, decision.action_key, decision.reason)
+    except (ValueError, RuntimeError, TypeError, KeyError, AttributeError):
+        return ParentDecision("block_parent", None, "refresh workflow authority is conflicting")
+
+
+def _dedicated_refresh_decision_hold_reason(
+    decision: ParentDecision | refresh.RefreshDecision | None,
+) -> str | None:
+    """Map one specialized decision to the shared ordinary-writer hold."""
+
+    if decision is None or decision.kind == "create_gate_stage":
+        return None
+    if decision.kind in {"block", "block_parent"}:
+        raise RuntimeError("refresh workflow authority is conflicting")
+    if decision.reason == (
+        "refresh adopted; validate normal gate or repair history"
+    ):
+        return None
+    if "authorization" in decision.reason:
+        return "dedicated refresh request awaits exact member authorization"
+    if "preparation pending" in decision.reason:
+        return "dedicated refresh preparation requires finish-refresh"
+    if "cancellation" in decision.reason or "gates cancelled" in decision.reason:
+        return "dedicated refresh cancellation requires execute-parent-refresh"
+    if (
+        decision.kind == "publish_refresh"
+        or "adoption" in decision.reason
+        or "registered candidate" in decision.reason
+    ):
+        return "dedicated refresh publication requires execute-parent-refresh"
+    return "dedicated refresh execution requires execute-parent-refresh"
+
+
+def _dedicated_refresh_hold_reason(
+    snapshot: ParentSnapshot,
+) -> str | None:
+    """Classify when ordinary workflow writers must yield to refresh."""
+
+    return _dedicated_refresh_decision_hold_reason(
+        _refresh_workflow_decision(snapshot)
+    )
+
+
+def _receipt_bound_superseded_gate_ids(
+        refresh_state: refresh.RefreshSnapshot | None) -> frozenset[str]:
+    if refresh_state is None:
+        return frozenset()
+    state = refresh_state.state()
+    feature = refresh.refresh_metadata(state["metadata"])
+    if feature is None or "supersession" not in feature:
+        return frozenset()
+    request = refresh.parse_request(feature["request"])
+    child, prepared = refresh._refresh_child(request, state)
+    if prepared is None:
+        raise ValueError("supersession receipt lacks prepared child")
+    receipt = refresh._supersession_receipt(
+        feature, request, prepared, state)
+    return frozenset(gate["id"] for gate in receipt["gates"])
+
+
+def _request_bound_superseded_gate_ids(
+        refresh_state: refresh.RefreshSnapshot | None) -> frozenset[str]:
+    """Project v2-owned pristine gates out of ordinary workflow parsing."""
+    if refresh_state is None:
+        return frozenset()
+    state = refresh_state.state()
+    feature = refresh.refresh_metadata(state["metadata"])
+    if feature is None:
+        return frozenset()
+    request = refresh.parse_request(feature["request"])
+    if refresh.refresh_protocol(request) != 2:
+        return frozenset()
+    return frozenset(
+        str(gate["id"])
+        for gate in request.payload()["supersession"]["gates"]
+    )
+
+
 def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
     """Return one deterministic coordinator action without mutating state."""
 
@@ -1475,6 +1940,9 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
     parent_authority_problem = _parent_assignment_authority_problem(snapshot)
     if parent_authority_problem is not None:
         return ParentDecision("block_parent", None, parent_authority_problem)
+    refresh_decision = _refresh_workflow_decision(snapshot)
+    if refresh_decision is not None:
+        return refresh_decision
     if snapshot.repair_reservation is not None:
         return _parent_decision(
             snapshot,
@@ -1487,6 +1955,11 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
             "block_parent",
             "smoke reservation requires exact executor reconciliation",
         )
+    round_three_problem = _historical_round_three_authorization_problem(
+        snapshot)
+    if round_three_problem is not None:
+        return _parent_decision(
+            snapshot, "block_parent", round_three_problem)
     if snapshot.merge_state == "partial":
         return _parent_decision(
             snapshot,
@@ -1550,12 +2023,78 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
         )
 
     if snapshot.merge_state == "merged":
+        superseded_gate_ids = _receipt_bound_superseded_gate_ids(
+            snapshot.refresh_state)
+        if snapshot.refresh_state is not None and not superseded_gate_ids:
+            return ParentDecision("noop", None, "human merge approval required")
         if not _attempt_history_is_consistent(snapshot):
             return _parent_decision(
                 snapshot,
                 "block_parent",
                 "parent attempt conflicts with completed child history",
             )
+        if snapshot.refresh_state is not None:
+            feature = refresh.refresh_metadata(
+                snapshot.refresh_state.state()["metadata"])
+            receipt = feature["supersession"]
+            smoke_stages = [item.stage for item in snapshot.children
+                            if item.kind == "smoke"]
+            gate_stage = (min(smoke_stages) - 1
+                          if smoke_stages else current_stage)
+            gates = tuple(item for item in snapshot.children
+                          if item.stage == gate_stage)
+            if (
+                gate_stage < receipt["fresh_gate_stage"]
+                or not gates
+                or not {item.kind for item in gates}
+                    <= {"review", "qa", "integration_qa"}
+            ):
+                return _parent_decision(
+                    snapshot,
+                    "block_parent",
+                    "merged refresh lacks its request-bound gate set",
+                )
+            repair_problem = _historical_repair_chain_problem(
+                snapshot, gates, receipt["fresh_gate_stage"])
+            if repair_problem is not None:
+                return _parent_decision(
+                    snapshot,
+                    "block_parent",
+                    repair_problem,
+                )
+            if any(item.status != "done" for item in gates):
+                if not smoke_stages and gate_stage == current_stage:
+                    return ParentDecision(
+                        "noop", None, "fresh gate stage is still active")
+                return _parent_decision(
+                    snapshot,
+                    "block_parent",
+                    "merged refresh has later history before its gate set completed",
+                )
+            if any(item.result not in PHASE_RESULTS for item in gates):
+                return _parent_decision(
+                    snapshot,
+                    "block_parent",
+                    "terminal refresh gate evidence is malformed",
+                )
+            if not _phase_shas_match(snapshot, gates):
+                return _parent_decision(
+                    snapshot,
+                    "block_parent",
+                    "merged refresh gate evidence does not match current candidates",
+                )
+            if not _historical_gate_identity_matches(snapshot, gates):
+                return _parent_decision(
+                    snapshot,
+                    "block_parent",
+                    "merged refresh gate coverage is incomplete",
+                )
+            if not all(item.result == "pass" for item in gates):
+                return _parent_decision(
+                    snapshot,
+                    "block_parent",
+                    "merged refresh contains a non-passing gate",
+                )
         if latest and {item.kind for item in latest} == {"smoke"}:
             if any(item.status != "done" for item in latest):
                 return ParentDecision("noop", None, "smoke stage is still active")
@@ -1682,6 +2221,8 @@ def decide_parent_action(snapshot: ParentSnapshot) -> ParentDecision:
                 "block_parent",
                 "current pull request state is not merge-ready",
             )
+        if snapshot.refresh_state is not None:
+            return ParentDecision("noop", None, "human merge approval required")
         return _parent_decision(
             snapshot,
             "merge",
@@ -1754,6 +2295,15 @@ def _recovery_authority_identity(
         parent.next_stage,
         parent.authorization_comment_uuid,
         parent.consumed_authorization_uuid,
+        (
+            None
+            if parent.consumed_authorizing_comment is None
+            else (
+                parent.consumed_authorizing_comment.comment_uuid,
+                parent.consumed_authorizing_comment.author_type,
+                parent.consumed_authorizing_comment.content,
+            )
+        ),
         parent.smoke_retry_authorization_comment_uuid,
         parent.consumed_smoke_retry_authorization_uuid,
         (
@@ -2337,6 +2887,9 @@ def _current_assignment_provenance_problem(
         or parent.smoke_reservation is not None
     ):
         return "current assignment reservation is still in progress"
+    round_three_problem = _historical_round_three_authorization_problem(parent)
+    if round_three_problem is not None:
+        return round_three_problem
     current_children = tuple(
         child
         for child in snapshot.children
@@ -2466,6 +3019,19 @@ def _initial_parent_recovery_problem(
 def decide_recovery(snapshot: WorkflowSnapshot) -> RecoveryDecision:
     """Choose at most one safe stalled-work rerun."""
 
+    if snapshot.refresh_metadata_malformed:
+        return RecoveryDecision(
+            "block", None, "refresh workflow metadata is malformed")
+    if snapshot.refresh_hold_reason:
+        return RecoveryDecision(
+            "noop", None, snapshot.refresh_hold_reason)
+    if snapshot.refresh_reservation_state:
+        return RecoveryDecision(
+            "noop", None,
+            "refresh reservation " + snapshot.refresh_reservation_state
+            + " requires execute-parent-refresh",
+        )
+
     if snapshot.workflow_version == 1:
         return RecoveryDecision(
             "noop",
@@ -2563,7 +3129,7 @@ def recover_once(runner: MulticaRunner, snapshot_loader) -> RecoveryResult:
 
     initial_snapshot = snapshot_loader()
     initial = decide_recovery(initial_snapshot)
-    if initial.kind == "noop":
+    if initial.kind in {"noop", "block"}:
         return RecoveryResult(initial, 0)
     fresh_snapshot = snapshot_loader()
     fresh = decide_recovery(fresh_snapshot)
@@ -2621,6 +3187,10 @@ def recover_once(runner: MulticaRunner, snapshot_loader) -> RecoveryResult:
 
 
 def _parent_metadata(value: dict[str, str]) -> dict[str, object]:
+    try:
+        refresh_feature = refresh.refresh_metadata(value)
+    except (ValueError, TypeError):
+        raise RuntimeError("malformed parent refresh metadata") from None
     version = value.get("eventra.workflow.version")
     classification = value.get("eventra.workflow.classification")
     next_stage = value.get("eventra.workflow.next_stage")
@@ -2707,6 +3277,7 @@ def _parent_metadata(value: dict[str, str]) -> dict[str, object]:
         ),
         "repair_reservation": repair_reservation,
         "smoke_reservation": smoke_reservation,
+        "refresh_feature": refresh_feature,
     }
 
 
@@ -2897,11 +3468,42 @@ def _decode_repair_reservation(value: str) -> dict[str, object]:
     return decoded
 
 
+def _refresh_phase_provenance(metadata: dict[str, str]) -> str | None:
+    keys = {key for key in metadata if key.startswith(refresh.REFRESH_PREFIX)}
+    kind = metadata.get("eventra.phase.kind")
+    if not keys and kind != "refresh":
+        return None
+    expected = {"eventra.refresh.version", "eventra.refresh.request_digest", "eventra.refresh.source_sha"}
+    source = metadata.get("eventra.refresh.source_sha", "")
+    digest = metadata.get("eventra.refresh.request_digest", "")
+    protocol_text = metadata.get("eventra.refresh.version", "")
+    refresh_stage = {"1": 2, "2": 3}.get(protocol_text)
+    if (keys != expected or kind != "refresh" or refresh_stage is None
+            or metadata.get("eventra.workflow.version") != "2" or metadata.get("eventra.phase.attempt") != "0"
+            or SHA_PATTERN.fullmatch(source) is None or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or metadata.get("eventra.phase.target") != "repository:frontend"
+            or metadata.get("eventra.phase.role") != "frontend_engineer"
+            or "eventra.phase.sha.backend" in metadata
+            or any(key.startswith("eventra.repair.") for key in metadata)
+            or re.fullmatch(r"2:PRO-[1-9][0-9]*:create_refresh_stage:0:frontend:" + source
+                            + rf":next-stage:{refresh_stage}:refresh:{protocol_text}:"
+                            + digest,
+                            metadata.get("eventra.phase.creation_action", "")) is None):
+        raise RuntimeError("malformed child refresh provenance")
+    return _canonical_json({"version": int(protocol_text),
+                            "request_digest": digest, "source_sha": source})
+
+
 def _phase_snapshot(
     issue: dict[str, object],
     metadata: dict[str, str],
 ) -> PhaseSnapshot:
     kind = metadata.get("eventra.phase.kind", "unknown")
+    refresh_provenance = _refresh_phase_provenance(metadata)
+    if refresh_provenance is not None:
+        protocol = json.loads(refresh_provenance)["version"]
+        if type(issue["stage"]) is not int or issue["stage"] != protocol + 1:
+            raise RuntimeError("refresh must occupy its request-bound Stage")
     result = metadata.get("eventra.phase.result")
     attempt_text = metadata.get("eventra.phase.attempt", "0")
     frontend_sha = metadata.get("eventra.phase.sha.frontend")
@@ -3005,7 +3607,7 @@ def _phase_snapshot(
         repair_source_candidates = tuple(decoded_source_candidates.items())
     if (
         version not in {"1", "2"}
-        or (kind != "unknown" and kind not in PHASE_KINDS)
+        or (kind != "unknown" and kind not in PHASE_KINDS and refresh_provenance is None)
         or (result is not None and result not in PHASE_RESULTS)
         or not attempt_text.isdigit()
         or (version == "2" and int(attempt_text) > 3)
@@ -3059,6 +3661,7 @@ def _phase_snapshot(
         assignee_id=str(issue["assignee_id"]),
         assignee_type=str(issue["assignee_type"]),
         workflow_version=int(version),
+        refresh_provenance=refresh_provenance,
     )
 
 
@@ -3191,10 +3794,34 @@ def _read_gate_evidence_set(
     return tuple(sorted(authorities))
 
 
+def _read_parent_authorization(
+    runner: MulticaRunner,
+    parent_key: str,
+    comment_uuid: str,
+) -> AuthorizingComment:
+    raw_comment = parse_authorizing_comment(
+        runner.run(
+            [
+                "issue", "comment", "list", parent_key,
+                "--thread", comment_uuid, "--full", "--compact",
+                "--output", "json",
+            ]
+        ),
+        comment_uuid,
+    )
+    return AuthorizingComment(
+        comment_uuid=raw_comment["comment_uuid"],
+        author_type=raw_comment["author_type"],
+        content=raw_comment["content"],
+    )
+
+
 def load_parent_snapshot(
     runner: MulticaRunner,
     github: GitHubRunner,
     parent_key: str,
+    *,
+    refresh_api=None,
 ) -> ParentSnapshot:
     """Read parent phase metadata and current GitHub heads without mutation."""
 
@@ -3204,38 +3831,38 @@ def load_parent_snapshot(
     )
     if parent["parent_issue_id"] is not None:
         raise RuntimeError("parent planning requires a parent issue")
-    metadata = _parent_metadata(
-        parse_issue_metadata(
-            runner.run(
-                ["issue", "metadata", "list", parent_key, "--output", "json"]
-            )
+    raw_parent_metadata = parse_issue_metadata(
+        runner.run(
+            ["issue", "metadata", "list", parent_key, "--output", "json"]
         )
     )
+    metadata = _parent_metadata(raw_parent_metadata)
+    refresh_state = None
+    if metadata["refresh_feature"] is not None:
+        if refresh_api is None:
+            raise RuntimeError("refresh requires an explicitly configured authoritative reader")
+        refresh_state = refresh_api.snapshot(parent_key)
+        refresh_state_value = refresh_state.state()
+        refresh_feature = refresh.refresh_metadata(
+            refresh_state_value["metadata"]
+        )
+        refresh_request = refresh.parse_request(refresh_feature["request"])
+        if (
+            refresh_state_value["metadata"] != raw_parent_metadata
+            or refresh.plan_refresh(refresh_request, refresh_state).kind == "block"
+        ):
+            raise RuntimeError("refresh workflow authority is conflicting")
     authorizing_comment = None
     authorization_comment_uuid = str(metadata["authorization_comment_uuid"])
     if authorization_comment_uuid:
-        raw_comment = parse_authorizing_comment(
-            runner.run(
-                [
-                    "issue",
-                    "comment",
-                    "list",
-                    parent_key,
-                    "--thread",
-                    authorization_comment_uuid,
-                    "--full",
-                    "--compact",
-                    "--output",
-                    "json",
-                ]
-            ),
-            authorization_comment_uuid,
-        )
-        authorizing_comment = AuthorizingComment(
-            comment_uuid=raw_comment["comment_uuid"],
-            author_type=raw_comment["author_type"],
-            content=raw_comment["content"],
-        )
+        authorizing_comment = _read_parent_authorization(
+            runner, parent_key, authorization_comment_uuid)
+    consumed_authorization_uuid = str(
+        metadata["consumed_authorization_uuid"])
+    consumed_authorizing_comment = None
+    if consumed_authorization_uuid:
+        consumed_authorizing_comment = _read_parent_authorization(
+            runner, parent_key, consumed_authorization_uuid)
     smoke_retry_authorizing_comment = None
     smoke_retry_authorization_comment_uuid = str(
         metadata["smoke_retry_authorization_comment_uuid"]
@@ -3271,6 +3898,7 @@ def load_parent_snapshot(
     quarantined: list[QuarantinedRepairChild] = []
     child_metadata_by_key: dict[str, dict[str, str]] = {}
     pr_candidates: dict[str, tuple[int, str]] = {}
+    superseded_gate_ids = _request_bound_superseded_gate_ids(refresh_state)
     for child in children:
         if child["stage"] is None:
             continue
@@ -3283,6 +3911,8 @@ def load_parent_snapshot(
             )
         )
         child_metadata_by_key[str(child["identifier"])] = child_metadata
+        if str(child["id"]) in superseded_gate_ids:
+            continue
         reservation = metadata["repair_reservation"]
         if reservation is not None:
             incomplete = _quarantined_repair_child(
@@ -3367,6 +3997,7 @@ def load_parent_snapshot(
             )
             for child in stable_children
             if child["stage"] is not None
+            and str(child["id"]) not in superseded_gate_ids
             and str(child["identifier"]) not in quarantined_keys
         )
         evidence_after = _read_gate_evidence_set(
@@ -3438,6 +4069,19 @@ def load_parent_snapshot(
             raise RuntimeError(
                 "smoke retry authorization changed during recovery read"
             )
+
+    if consumed_authorization_uuid:
+        try:
+            stable_consumed_authorizing_comment = _read_parent_authorization(
+                runner, parent_key, consumed_authorization_uuid)
+        except RuntimeError:
+            raise RuntimeError(
+                "consumed repair authorization changed during parent read"
+            ) from None
+        if (stable_consumed_authorizing_comment
+                != consumed_authorizing_comment):
+            raise RuntimeError(
+                "consumed repair authorization changed during parent read")
 
     current_stage = int(metadata["next_stage"]) - 1
     current_kinds = {
@@ -3524,6 +4168,7 @@ def load_parent_snapshot(
             metadata["consumed_authorization_uuid"]
         ),
         authorizing_comment=authorizing_comment,
+        consumed_authorizing_comment=consumed_authorizing_comment,
         smoke_retry_authorization_comment_uuid=(
             smoke_retry_authorization_comment_uuid
         ),
@@ -3546,11 +4191,18 @@ def load_parent_snapshot(
         delivery_lead_id=assignment_authority_before[3],
         delivery_squad_leader_id=assignment_authority_before[4],
         delivery_squad_members=assignment_authority_before[5],
+        refresh_state=refresh_state,
     )
     if snapshot.workflow_version == 2:
         authority_problem = _parent_assignment_authority_problem(snapshot)
         if authority_problem is not None:
             raise RuntimeError(authority_problem)
+    if refresh_state is not None:
+        if refresh_api.snapshot(parent_key) != refresh_state:
+            raise RuntimeError("refresh authority changed during parent read")
+        decision = _refresh_workflow_decision(snapshot)
+        if decision is not None and decision.kind == "block_parent":
+            raise RuntimeError(decision.reason)
     if quarantined:
         if snapshot.repair_reservation is None:
             raise RuntimeError("quarantined repair child lacks a reservation")
@@ -3747,8 +4399,16 @@ def _validate_repair_reservation(
         ):
             if not _repair_authorization_matches(source_snapshot, bundle):
                 raise RuntimeError("reserved repair authorization no longer matches")
-        elif snapshot.consumed_authorization_uuid != authorization_uuid:
-            raise RuntimeError("reserved repair authorization was not consumed")
+        elif (
+            snapshot.consumed_authorization_uuid != authorization_uuid
+            or not _repair_authorization_comment_matches(
+                authorization_uuid,
+                snapshot.consumed_authorizing_comment,
+                bundle,
+            )
+        ):
+            raise RuntimeError(
+                "reserved repair authorization was not validly consumed")
     elif authorization_uuid:
         raise RuntimeError("automatic repair cannot carry authorization")
     if committed_children is not None:
@@ -4396,8 +5056,10 @@ def _create_reserved_repair_children(
     parent_key: str,
     reservation: dict[str, object],
     observed_effects: list[int],
+    refresh_api=None,
 ) -> ParentSnapshot:
-    snapshot = load_parent_snapshot(runner, github, parent_key)
+    snapshot = load_parent_snapshot(
+        runner, github, parent_key, refresh_api=refresh_api)
     if snapshot.repair_reservation != reservation:
         raise RuntimeError("authoritative repair reservation changed before child creation")
     _validate_repair_reservation(snapshot, reservation, str(reservation["action_key"]))
@@ -4501,7 +5163,8 @@ def _create_reserved_repair_children(
             or observed_description != description
         ):
             raise RuntimeError("repair child persistence verification failed")
-    fresh = load_parent_snapshot(runner, github, parent_key)
+    fresh = load_parent_snapshot(
+        runner, github, parent_key, refresh_api=refresh_api)
     if fresh.repair_reservation != reservation:
         raise RuntimeError("authoritative repair reservation changed after child creation")
     _validate_repair_reservation(fresh, reservation, str(reservation["action_key"]))
@@ -4582,13 +5245,16 @@ def _require_stable_repair_reservation_authority(
     github: GitHubRunner,
     parent_key: str,
     reservation: dict[str, object],
+    refresh_api=None,
 ) -> ParentSnapshot:
     action_key = str(reservation["action_key"])
-    first = load_parent_snapshot(runner, github, parent_key)
+    first = load_parent_snapshot(
+        runner, github, parent_key, refresh_api=refresh_api)
     if first.repair_reservation != reservation:
         raise RuntimeError("repair reservation authority is conflicting")
     _validate_repair_reservation(first, reservation, action_key)
-    second = load_parent_snapshot(runner, github, parent_key)
+    second = load_parent_snapshot(
+        runner, github, parent_key, refresh_api=refresh_api)
     if second.repair_reservation != reservation:
         raise RuntimeError("repair reservation authority is conflicting")
     _validate_repair_reservation(second, reservation, action_key)
@@ -4603,6 +5269,7 @@ def _commit_reserved_repair(
     parent_key: str,
     reservation: dict[str, object],
     observed_effects: list[int],
+    refresh_api=None,
 ) -> tuple[str, ...]:
     action_key = str(reservation["action_key"])
     source_attempt = int(reservation["source_attempt"])
@@ -4693,7 +5360,8 @@ def _commit_reserved_repair(
     ):
         raise RuntimeError("parent repair commit verification failed")
 
-    fresh = load_parent_snapshot(runner, github, parent_key)
+    fresh = load_parent_snapshot(
+        runner, github, parent_key, refresh_api=refresh_api)
     _validate_repair_reservation(fresh, reservation, action_key)
     children = _repair_children_for_reservation(runner, fresh, reservation)
     expected_repositories = {
@@ -4704,15 +5372,15 @@ def _commit_reserved_repair(
     for repository in sorted(children):
         child = children[repository]
         _require_stable_repair_reservation_authority(
-            runner, github, parent_key, reservation
+            runner, github, parent_key, reservation, refresh_api
         )
         _promote_repair_child_observed(runner, child, observed_effects)
         _require_stable_repair_reservation_authority(
-            runner, github, parent_key, reservation
+            runner, github, parent_key, reservation, refresh_api
         )
 
     _require_stable_repair_reservation_authority(
-        runner, github, parent_key, reservation
+        runner, github, parent_key, reservation, refresh_api
     )
     observed_effects[0] += _metadata_delete_observed(
         runner,
@@ -4801,6 +5469,14 @@ def _verified_replayed_repair_children(
         bundle = _failure_bundle(source_snapshot, source_phases)
     except ValueError:
         raise RuntimeError("recorded repair bundle cannot be reconstructed") from None
+    if (repair_round == 3
+            and not _repair_authorization_comment_matches(
+                authorization_uuid,
+                snapshot.consumed_authorizing_comment,
+                bundle,
+            )):
+        raise RuntimeError(
+            "recorded round-three member authorization conflicts")
     computed_key = _action_key(
         source_snapshot,
         "create_repair_stage",
@@ -4856,6 +5532,7 @@ def execute_parent_repair(
     parent_key: str,
     *,
     expected_action_key: str,
+    refresh_api=None,
 ) -> RepairExecutionResult:
     """Execute or resume one exact planned repair under serialized Lead access."""
 
@@ -4884,7 +5561,11 @@ def execute_parent_repair(
             or detail["assignee_type"] == "member"
         ):
             raise RuntimeError("repair execution requires a mutable parent")
-        snapshot = load_parent_snapshot(runner, github, parent_key)
+        snapshot = load_parent_snapshot(
+            runner, github, parent_key, refresh_api=refresh_api)
+        refresh_hold_reason = _dedicated_refresh_hold_reason(snapshot)
+        if refresh_hold_reason is not None:
+            raise RuntimeError(refresh_hold_reason)
         reservation = snapshot.repair_reservation
         if reservation is None and snapshot.last_action == expected_action_key:
             children = _verified_replayed_repair_children(
@@ -4913,7 +5594,8 @@ def execute_parent_repair(
                     expected_action_key,
                     0,
                 )
-            fresh_snapshot = load_parent_snapshot(runner, github, parent_key)
+            fresh_snapshot = load_parent_snapshot(
+                runner, github, parent_key, refresh_api=refresh_api)
             fresh_decision = decide_parent_action(fresh_snapshot)
             if fresh_snapshot != snapshot or fresh_decision != decision:
                 raise RuntimeError(
@@ -4943,6 +5625,7 @@ def execute_parent_repair(
             parent_key,
             reservation,
             observed_effects,
+            refresh_api,
         )
         child_identifiers = _commit_reserved_repair(
             runner,
@@ -4950,6 +5633,7 @@ def execute_parent_repair(
             parent_key,
             reservation,
             observed_effects,
+            refresh_api,
         )
         return RepairExecutionResult(
             parent_key,
@@ -5255,6 +5939,7 @@ def _read_smoke_reservation_authority(
     github: GitHubRunner,
     parent_key: str,
     reservation: dict[str, object],
+    refresh_api=None,
 ) -> tuple[object, ...]:
     parent = parse_issue_detail(
         runner.run(["issue", "get", parent_key, "--output", "json"]),
@@ -5265,15 +5950,37 @@ def _read_smoke_reservation_authority(
             ["issue", "metadata", "list", parent_key, "--output", "json"]
         )
     )
+    authoritative_refresh_state = None
+    if any(key.startswith(refresh.REFRESH_PREFIX) for key in raw_parent_metadata):
+        if refresh_api is None:
+            raise RuntimeError(
+                "refresh requires an explicitly configured authoritative reader")
+        authoritative_refresh_state = refresh_api.snapshot(parent_key)
+        if authoritative_refresh_state.state()["metadata"] != raw_parent_metadata:
+            raise RuntimeError("refresh authority changed during smoke read")
     parent_metadata = _parent_metadata(raw_parent_metadata)
+    consumed_authorization_uuid = str(
+        parent_metadata["consumed_authorization_uuid"]
+    )
+    consumed_authorizing_comment = None
+    if consumed_authorization_uuid:
+        consumed_authorizing_comment = _read_parent_authorization(
+            runner,
+            parent_key,
+            consumed_authorization_uuid,
+        )
     children = parse_issue_children(
         runner.run(["issue", "children", parent_key, "--output", "json"]),
         str(parent["id"]),
+    )
+    superseded_gate_ids = _request_bound_superseded_gate_ids(
+        authoritative_refresh_state
     )
     smoke_stage = int(reservation["next_stage"])
     source_children = tuple(
         child for child in children if child["stage"] is not None
         and int(child["stage"]) < smoke_stage
+        and str(child["id"]) not in superseded_gate_ids
     )
     smoke_children = tuple(
         child for child in children if child["stage"] == smoke_stage
@@ -5439,9 +6146,19 @@ def _read_smoke_reservation_authority(
         delivery_lead_id=assignment_authority[3],
         delivery_squad_leader_id=assignment_authority[4],
         delivery_squad_members=assignment_authority[5],
+        consumed_authorization_uuid=consumed_authorization_uuid,
+        consumed_authorizing_comment=consumed_authorizing_comment,
+        refresh_state=authoritative_refresh_state,
+    )
+    refresh_hold_reason = _dedicated_refresh_hold_reason(source_snapshot)
+    if refresh_hold_reason is not None:
+        raise RuntimeError(refresh_hold_reason)
+    historical_authorization_problem = (
+        _historical_round_three_authorization_problem(source_snapshot)
     )
     if (
-        not _historical_gate_identity_matches(source_snapshot, source_gate)
+        historical_authorization_problem is not None
+        or not _historical_gate_identity_matches(source_snapshot, source_gate)
         or any(item.status != "done" or item.result != "pass" for item in source_gate)
         or any(
             item.state != "merged"
@@ -5541,6 +6258,7 @@ def _read_smoke_reservation_authority(
         authorization_comment,
         source_smoke_evidence,
         assignment_authority,
+        consumed_authorizing_comment,
     )
 
 
@@ -5549,12 +6267,13 @@ def _require_stable_smoke_reservation_authority(
     github: GitHubRunner,
     parent_key: str,
     reservation: dict[str, object],
+    refresh_api=None,
 ) -> tuple[object, ...]:
     first = _read_smoke_reservation_authority(
-        runner, github, parent_key, reservation
+        runner, github, parent_key, reservation, refresh_api
     )
     second = _read_smoke_reservation_authority(
-        runner, github, parent_key, reservation
+        runner, github, parent_key, reservation, refresh_api
     )
     if first != second:
         raise RuntimeError("smoke reservation authority changed during read")
@@ -5567,10 +6286,13 @@ def _start_committed_smoke_child(
     parent_key: str,
     action_key: str,
     effects: list[int],
+    refresh_api=None,
 ) -> SmokeExecutionResult:
     """Start a smoke child only after its parent assignment is committed."""
 
-    snapshot = load_parent_snapshot(runner, github, parent_key)
+    snapshot = load_parent_snapshot(
+        runner, github, parent_key, refresh_api=refresh_api
+    )
     current = tuple(
         item for item in snapshot.children if item.stage == snapshot.next_stage - 1
     )
@@ -5658,16 +6380,21 @@ def _reconcile_committed_smoke_reservation(
     parent_key: str,
     reservation: dict[str, object],
     effects: list[int],
+    refresh_api=None,
 ) -> SmokeExecutionResult | None:
     """Clear a reservation whose exact smoke assignment already committed."""
 
-    first = load_parent_snapshot(runner, github, parent_key)
+    first = load_parent_snapshot(
+        runner, github, parent_key, refresh_api=refresh_api
+    )
     if (
         first.last_action != reservation["action_key"]
         and first.next_stage != int(reservation["next_stage"]) + 1
     ):
         return None
-    second = load_parent_snapshot(runner, github, parent_key)
+    second = load_parent_snapshot(
+        runner, github, parent_key, refresh_api=refresh_api
+    )
     if first != second:
         raise RuntimeError("committed smoke authority changed during read")
     if (
@@ -5738,7 +6465,9 @@ def _reconcile_committed_smoke_reservation(
         reservation_key=SMOKE_RESERVATION_KEY,
         reservation_value=None,
     )
-    final = load_parent_snapshot(runner, github, parent_key)
+    final = load_parent_snapshot(
+        runner, github, parent_key, refresh_api=refresh_api
+    )
     final_current = tuple(
         item for item in final.children if item.stage == final.next_stage - 1
     )
@@ -5754,6 +6483,7 @@ def _reconcile_committed_smoke_reservation(
             parent_key,
             str(reservation["action_key"]),
             effects,
+            refresh_api,
         )
     return SmokeExecutionResult(
         parent_key,
@@ -5771,9 +6501,10 @@ def _resume_smoke_reservation(
     parent_key: str,
     reservation: dict[str, object],
     effects: list[int],
+    refresh_api=None,
 ) -> SmokeExecutionResult:
     first = _require_stable_smoke_reservation_authority(
-        runner, github, parent_key, reservation
+        runner, github, parent_key, reservation, refresh_api
     )
     if not any(
         item["stage"] == reservation["next_stage"] for item in first[2]
@@ -5796,7 +6527,7 @@ def _resume_smoke_reservation(
         except RuntimeError:
             pass
         first = _require_stable_smoke_reservation_authority(
-            runner, github, parent_key, reservation
+            runner, github, parent_key, reservation, refresh_api
         )
         created = [
             item for item in first[2]
@@ -5815,19 +6546,19 @@ def _resume_smoke_reservation(
     prefix_length = len(first[4])
     for index in range(prefix_length, len(expected_items)):
         before = _require_stable_smoke_reservation_authority(
-            runner, github, parent_key, reservation
+            runner, github, parent_key, reservation, refresh_api
         )
         if len(before[4]) != index:
             raise RuntimeError("smoke metadata prefix changed before write")
         key, value = expected_items[index]
         effects[0] += _metadata_set_observed(runner, child_key, key, value)
         after = _require_stable_smoke_reservation_authority(
-            runner, github, parent_key, reservation
+            runner, github, parent_key, reservation, refresh_api
         )
         if len(after[4]) != index + 1:
             raise RuntimeError("smoke metadata prefix reconciliation failed")
     _require_stable_smoke_reservation_authority(
-        runner, github, parent_key, reservation
+        runner, github, parent_key, reservation, refresh_api
     )
     if reservation["mode"] == "retry":
         effects[0] += _parent_status_set_observed(
@@ -5837,7 +6568,7 @@ def _resume_smoke_reservation(
             desired="in_progress",
         )
         _require_stable_smoke_reservation_authority(
-            runner, github, parent_key, reservation
+            runner, github, parent_key, reservation, refresh_api
         )
     desired_parent = {
         "eventra.workflow.next_stage": str(int(reservation["next_stage"]) + 1),
@@ -5849,14 +6580,14 @@ def _resume_smoke_reservation(
         )
     for key, value in desired_parent.items():
         _require_stable_smoke_reservation_authority(
-            runner, github, parent_key, reservation
+            runner, github, parent_key, reservation, refresh_api
         )
         effects[0] += _metadata_set_observed(runner, parent_key, key, value)
         _require_stable_smoke_reservation_authority(
-            runner, github, parent_key, reservation
+            runner, github, parent_key, reservation, refresh_api
         )
     _require_stable_smoke_reservation_authority(
-        runner, github, parent_key, reservation
+        runner, github, parent_key, reservation, refresh_api
     )
     effects[0] += _metadata_delete_observed(
         runner, parent_key, SMOKE_RESERVATION_KEY
@@ -5873,6 +6604,7 @@ def _resume_smoke_reservation(
         parent_key,
         str(reservation["action_key"]),
         effects,
+        refresh_api,
     )
 
 
@@ -5882,6 +6614,7 @@ def execute_parent_smoke(
     parent_key: str,
     *,
     expected_action_key: str,
+    refresh_api=None,
 ) -> SmokeExecutionResult:
     effects = [0]
     try:
@@ -5914,6 +6647,7 @@ def execute_parent_smoke(
                     parent_key,
                     reservation,
                     effects,
+                    refresh_api,
                 )
                 if reconciled is not None:
                     return reconciled
@@ -5923,8 +6657,13 @@ def execute_parent_smoke(
                 parent_key,
                 reservation,
                 effects,
+                refresh_api,
             )
-        snapshot = load_parent_snapshot(runner, github, parent_key)
+        snapshot = load_parent_snapshot(
+            runner, github, parent_key, refresh_api=refresh_api)
+        refresh_hold_reason = _dedicated_refresh_hold_reason(snapshot)
+        if refresh_hold_reason is not None:
+            raise RuntimeError(refresh_hold_reason)
         if snapshot.last_action == expected_action_key:
             current = tuple(
                 item
@@ -5939,6 +6678,7 @@ def execute_parent_smoke(
                 parent_key,
                 expected_action_key,
                 effects,
+                refresh_api,
             )
         decision = decide_parent_action(snapshot)
         if (
@@ -5946,7 +6686,8 @@ def execute_parent_smoke(
             or decision.action_key != expected_action_key
         ):
             raise RuntimeError("fresh parent plan does not authorize smoke action")
-        fresh_snapshot = load_parent_snapshot(runner, github, parent_key)
+        fresh_snapshot = load_parent_snapshot(
+            runner, github, parent_key, refresh_api=refresh_api)
         fresh_decision = decide_parent_action(fresh_snapshot)
         if fresh_snapshot != snapshot or fresh_decision != decision:
             raise RuntimeError(
@@ -5969,6 +6710,7 @@ def execute_parent_smoke(
             parent_key,
             reservation,
             effects,
+            refresh_api,
         )
     except (RuntimeError, ValueError, KeyError, TypeError) as error:
         return SmokeExecutionResult(
@@ -5981,6 +6723,15 @@ def execute_parent_smoke(
 
 
 def _has_phase_completion(metadata: dict[str, str]) -> bool:
+    if metadata.get("eventra.phase.kind") == "refresh":
+        try:
+            _refresh_phase_provenance(metadata)
+        except RuntimeError:
+            return False
+        return (metadata.get("eventra.phase.result") in PHASE_RESULTS
+                and _is_uuid(metadata.get("eventra.phase.evidence_comment"))
+                and SHA_PATTERN.fullmatch(metadata.get("eventra.phase.sha.frontend", "")) is not None
+                and metadata.get("eventra.phase.failure_repositories", "[]") == "[]")
     version = metadata.get("eventra.workflow.version")
     if version not in {"1", "2"}:
         return False
@@ -6040,6 +6791,71 @@ def _is_uuid(value: str | None) -> bool:
         return False
 
 
+def _refresh_reservation_is_watcher_safe(feature: dict[str, object]) -> bool:
+    """Recognize only a typed refresh checkpoint that Watcher must not rerun."""
+
+    reservation = feature.get("reservation")
+    if (type(reservation) is not dict
+            or set(reservation) != refresh_executor.RESERVATION_FIELDS):
+        return False
+    try:
+        request = refresh.parse_request(feature["request"])
+        payload = request.payload()
+    except (KeyError, TypeError, ValueError):
+        return False
+    state = reservation.get("state")
+    if (reservation.get("version") != 1
+            or reservation.get("request_digest") != request.digest
+            or not _is_uuid(reservation.get("authorization_uuid"))
+            or feature.get("authorization_comment")
+                != reservation.get("authorization_uuid")
+            or reservation.get("action_key") != refresh.refresh_action(request)
+            or state not in refresh.RESERVATION_STATES
+            or type(reservation.get("parent_status_category")) is not str
+            or not reservation["parent_status_category"]
+            or type(reservation.get("parent_position")) is not int
+            or type(reservation.get("parent_projection_digest")) is not str
+            or re.fullmatch(
+                r"[0-9a-f]{64}", reservation["parent_projection_digest"]
+            ) is None):
+        return False
+    if state == "reserved":
+        return all(reservation.get(key) is None for key in (
+            "child_id", "child_identifier", "child_position", "prepared"))
+    if (not _is_uuid(reservation.get("child_id"))
+            or type(reservation.get("child_identifier")) is not str
+            or ISSUE_KEY_PATTERN.fullmatch(reservation["child_identifier"]) is None
+            or type(reservation.get("child_position")) is not int):
+        return False
+    prepared = reservation.get("prepared")
+    if state in {"child_initialized", "child_dispatched"}:
+        return prepared is None
+    fields = {
+        "request_digest", "child_id", "source_sha", "prerequisite_sha",
+        "target_sha", "tree_sha", "evidence_uuid", "evidence_digest",
+        "staging_ref",
+    }
+    return (
+        type(prepared) is dict
+        and set(prepared) == fields
+        and prepared.get("request_digest") == request.digest
+        and prepared.get("child_id") == reservation["child_id"]
+        and prepared.get("source_sha") == payload["source"]["sha"]
+        and prepared.get("prerequisite_sha")
+            == payload["prerequisite"]["merge_sha"]
+        and type(prepared.get("target_sha")) is str
+        and SHA_PATTERN.fullmatch(prepared["target_sha"]) is not None
+        and prepared["target_sha"] not in {
+            prepared["source_sha"], prepared["prerequisite_sha"]}
+        and type(prepared.get("tree_sha")) is str
+        and SHA_PATTERN.fullmatch(prepared["tree_sha"]) is not None
+        and _is_uuid(prepared.get("evidence_uuid"))
+        and type(prepared.get("evidence_digest")) is str
+        and re.fullmatch(r"[0-9a-f]{64}", prepared["evidence_digest"]) is not None
+        and prepared.get("staging_ref") == request.staging_ref
+    )
+
+
 def _is_human_wait(issue: dict[str, object]) -> bool:
     return (
         issue["assignee_type"] == "member"
@@ -6052,6 +6868,7 @@ def load_workflow_snapshot(
     parent_key: str,
     project_ids: Sequence[str] = (),
     github: GitHubRunner | None = None,
+    refresh_api=None,
 ) -> WorkflowSnapshot:
     """Read one complete parent/child/run view from authoritative CLI reads."""
 
@@ -6068,17 +6885,71 @@ def load_workflow_snapshot(
     if workflow_version not in {"1", "2"}:
         raise RuntimeError("unsupported workflow metadata")
     decoded_parent: dict[str, object] | None = None
+    refresh_reservation_state = ""
+    refresh_hold_reason = ""
+    refresh_metadata_malformed = False
+    authoritative_refresh_state = None
+    has_refresh_metadata = any(
+        key.startswith(refresh.REFRESH_PREFIX) for key in parent_metadata)
     assignment_agent_ids: tuple[tuple[str, str], ...] = ()
     assignment_project_ids: tuple[tuple[str, str], ...] = ()
     delivery_squad_id = ""
     delivery_lead_id = ""
     delivery_squad_leader_id = ""
     delivery_squad_members: tuple[tuple[str, str, str], ...] = ()
+    consumed_authorizing_comment = None
+    consumed_authorization_malformed = False
     if workflow_version == "2":
         try:
             decoded_parent = _parent_metadata(parent_metadata)
         except RuntimeError:
             decoded_parent = None
+            refresh_metadata_malformed = has_refresh_metadata
+        if decoded_parent is not None and decoded_parent["refresh_feature"] is not None:
+            feature = decoded_parent["refresh_feature"]
+            reservation = feature.get("reservation")
+            if refresh_api is None:
+                refresh_metadata_malformed = True
+            else:
+                try:
+                    authority = refresh_api.snapshot(parent_key)
+                    authority_state = authority.state()
+                    authority_feature = refresh.refresh_metadata(
+                        authority_state["metadata"])
+                    authority_request = refresh.parse_request(
+                        authority_feature["request"])
+                    authority_decision = refresh.plan_refresh(
+                        authority_request, authority)
+                    if (
+                        authority_state["metadata"] != parent_metadata
+                        or authority_feature != feature
+                        or authority_decision.kind == "block"
+                    ):
+                        raise RuntimeError
+                    if (
+                        reservation is not None
+                        and refresh.refresh_protocol(authority_request) == 1
+                        and not _refresh_reservation_is_watcher_safe(feature)
+                    ):
+                        raise RuntimeError
+                    protocol = refresh.refresh_protocol(authority_request)
+                    if protocol == 2:
+                        authoritative_refresh_state = authority
+                    if reservation is not None:
+                        refresh_reservation_state = str(reservation["state"])
+                except (AttributeError, KeyError, RuntimeError,
+                        TypeError, ValueError):
+                    refresh_metadata_malformed = True
+        if decoded_parent is not None:
+            consumed_uuid = str(
+                decoded_parent["consumed_authorization_uuid"])
+            if consumed_uuid:
+                try:
+                    consumed_authorizing_comment = (
+                        _read_parent_authorization(
+                            runner, parent_key, consumed_uuid))
+                except (RuntimeError, TypeError, ValueError):
+                    consumed_authorization_malformed = True
         if project_ids:
             try:
                 authority = _exact_assignment_authority(runner)
@@ -6098,6 +6969,9 @@ def load_workflow_snapshot(
     children = parse_issue_children(
         runner.run(["issue", "children", parent_key, "--output", "json"]),
         str(parent["id"]),
+    )
+    superseded_gate_ids = _request_bound_superseded_gate_ids(
+        authoritative_refresh_state
     )
     parent_runs = parse_issue_runs(
         runner.run(["issue", "runs", parent_key, "--output", "json"]),
@@ -6123,7 +6997,11 @@ def load_workflow_snapshot(
         has_active = any(item["status"] in ACTIVE_RUN_STATUSES for item in runs)
         has_human_wait = has_human_wait or _is_human_wait(child)
         phase_value = None
-        if child["stage"] is not None and workflow_version == "2":
+        if (
+            child["stage"] is not None
+            and workflow_version == "2"
+            and str(child["id"]) not in superseded_gate_ids
+        ):
             try:
                 phase_value = _phase_snapshot(child, metadata)
             except (RuntimeError, TypeError, ValueError):
@@ -6195,6 +7073,18 @@ def load_workflow_snapshot(
     except (RuntimeError, TypeError, ValueError):
         evidence_authority_malformed = True
 
+    if (decoded_parent is not None
+            and decoded_parent["consumed_authorization_uuid"]):
+        try:
+            stable_consumed_comment = _read_parent_authorization(
+                runner, parent_key,
+                str(decoded_parent["consumed_authorization_uuid"]),
+            )
+            if stable_consumed_comment != consumed_authorizing_comment:
+                consumed_authorization_malformed = True
+        except (RuntimeError, TypeError, ValueError):
+            consumed_authorization_malformed = True
+
     next_stage_text = parent_metadata.get("eventra.workflow.next_stage")
     current_stage = (
         int(next_stage_text) - 1
@@ -6210,6 +7100,7 @@ def load_workflow_snapshot(
     ]
     malformed_current_stage = workflow_version == "2" and (
         evidence_authority_malformed
+        or consumed_authorization_malformed
         or current_stage is None
         or any(int(item["stage"]) > current_stage for item in staged)
         or (bool(staged) and not current_stage_children)
@@ -6309,6 +7200,7 @@ def load_workflow_snapshot(
                 consumed_authorization_uuid=str(
                     decoded_parent["consumed_authorization_uuid"]
                 ),
+                consumed_authorizing_comment=consumed_authorizing_comment,
                 repair_reservation=decoded_parent["repair_reservation"],
                 smoke_reservation=decoded_parent["smoke_reservation"],
                 parent_id=str(parent["id"]),
@@ -6325,9 +7217,18 @@ def load_workflow_snapshot(
                 delivery_lead_id=delivery_lead_id,
                 delivery_squad_leader_id=delivery_squad_leader_id,
                 delivery_squad_members=delivery_squad_members,
+                refresh_state=authoritative_refresh_state,
             )
         except (KeyError, RuntimeError, TypeError, ValueError):
             parent_snapshot = None
+            malformed_current_stage = True
+    if parent_snapshot is not None and authoritative_refresh_state is not None:
+        try:
+            refresh_hold_reason = (
+                _dedicated_refresh_hold_reason(parent_snapshot) or ""
+            )
+        except RuntimeError:
+            refresh_metadata_malformed = True
             malformed_current_stage = True
     return WorkflowSnapshot(
         parent_issue_id=str(parent["id"]),
@@ -6358,6 +7259,9 @@ def load_workflow_snapshot(
         delivery_lead_id=delivery_lead_id,
         delivery_squad_leader_id=delivery_squad_leader_id,
         delivery_squad_members=delivery_squad_members,
+        refresh_reservation_state=refresh_reservation_state,
+        refresh_hold_reason=refresh_hold_reason,
+        refresh_metadata_malformed=refresh_metadata_malformed,
     )
 
 
@@ -6433,6 +7337,7 @@ def watch_projects(
     *,
     apply: bool,
     github: GitHubRunner | None = None,
+    refresh_api=None,
 ) -> WatchResult:
     """Scan only the configured projects and recover at most one workflow."""
 
@@ -6442,6 +7347,7 @@ def watch_projects(
     parent_keys = _list_workflow_parents(runner, project_ids)
     candidates: list[tuple[str, RecoveryDecision]] = []
     migrations: list[tuple[str, RecoveryDecision]] = []
+    refresh_waits: list[tuple[str, RecoveryDecision]] = []
     for parent_key in parent_keys:
         decision = decide_recovery(
             load_workflow_snapshot(
@@ -6449,10 +7355,19 @@ def watch_projects(
                 parent_key,
                 project_ids,
                 authoritative_github,
+                refresh_api,
             )
         )
         if decision.reason == "version 1 workflow requires explicit migration":
             migrations.append((parent_key, decision))
+        elif (
+            decision.kind == "noop"
+            and (
+                decision.reason.startswith("refresh reservation ")
+                or decision.reason.startswith("dedicated refresh ")
+            )
+        ):
+            refresh_waits.append((parent_key, decision))
         elif decision.kind != "noop":
             candidates.append((parent_key, decision))
     if migrations:
@@ -6464,11 +7379,15 @@ def watch_projects(
             "version 1 workflow requires explicit migration",
         )
     if not candidates:
+        if refresh_waits:
+            return WatchResult(
+                len(parent_keys), 0, 0, "noop", refresh_waits[0][1].reason)
         return WatchResult(len(parent_keys), 0, 0, "noop")
     first_parent, first_decision = candidates[0]
     if not apply:
         return WatchResult(
-            len(parent_keys), len(candidates), 0, first_decision.kind
+            len(parent_keys), len(candidates), 0, first_decision.kind,
+            first_decision.reason if first_decision.kind == "block" else "",
         )
     recovered = recover_once(
         runner,
@@ -6477,6 +7396,7 @@ def watch_projects(
             first_parent,
             project_ids,
             authoritative_github,
+            refresh_api,
         ),
     )
     return WatchResult(
@@ -6484,6 +7404,7 @@ def watch_projects(
         len(candidates),
         recovered.mutation_count,
         recovered.decision.kind,
+        recovered.decision.reason if recovered.decision.kind == "block" else "",
     )
 
 
@@ -6668,6 +7589,7 @@ def _finish_phase_authority_problem(
     metadata: dict[str, str],
     value: PhaseCompletion,
     implementation_pr_authority: PullRequestSnapshot | None = None,
+    refresh_api=None,
 ) -> str | None:
     parent_id = str(detail["parent_issue_id"])
     raw_parent = runner.run(
@@ -6709,6 +7631,14 @@ def _finish_phase_authority_problem(
         parent_workflow = _parent_metadata(parent_metadata)
     except RuntimeError:
         return "authoritative parent or child relationship is malformed"
+    refresh_feature = parent_workflow["refresh_feature"]
+    if refresh_feature is not None:
+        try:
+            _reject_refresh_parent_for_ordinary_finish(
+                runner, detail, refresh_api
+            )
+        except RuntimeError as error:
+            return str(error)
     next_stage = int(parent_workflow["next_stage"])
     attempt = int(parent_workflow["attempt"])
     if (
@@ -6744,6 +7674,7 @@ def _finish_phase_authority_problem(
                 runner,
                 GitHubRunner(),
                 str(parent["identifier"]),
+                refresh_api=refresh_api,
             )
         except (RuntimeError, TypeError, ValueError):
             return "authoritative nonrepair assignment provenance is malformed"
@@ -6901,6 +7832,7 @@ def _finish_phase_authority_problem(
                     runner,
                     GitHubRunner(),
                     str(parent["identifier"]),
+                    refresh_api=refresh_api,
                 )
             except (RuntimeError, TypeError, ValueError):
                 return "authoritative current repair snapshot is malformed"
@@ -7163,10 +8095,54 @@ def _finish_implementation_pr_authority(
     return pull_request
 
 
+def _reject_refresh_parent_for_ordinary_finish(
+    runner: MulticaRunner,
+    detail: dict[str, object],
+    refresh_api=None,
+) -> None:
+    raw_parent = runner.run(
+        ["issue", "get", str(detail["parent_issue_id"]), "--output", "json"])
+    if type(raw_parent) is not dict or type(raw_parent.get("identifier")) is not str:
+        raise RuntimeError("authoritative parent detail is malformed")
+    metadata = parse_issue_metadata(runner.run([
+        "issue", "metadata", "list", raw_parent["identifier"],
+        "--output", "json",
+    ]))
+    if any(key.startswith(refresh.REFRESH_PREFIX) for key in metadata):
+        try:
+            feature = refresh.refresh_metadata(metadata)
+        except (TypeError, ValueError):
+            raise RuntimeError("refresh workflow metadata is malformed") from None
+        if feature is None:
+            return
+        if refresh_api is None:
+            raise RuntimeError(
+                "refresh requires an explicitly configured authoritative reader")
+        try:
+            snapshot = refresh_api.snapshot(str(raw_parent["identifier"]))
+            state = snapshot.state()
+            if (
+                state["parent"].get("id") != detail["parent_issue_id"]
+                or state["metadata"] != metadata
+            ):
+                raise RuntimeError
+            request = refresh.parse_request(feature["request"])
+            decision = refresh.plan_refresh(request, snapshot)
+            hold_reason = _dedicated_refresh_decision_hold_reason(decision)
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+            raise RuntimeError(
+                "refresh workflow authority is conflicting"
+            ) from None
+        if hold_reason is not None:
+            raise RuntimeError(hold_reason)
+
+
 def finish_phase(
     runner: MulticaRunner,
     issue_key: str,
     value: PhaseCompletion,
+    *,
+    refresh_api=None,
 ) -> PhaseResult:
     """Write, verify, and terminally finish one staged child phase."""
 
@@ -7179,6 +8155,7 @@ def finish_phase(
     )
     if detail["parent_issue_id"] is None or detail["stage"] is None:
         raise RuntimeError("phase completion requires a staged child issue")
+    _reject_refresh_parent_for_ordinary_finish(runner, detail, refresh_api)
     before = parse_issue_metadata(
         runner.run(["issue", "metadata", "list", issue_key, "--output", "json"])
     )
@@ -7214,6 +8191,7 @@ def finish_phase(
                 before,
                 value,
                 implementation_pr_authority,
+                refresh_api,
             )
             if authority_problem is not None:
                 raise RuntimeError(authority_problem)
@@ -7275,6 +8253,7 @@ def finish_phase(
         before,
         value,
         implementation_pr_authority,
+        refresh_api,
     )
     if authority_problem is not None:
         raise RuntimeError(authority_problem)
@@ -7526,6 +8505,9 @@ def finish_parent(
         raise RuntimeError("parent issue is not mutable")
 
     initial_snapshot = snapshot_loader()
+    refresh_hold_reason = _dedicated_refresh_hold_reason(initial_snapshot)
+    if refresh_hold_reason is not None:
+        raise RuntimeError(refresh_hold_reason)
     initial_decision = decide_parent_action(initial_snapshot)
     fresh_snapshot = snapshot_loader()
     fresh_decision = decide_parent_action(fresh_snapshot)
@@ -7605,6 +8587,23 @@ def build_workflow_parser() -> argparse.ArgumentParser:
     )
     plan_parent = subparsers.add_parser("plan-parent")
     plan_parent.add_argument("parent")
+    plan_refresh = subparsers.add_parser("plan-refresh")
+    plan_refresh.add_argument("parent")
+    plan_refresh.add_argument("--prerequisite-pr", required=True)
+    plan_refresh.add_argument("--control-tool-sha", required=True)
+    plan_refresh.add_argument("--supersede-pristine-gates", action="store_true")
+    stage_refresh = subparsers.add_parser("stage-refresh-request")
+    stage_refresh.add_argument("parent")
+    stage_refresh.add_argument("--request-file", required=True)
+    execute_refresh = subparsers.add_parser("execute-parent-refresh")
+    execute_refresh.add_argument("parent")
+    execute_refresh.add_argument("--request-comment", required=True)
+    execute_refresh.add_argument("--authorization-comment", required=True)
+    execute_refresh.add_argument("--expected-action-key", required=True)
+    finish_refresh = subparsers.add_parser("finish-refresh")
+    finish_refresh.add_argument("issue")
+    finish_refresh.add_argument("--result", required=True, choices=("pass", "fail", "blocked"))
+    finish_refresh.add_argument("--evidence-comment", required=True)
     execute_repair = subparsers.add_parser("execute-parent-repair")
     execute_repair.add_argument("parent")
     execute_repair.add_argument("--expected-action-key", required=True)
@@ -7694,10 +8693,115 @@ def print_smoke_execution_result(value: SmokeExecutionResult) -> None:
     )
 
 
+def _refresh_components(deployment: RefreshDeployment, runner, github,
+                        *, prerequisite_pr: str | None = None):
+    execution_root = Path(__file__).resolve().parents[2]
+    if deployment.control_root.resolve() != execution_root:
+        raise RuntimeError(
+            "refresh helper is not loaded from the executing control checkout")
+    scope = refresh_executor.RefreshScope(
+        deployment.profile, deployment.workspace_id,
+        deployment.approved_control_sha)
+    api = refresh_executor.RefreshAPI(
+        runner, github, deployment.control_root, scope=scope,
+        prerequisite_pr=prerequisite_pr)
+    return api, RefreshGit(deployment.frontend_root)
+
+
+def _configured_refresh_api(runner, github, *, mutation: bool):
+    if not os.environ.get("EVENTRA_REFRESH_DEPLOYMENT_FILE"):
+        return None
+    deployment = _load_refresh_deployment(mutation=mutation)
+    api, _ = _refresh_components(deployment, runner, github)
+    return api
+
+
+def _read_refresh_request_file(filename: str) -> refresh.RefreshRequest:
+    limit = refresh.MAX_REQUEST_BYTES * 2 + 2_048
+    try:
+        path = Path(filename).resolve(strict=True)
+        if not path.is_file() or path.stat().st_size > limit:
+            raise RuntimeError
+        raw = refresh._load_json(
+            path.read_text(encoding="utf-8"), limit)
+        common_plan_fields = {
+            "action_key", "grant_comment", "mutation_count", "request",
+            "request_comment",
+        }
+        if type(raw) is dict and common_plan_fields <= set(raw):
+            if (type(raw["mutation_count"]) is not int
+                    or raw["mutation_count"] != 0):
+                raise RuntimeError
+            request = refresh.parse_request(raw["request"])
+            protocol = refresh.refresh_protocol(request)
+            plan_fields = common_plan_fields | (
+                {"supersession_preview"} if protocol == 2 else set())
+            if set(raw) != plan_fields:
+                raise RuntimeError
+            if (raw["action_key"] != refresh.refresh_action(request)
+                    or raw["request_comment"]
+                        != _refresh_block(
+                            "request", raw["request"], protocol=protocol)):
+                raise RuntimeError
+            grant = {
+                "schema_version": protocol, "request_digest": request.digest,
+                "granted_refresh": 1,
+            }
+            if raw["grant_comment"] != _refresh_block(
+                    "grant", grant, protocol=protocol):
+                raise RuntimeError
+            if (protocol == 2 and raw["supersession_preview"] !=
+                    list(refresh.supersession_preview(request))):
+                raise RuntimeError
+            return request
+        return refresh.parse_request(raw)
+    except (OSError, UnicodeError, ValueError, RuntimeError):
+        raise RuntimeError("refresh request file is invalid") from None
+
+
+def _refresh_block(kind: str, value: object, *, protocol: int = 1) -> str:
+    return ("```eventra-candidate-refresh-" + kind + f"-v{protocol}\n"
+            + refresh.canonical_json(value) + "\n```")
+
+
+def print_refresh_plan(request: refresh.RefreshRequest) -> None:
+    protocol = refresh.refresh_protocol(request)
+    envelope = {
+        "payload": request.payload(), "digest": request.digest,
+        "staging_ref": request.staging_ref,
+    }
+    grant = {
+        "schema_version": protocol, "request_digest": request.digest,
+        "granted_refresh": 1,
+    }
+    plan = {
+        "action_key": refresh.refresh_action(request),
+        "grant_comment": _refresh_block("grant", grant, protocol=protocol),
+        "mutation_count": 0,
+        "request": envelope,
+        "request_comment": _refresh_block("request", envelope, protocol=protocol),
+    }
+    if protocol == 2:
+        plan["supersession_preview"] = list(refresh.supersession_preview(request))
+    print(_canonical_json(plan))
+
+
+def print_refresh_execution_result(
+    value: refresh_executor.RefreshExecutionResult,
+) -> None:
+    print(_canonical_json({
+        "action_key": value.action_key,
+        "child": value.child_identifier,
+        "mutations": value.mutation_count,
+        "status": value.status,
+    }))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_workflow_parser().parse_args(argv)
     runner = MulticaRunner()
     if args.command == "finish-phase":
+        github = GitHubRunner()
         completion = PhaseCompletion(
             kind=args.kind,
             result=args.result,
@@ -7709,45 +8813,123 @@ def main(argv: Sequence[str] | None = None) -> int:
             responsible_repositories=tuple(args.responsible_repository),
             evidence_comment_url=args.evidence_comment_url,
         )
-        print_phase_result(finish_phase(runner, args.issue, completion))
+        print_phase_result(finish_phase(
+            runner, args.issue, completion,
+            refresh_api=_configured_refresh_api(
+                runner, github, mutation=True),
+        ))
     elif args.command == "plan-parent":
+        github = GitHubRunner()
         print_parent_decision(
             decide_parent_action(
-                load_parent_snapshot(runner, GitHubRunner(), args.parent)
+                load_parent_snapshot(
+                    runner, github, args.parent,
+                    refresh_api=_configured_refresh_api(
+                        runner, github, mutation=False),
+                )
             )
         )
+    elif args.command == "plan-refresh":
+        prerequisite_pr = _validated_pr_url(args.prerequisite_pr)
+        control_sha = _validated_sha(args.control_tool_sha)
+        deployment = _load_refresh_deployment(mutation=False)
+        if deployment.approved_control_sha != control_sha:
+            raise RuntimeError("refresh control SHA is not the approved deployment")
+        before = runner.mutation_count
+        api, _ = _refresh_components(
+            deployment, runner, GitHubRunner(), prerequisite_pr=prerequisite_pr)
+        request = refresh.freeze_refresh_request(
+            api.snapshot(args.parent),
+            supersede_pristine_gates=args.supersede_pristine_gates,
+        )
+        payload = request.payload()
+        if (payload["control_tool_sha"] != control_sha
+                or payload["prerequisite"]["pr_url"] != prerequisite_pr
+                or runner.mutation_count != before):
+            raise RuntimeError("refresh plan authority changed")
+        print_refresh_plan(request)
+    elif args.command == "stage-refresh-request":
+        request = _read_refresh_request_file(args.request_file)
+        payload = request.payload()
+        if payload["parent"]["identifier"] != args.parent:
+            raise RuntimeError("refresh request parent mismatch")
+        deployment = _load_refresh_deployment(mutation=True)
+        if deployment.approved_control_sha != payload["control_tool_sha"]:
+            raise RuntimeError("refresh request is not for the approved deployment")
+        api, _ = _refresh_components(
+            deployment, runner, GitHubRunner(),
+            prerequisite_pr=payload["prerequisite"]["pr_url"])
+        _require_refresh_mutation_contract(
+            deployment, request, args.parent)
+        print_refresh_execution_result(
+            refresh_executor.stage_refresh_request(api, args.parent, request))
+    elif args.command == "execute-parent-refresh":
+        deployment = _load_refresh_deployment(mutation=True)
+        api, git = _refresh_components(deployment, runner, GitHubRunner())
+        state = api.snapshot(args.parent).state()
+        request = refresh.parse_request(
+            state["metadata"].get(refresh.REFRESH_PREFIX + "request"))
+        _require_refresh_mutation_contract(
+            deployment, request, args.parent)
+        print_refresh_execution_result(refresh_executor.execute_refresh(
+            api, git, args.parent, args.request_comment,
+            args.authorization_comment, args.expected_action_key))
+    elif args.command == "finish-refresh":
+        deployment = _load_refresh_deployment(mutation=True)
+        api, git = _refresh_components(deployment, runner, GitHubRunner())
+        parent = api.parent_for_child(args.issue)
+        state = api.snapshot(parent).state()
+        request = refresh.parse_request(
+            state["metadata"].get(refresh.REFRESH_PREFIX + "request"))
+        _require_refresh_mutation_contract(deployment, request, parent)
+        print_refresh_execution_result(refresh_executor.finish_refresh(
+            api, git, args.issue, args.evidence_comment, args.result))
     elif args.command == "execute-parent-repair":
+        github = GitHubRunner()
         print_repair_execution_result(
             execute_parent_repair(
                 runner,
-                GitHubRunner(),
+                github,
                 args.parent,
                 expected_action_key=args.expected_action_key,
+                refresh_api=_configured_refresh_api(
+                    runner, github, mutation=True),
             )
         )
     elif args.command == "execute-parent-smoke":
+        github = GitHubRunner()
         print_smoke_execution_result(
             execute_parent_smoke(
                 runner,
-                GitHubRunner(),
+                github,
                 args.parent,
                 expected_action_key=args.expected_action_key,
+                refresh_api=_configured_refresh_api(
+                    runner, github, mutation=True),
             )
         )
     elif args.command == "finish-parent":
+        github = GitHubRunner()
+        refresh_api = _configured_refresh_api(
+            runner, github, mutation=True)
         print_parent_result(
             finish_parent(
                 runner,
                 args.parent,
-                lambda: load_parent_snapshot(runner, GitHubRunner(), args.parent),
+                lambda: load_parent_snapshot(
+                    runner, github, args.parent, refresh_api=refresh_api),
             )
         )
     elif args.command == "watch":
+        github = GitHubRunner()
         print_watch_result(
             watch_projects(
                 runner,
                 (args.project_id, args.backend_project_id),
                 apply=args.apply,
+                github=github,
+                refresh_api=_configured_refresh_api(
+                    runner, github, mutation=False),
             )
         )
     else:

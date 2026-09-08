@@ -36,18 +36,44 @@ payloads, or raw logs. Knowledge changes use a separate knowledge pull request
 with independent human review; QA neither edits business code nor self-merges
 knowledge.
 
+## Controlled refresh gate selection
+
+When a parent carries `eventra.refresh.version=2`, ignore the cancelled
+pristine Stage 2 QA child. It remains immutable superseded history and cannot
+be reused as a verdict or failure source. Accept work only from the fresh Stage
+4 QA child created after the permanent `eventra.refresh.supersession` receipt
+is durable and the refresh reservation has been removed. Reread the receipt,
+Stage 4 creation action, exact candidate SHA, assignee, Project, and managed PR
+before testing. Stop on a missing receipt, an active reservation, a reused
+Stage 2 child, or any SHA mismatch. A refresh grant authorizes candidate
+preparation only; it never authorizes QA PASS, merge, Smoke, deployment, or
+production mutation.
+
 ## Exact-SHA worktree preparation
 
-Before testing, inspect the Multica-managed task worktree and exclude only
-runtime-managed `AGENTS.md`, `.agent_context/`, and `.multica/`, plus a nested
-or sibling repository explicitly declared by the Project; any other change
-blocks QA. Fetch the handed-off PR ref or exact commit without moving a branch
-and verify `git rev-parse FETCH_HEAD` equals the handed-off SHA. Never switch,
-detach, reset, clean, or stash the Multica-managed task worktree. Create an
-owned directory outside it and materialize the immutable candidate with
-`git worktree add --detach TEMP_DIR FULL_SHA`. Verify `git -C TEMP_DIR
-rev-parse HEAD` and cleanliness before testing. Stop only processes started by
-this run, then remove only that owned temporary worktree.
+Require an explicit gate handoff with `runtime_workspace`,
+`inspection_workspace`, `candidate_sha`, and `control_tool_sha`.
+`inspection_workspace` must be a dedicated task-owned inspection worktree;
+never detach the runtime workspace. Before checkout, inspect the inspection
+worktree's cleanliness. Exclude only runtime-managed `AGENTS.md`,
+`.agent_context/`, and `.multica/`, plus a nested or sibling repository
+explicitly declared by the Project; any other change blocks QA. In the
+inspection worktree, fetch the handed-off PR ref or exact commit without moving
+a branch, verify `git rev-parse FETCH_HEAD` equals `candidate_sha`, then run
+`git switch --detach candidate_sha`. Verify both `git rev-parse HEAD` and
+cleanliness again before testing. Run the workflow helper only from the exact
+`control_tool_sha` checkout. Never reset, clean, stash, overwrite, fetch into,
+or switch the runtime workspace.
+Never switch, detach, reset, clean, or stash the Multica-managed task worktree.
+
+For an initial or retry Smoke, inspect the Multica-managed task worktree and
+apply the same allowed runtime exclusions, but never switch, detach, reset,
+clean, or stash it. Fetch the handed-off PR ref without moving its branch,
+verify `git rev-parse FETCH_HEAD` equals the candidate SHA, then create an owned
+directory outside it with `git worktree add --detach TEMP_DIR FULL_SHA`.
+Verify the temporary worktree's exact HEAD and cleanliness before testing.
+Stop only processes started by this run, then remove only that owned temporary
+worktree.
 
 For an initial or retry Smoke, perform a fresh fetch of every handed-off PR ref
 and require `FETCH_HEAD` to equal each unchanged candidate SHA. A retry action

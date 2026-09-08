@@ -112,6 +112,54 @@ SHAs, an exact backend readiness handoff on port 8080, and the full
 frontend-to-backend Smoke. Integration QA creates external detached temporary
 worktrees and must not move a Multica-managed task worktree branch.
 
+## Controlled candidate refresh
+
+Candidate refresh is a distinct control-plane transaction, not an ordinary
+phase completion. Set `EVENTRA_REFRESH_DEPLOYMENT_FILE` to the fixed
+operator-managed `~/.config/eventra/refresh-deployment.json`; mutating commands
+reject any other path. The record binds the Multica profile and
+workspace, absolute runtime and frontend roots, approved `control_tool_sha`,
+and the exact mutation contract. No environment-derived fallback is allowed.
+The helper must execute from that approved independent control-plane checkout;
+the runtime workspace is never detached or reused as a gate worktree.
+
+Run the read-only plan before asking a member for authorization:
+
+```text
+python3 -B -m tools.multica.workflow plan-refresh PRO-M --prerequisite-pr https://github.com/codeExploreHub/Eventra/pull/N --control-tool-sha FULL_SHA --supersede-pristine-gates > REFRESH_PLAN.json
+python3 -B -m tools.multica.workflow stage-refresh-request PRO-M --request-file REFRESH_PLAN.json
+python3 -B -m tools.multica.workflow execute-parent-refresh PRO-M --request-comment REQUEST_UUID --authorization-comment GRANT_UUID --expected-action-key ACTION_KEY
+python3 -B -m tools.multica.workflow finish-refresh PRO-N --result pass|fail|blocked --evidence-comment COMMENT_UUID
+python3 -B -m tools.multica.workflow execute-parent-refresh PRO-M --request-comment REQUEST_UUID --authorization-comment GRANT_UUID --expected-action-key ACTION_KEY
+```
+
+`plan-refresh` is read-only; save its whole canonical output. It contains the
+raw `request`, the exact `request_comment`, the member-only `grant_comment`, and
+`action_key`; `stage-refresh-request` accepts that whole file. After staging,
+post exactly `request_comment`, have a member independently post exactly
+`grant_comment`, and retain both server UUIDs. The first execute invocation
+binds those UUIDs, cancels exactly the two request-bound pristine Stage 2 gates
+with `--no-start`, and dispatches the preparation child in Stage 3. A chat
+approval, reaction, or prose acknowledgment is never the member grant; only the
+exact immutable member comment from `grant_comment` is valid. After the Engineer finishes the child,
+the second execute invocation publishes and adopts the registered candidate.
+Do not plan Stage 4 until it returns `adopted` and the permanent
+`eventra.refresh.supersession` receipt is present while the reservation is gone.
+Each mutation reloads authoritative state and fails closed on a changed SHA,
+comment, action key, scope, or deployment contract. A prepared PASS is not QA:
+it leaves the parent in a merge hold and
+never adopts the staged candidate. After publication, dispatch a fresh Stage 4
+with Independent Reviewer and Integration QA in task-owned inspection
+worktrees. Never reopen, delete, reinterpret, or reuse the cancelled Stage 2
+children. Only the fresh Stage 4 exact-SHA PASS may return control to the ordinary
+parent planner. Repair and replacement gates preserve the merge hold. A
+member's later exact-candidate merge authorization is independent of the
+earlier request/grant and is never inferred from it. The independent
+control-plane change must be reviewed and published before any live refresh is
+enabled. Run the Python control-plane suite first, then frontend checks serially
+(`lint` before `build`); record unavailable host fixtures as BLOCKED, never as
+an inferred PASS.
+
 ## Executable Stage protocol
 
 On the first run, classify `frontend-only`, `backend-only`, or `cross-stack`.

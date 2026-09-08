@@ -37,15 +37,36 @@ payloads, or raw logs. Do not mix knowledge edits into the reviewed business
 change: they require a separate knowledge pull request reviewed and merged by
 a human other than the candidate author.
 
+## Controlled refresh gate selection
+
+When a parent carries `eventra.refresh.version=2`, ignore the cancelled
+pristine Stage 2 Review child. It is retained only as superseded history and is
+not an assignment, failure, or prior approval. Accept work only from the fresh
+Stage 4 Review child created after the permanent
+`eventra.refresh.supersession` receipt is durable and the refresh reservation
+has been removed. Reread the receipt, Stage 4 creation action, target SHA,
+assignee, Project, and managed PR before reviewing. Stop on a missing receipt,
+an active reservation, a reused Stage 2 child, or any SHA mismatch. A refresh
+grant authorizes candidate preparation only; it never authorizes Review PASS,
+merge, Smoke, deployment, or production mutation.
+
 ## Exact-SHA worktree preparation
 
-Before checkout, inspect worktree cleanliness. Exclude only runtime-managed
-`AGENTS.md`, `.agent_context/`, and `.multica/`, plus a nested or sibling
-repository explicitly declared by the Project; any other change blocks the
-review. Fetch the handed-off PR ref or exact commit without moving a branch,
-verify `git rev-parse FETCH_HEAD` equals the handed-off SHA, then run
-`git switch --detach FULL_SHA`. Verify both `git rev-parse HEAD` and cleanliness
-again before reviewing. Never reset, clean, stash, or overwrite user work.
+Require an explicit gate handoff with `runtime_workspace`,
+`inspection_workspace`, `candidate_sha`, and `control_tool_sha`.
+`inspection_workspace` must be a dedicated task-owned inspection worktree;
+never detach the runtime workspace. Before checkout, inspect the inspection
+worktree's cleanliness. Exclude only runtime-managed `AGENTS.md`,
+`.agent_context/`, and `.multica/`, plus a nested or sibling repository
+explicitly declared by the Project; any other change blocks the review. In the
+inspection worktree, fetch the handed-off PR ref or exact commit without moving
+a branch, verify `git rev-parse FETCH_HEAD` equals `candidate_sha`, then run
+`git switch --detach candidate_sha`. Verify both `git rev-parse HEAD` and
+cleanliness again before reviewing. Run the workflow helper only from the exact
+`control_tool_sha` checkout. Never reset, clean, stash, overwrite, fetch into,
+or switch the runtime workspace.
+In the ordinary gate template, `FULL_SHA` is this bound `candidate_sha`, so the
+equivalent literal command is `git switch --detach FULL_SHA`.
 
 If the inspected SHA predates the automation helper, keep this worktree at the
 exact review SHA and run `tools.multica.workflow` only from the Delivery Lead's

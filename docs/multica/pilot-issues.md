@@ -9,6 +9,42 @@ after the read-only audit, dry run, and explicit live-mutation approval in the
 adapter runbook. Every Curator pass processes at most one candidate, stops a
 knowledge PR at human review, and must never merge or deploy.
 
+## Controlled candidate refresh pilot rule
+
+Run refresh only from an approved independent control-plane checkout. Set
+`EVENTRA_REFRESH_DEPLOYMENT_FILE` to the operator-managed fixed path
+`~/.config/eventra/refresh-deployment.json`; mutating commands reject any other
+path. Never infer its Multica scope, workspace paths, `control_tool_sha`, or
+mutation contract from ambient state. Use only this five-invocation sequence:
+
+```text
+python3 -B -m tools.multica.workflow plan-refresh PRO-M --prerequisite-pr https://github.com/codeExploreHub/Eventra/pull/N --control-tool-sha FULL_SHA --supersede-pristine-gates > REFRESH_PLAN.json
+python3 -B -m tools.multica.workflow stage-refresh-request PRO-M --request-file REFRESH_PLAN.json
+python3 -B -m tools.multica.workflow execute-parent-refresh PRO-M --request-comment REQUEST_UUID --authorization-comment GRANT_UUID --expected-action-key ACTION_KEY
+python3 -B -m tools.multica.workflow finish-refresh PRO-N --result pass|fail|blocked --evidence-comment COMMENT_UUID
+python3 -B -m tools.multica.workflow execute-parent-refresh PRO-M --request-comment REQUEST_UUID --authorization-comment GRANT_UUID --expected-action-key ACTION_KEY
+```
+
+Save the whole `plan-refresh` JSON. It contains `action_key`, the exact request
+comment, and the exact member grant. Stage that file, post the request, obtain a
+separate member-authored grant and retain both UUIDs, then run the first execute
+to cancel only the request-bound pristine Stage 2 Review/QA children and
+dispatch the preparation child in Stage 3. After `finish-refresh`, repeat
+execute with the same bound
+UUIDs and action key; continue only when it returns `adopted`.
+
+The worker, Reviewer, and QA handoffs distinguish `runtime_workspace` from a
+task-owned `inspection_workspace` and bind `candidate_sha` plus
+`control_tool_sha`; never detach the runtime workspace. A prepared PASS is not
+QA and cannot release the merge hold. It must be followed by a fresh Stage 4
+whose Independent Reviewer and Integration QA independently fetch and verify
+the exact candidate. Repair preserves the hold, and a member's later
+exact-candidate merge authorization is independent of the request/grant.
+Review and publish the independent control-plane commit before enabling any
+live refresh. Record Python control-plane tests first, then serial frontend lint
+and build evidence. A missing host fixture or blocked dependency is BLOCKED,
+not PASS.
+
 ## Dispatch and evidence rules (apply to every pilot)
 
 1. Create **one parent Issue** from the selected body. Bind it to the
@@ -267,6 +303,52 @@ PR. Neither child modifies the nested frontend `Backend/` directory.
 Independent Reviewer (exact SHA pair) and Integration QA (same exact SHA pair)
 → Delivery Lead coordinated merge decision. Any changed SHA invalidates the
 corresponding review or QA result and returns to its owning child.
+
+## PRO-122 controlled supersession pilot identities
+
+Use these identities only as the expected topology for a future explicitly
+approved live run; this document does not claim that any refresh mutation has
+happened:
+
+- `PRO-122`: frontend-only parent and sole refresh transaction owner.
+- `PRO-123`: completed Stage 1 implementation source whose exact PASS evidence,
+  managed PR, and source SHA are frozen by the request.
+- `PRO-124`: pristine Stage 2 Independent Reviewer child eligible for ordered
+  `--no-start` cancellation only when its ID, revision, assignment, empty
+  metadata/history, and authority digest match the request.
+- `PRO-125`: pristine Stage 2 Integration QA child eligible for the second
+  ordered cancellation under the same exact checks.
+
+Expected transition: freeze and preview with zero writes; stage the request;
+post the exact Delivery Lead request and separate member grant; cancel
+`PRO-124` then `PRO-125`; create one Stage 3 refresh preparation child; finish
+it with immutable v2 evidence; publish/adopt once; persist the permanent
+supersession receipt; remove the reservation; then create fresh Stage 4 Review
+and QA children at the adopted SHA. The cancelled Issues remain visible and
+must never be deleted, reopened, counted as gates, or used as repair evidence.
+Merge, Smoke, deployment, and production mutation require their existing
+separate authorities.
+
+## Candidate refresh control-plane verification
+
+The earlier 2026-09-06 isolated control-plane run is evidence for the helper
+code only; it is not a live refresh approval. That prior run passed 658 Python
+tests; current verification totals are recorded with the final branch receipt.
+The new combined tests cover every baseline-recorded mutation boundary before
+and after its effect, reject incompatible external writes without later effects,
+and use a real temporary Git repository plus bare remote for the complete refresh path.
+That path preserves Stage 1, leaves remote `master` unchanged, adopts only the
+staged candidate, requires ordered Stage 2 cancellation, Stage 3 preparation,
+and fresh Stage 4 Reviewer and QA gates, and ends at
+`human merge approval required` without deployment or Smoke.
+
+The serial frontend receipt is: local contract 4 PASS, footer metadata 14 PASS,
+layout hydration 1 PASS, dashboard profile 11 PASS, lint PASS with 34 existing
+warnings and zero errors, and production build PASS. The first sandboxed build
+could not reach its local font proxy; the unchanged build command passed under
+host execution. Knowledge verification returned the 12 existing indexed
+entries. Preserve the final full commit SHA and Context Receipt in the handoff;
+the receipt authorizes no live configuration, push, merge PR #14, or deploy.
 
 ## Parent closure checklist
 

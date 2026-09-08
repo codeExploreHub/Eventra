@@ -72,6 +72,8 @@ python3 -B -m tools.multica.knowledge verify --frontend-root . --backend-root /U
 
 ## Task 1: 固定请求、摘要和证据协议
 
+**执行状态（2026-09-04）：本地实现与回归完成。** 提交 `ebb0ac63e7b7bc15cc8a4f67164b34d57321c14c`；16 项协议测试先因缺接口 RED，再 GREEN。下列条目保留原计划；实测执行细节见同目录 `2026-09-04-eventra-candidate-refresh-batch-1.md`。
+
 **Files:** Create `candidate_refresh.py`, `tests/test_candidate_refresh.py`。
 
 **Interfaces:** 均在 `tools.multica.candidate_refresh` 中定义：
@@ -179,6 +181,8 @@ request = RefreshRequest(encoded, digest,
 
 ## Task 2: 真实 Git 合并对象与发布边界
 
+**执行状态（2026-09-04）：本地实现与回归完成。** 提交 `3f7d571a14af1e225593c04335100bba2a2e86fa`；16 项真实 Git 测试先因缺接口 RED，再 GREEN。尚未接入 live 执行入口；Task 3–9 待完成。
+
 **Files:** Create `refresh_git.py`, `tests/test_refresh_git.py`。
 
 **Interfaces:** `RefreshGit(repository_dir: pathlib.Path)`；方法
@@ -211,6 +215,8 @@ def test_reversed_parents_are_rejected(self):
 
 ## Task 3: 读取完整 authority 与精确请求预检
 
+**执行状态（2026-09-04）：本地实现与回归完成。** 提交 `effadc49f09930ce94a04b19dd50500899ebcba1`；18 项新增只读边界测试先 RED 后 GREEN。部署审批记录与 CLI 配置接线仍归 Task 8，不把调用者构造的 scope 当作部署批准。详见 `2026-09-04-eventra-candidate-refresh-batch-2.md`。
+
 **Files:** Create `refresh_executor.py`, `tests/test_refresh_executor.py`；Modify `candidate_refresh.py`。
 
 **Interfaces:** 在 candidate_refresh 定义
@@ -240,6 +246,8 @@ def test_no_api_revision_is_not_assumed_immutable(self):
 - [ ] 测试所有入口负例和跨 scope grant；记录 reads-only fake 的 writes 始终为空。Run 模块 GREEN；Commit：`feat(multica): bind refresh admission to authoritative snapshots`。
 
 ## Task 4: 纯状态机和旧 workflow 的防护接入
+
+**执行状态（2026-09-04）：本地实现与回归完成。** 提交 `3df04fa8f5c30de7a583702ff90d7ee8934f9313`；本批最终 Python 全量 584 项通过。完成纯状态建议、已采纳历史校验、旧 planner 绑定、fresh Stage 3 和持续 merge hold；Task 5–8 的真实写入、恢复、完成入口、Watcher/CLI 全面接线仍未完成。
 
 **Files:** Modify `candidate_refresh.py`, `workflow.py`, `tests/test_candidate_refresh.py`, `tests/test_workflow.py`。
 
@@ -273,11 +281,66 @@ def test_unadopted_refresh_cannot_open_gate(self):
 
 ## Task 5: 建立并恢复唯一刷新阶段
 
+**执行状态（2026-09-04）：协议修订方向已获用户同意，书面补充待审阅。** 官方 v0.4.38 的评论创建也推进父 Issue revision；现有请求缺少冻结 authority/评论基线，无法证明请求与 grant 发布后的合法推进。不得用固定 `+2` 或 `revision >= old` 放宽。此前 584 项回归通过，但不覆盖真实评论创建副作用；Task 5/6 尚未实现。证据见 `2026-09-04-eventra-candidate-refresh-batch-3-preflight.md`，修订见 `../specs/2026-09-04-eventra-candidate-refresh-authority-design.md`。该书面补充获准后先补 Task 3/4 的基线契约与真实副作用测试，再执行下列初始化步骤；原步骤不能绕过新增基线与部署契约要求。
+
+### Task 4A: 冻结基线的纯协议与容量边界
+
+**执行状态（2026-09-05）：本地实现与回归完成。** 请求现已强制绑定两份基线摘要；评论 manifest、完整稳定 authority 投影和元数据容量预检已实现。首个请求测试与评论/authority/容量测试均先 RED 后 GREEN；相关 76 项及 Python 全量 590 项通过。Task 4B 尚未实现，因此尚不能接受评论导致的合法 revision 推进，也不存在 live 写入口。
+
+**Files:** Modify `candidate_refresh.py`, `tests/test_candidate_refresh.py`。
+
+**Interfaces:** `comment_manifest(records, issue_id) -> list[dict[str, object]]`；
+`comment_manifest_digest(records, issue_id) -> str`；
+`authority_projection(snapshot) -> dict[str, object]`；
+`authority_digest(snapshot) -> str`；
+`validate_metadata_budget(metadata, *, request=None) -> None`。
+
+- [x] Request payload 增加精确 `baseline={authority_digest,comments_digest}`，两值均为 SHA-256；缺失、额外、错类型、非规范摘要拒绝。request envelope UTF-8 上限 3072 bytes。
+- [x] 先写 `BaselineContractTests.test_request_baseline_participates_in_digest`，用测试内独立 canonical JSON 计算期望 digest；运行单测，确认因未知 baseline 字段 RED。
+- [x] 最小实现 request baseline 校验并更新显式 fixture；运行 Request/Grant/Prepared/Git 契约回归 GREEN。
+- [x] 写评论清单 RED：完整记录规范成固定九字段，按 UUID 排序；正文只进入 content_digest。错 scope、未知字段、重复 UUID、缺 parent、错时间、折叠/分页输入拒绝。
+
+```python
+manifest = comment_manifest([root, reply], uid(2))
+self.assertEqual(manifest[0]["content_digest"], hashlib.sha256(b"old").hexdigest())
+self.assertNotIn("content", manifest[0])
+```
+
+- [x] 实现 strict manifest/digest；适配器在已有评论解析前复用它，不维护第二套宽松语义。Run GREEN。
+- [x] 写 authority 投影 RED：完整父/source detail、完整 metadata、assignment、PR/prerequisite/tool 均参与；只剔除三个活动/回显字段；未知 detail、echo metadata 冲突、非 blocked、非唯一 Stage 1 拒绝。
+- [x] 实现 canonical projection/digest；增加 metadata 整图 ASCII JSON 6144-byte、50-key、request 3072-byte 与 identifier 64 字符预算。峰值 fixture 必须验证，不截断/删除数据。Run candidate/executor/Git tests GREEN。
+- [x] Commit：`feat(multica): bind refresh requests to frozen authority baselines`。
+
+### Task 4B: 可信读取与评论 revision 前缀证明
+
+**执行状态（2026-09-05）：本地实现与全量回归完成。** 可信快照现携带完整父评论 manifest 并强制 detail/metadata echo 一致；freezer 从同一双读快照生成 request 两份基线。初始化验证只接受固定六笔 KV 与两条评论的合法前缀，以 `R0 + M + K` 和双摘要逆向还原证明当前 revision。完整绑定前只等待，完整绑定后才路由 refresh 初始化；普通 v2 全量回归未变。证据见 `2026-09-05-eventra-candidate-refresh-batch-3b.md`。Task 5 写接口仍未实现，不存在 live 写入。
+
+**Files:** Modify `refresh_executor.py`, `candidate_refresh.py`, `workflow.py`, `tests/test_refresh_executor.py`, `tests/test_candidate_refresh.py`, `tests/test_workflow.py`。
+
+**Interfaces:** `freeze_refresh_request(snapshot) -> RefreshRequest`；
+`InitialRefreshProgress(request, metadata_writes, comment_writes, request_comment, grant_comment)`；
+`validate_initial_refresh_progress(request, snapshot) -> InitialRefreshProgress`。
+
+- [x] 严格 read fake 模拟官方副作用：新评论与 changed KV 各将 parent revision +1；相同 KV 重放为 no-op。注入同 revision 差额但不同正文/parent 字段，必须零写入拒绝。
+- [x] 首个 RED 从 R0=7 执行四笔暂停 KV、request、grant、两个 UUID 绑定，验证 progress 为 M=6/K=2/current revision=15；不同内容但 revision 同为 15 拒绝。
+- [x] 快照保存完整 comment manifest 与 detail echo 校验；`freeze_refresh_request` 只接受 blocked、无 feature/reservation、唯一源和合法单 Lead authority，并由双读结果生成两摘要。
+- [x] `validate_initial_refresh_progress` 只接受固定 KV 前缀与 K=0/1/2；grant 无 request、评论出现在未完整暂停前缀、额外父评论、编辑/删除、旧评论充当新增均拒绝。
+- [x] 重构首次 admission 使用 progress 证明，不保留 `revision >=`、固定 `+2` 或 caller 覆盖 revision 的旁路；旧普通 v2 行为不变。Run candidate/executor/workflow GREEN。
+- [x] Commit：`feat(multica): prove refresh revision changes from exact writes`。
+
+完成 4A/4B 后才执行 Task 5。Task 5 每个 checkpoint 复用同一投影算法；任何写入前缀无法唯一逆向还原时停止。Task 8 仍需独立验证 pro-1 部署 mutation contract；本地 CLI 版本不构成启用许可。
+
 **Files:** Modify `refresh_executor.py`, `candidate_refresh.py`, `workflow.py`, `tests/test_refresh_executor.py`。
 
 **Interfaces:** `RefreshExecutionResult(action_key: str, status: str, mutation_count: int, child_identifier: str)`；
 `execute_refresh(api: RefreshAPI, git: RefreshGit, parent: str, request_uuid: str, grant_uuid: str, expected_action_key: str) -> RefreshExecutionResult`。
 本任务实现 reserved/child_initialized/child_dispatched；后续 publish 路径 Task7 接上。
+
+**分批执行状态（2026-09-05，Task 5A）：本地暂停登记完成。** `stage_refresh_request` 在 workspace+parent 非阻塞锁内只写固定四键前缀，每次写入均以 4B 的 baseline/revision 证明前后读回；写前/写后失败可安全重试，同值重放为 no-op。生产适配器仅增加受限 `set_metadata` 封装，尚未增加 status/child/run 写入，未接 CLI、未触碰 live。证据见 `2026-09-05-eventra-candidate-refresh-batch-3c.md`。Task 5B 的 reserved、child 创建/初始化/启动仍未实现，因此 Task 5 整体保持未完成。
+
+**分批执行状态（2026-09-05，Task 5B1）：授权绑定、reserved 与 child 创建恢复已完成。** executor 从已登记 request 重新读取请求，绑定精确 request/grant UUID，写后验证 revision=16 的 reserved checkpoint；child 创建 ACK 丢失后只接受唯一精确匹配的 Stage 2 backlog child，不按标题模糊追认。当前停在内部 `child_created`，尚未写 child provenance、父 next_stage/status 或启动 run；Task 5 整体仍未完成且不可上线。
+
+**分批执行状态（2026-09-05，Task 5B2）：本地初始化与派发闭环完成。** executor 只接受固定 child metadata 前缀，完整初始化后依次推进父 `next_stage`、`last_action` 和显式保留 position 的 `in_progress --no-start`，写入 `child_initialized` 后才启动唯一 Engineer run，最后写 `child_dispatched`。reservation 新增冻结的 `parent_status_category` / `parent_position`，用于状态写 ACK 丢失后的精确逆向证明；快速终止的唯一 owner run 也可收敛，不会重复启动。planner 同时接受 `reserved + 精确 child 前缀`，Watcher 不会把 create ACK 丢失误判为不可恢复。证据见 `2026-09-05-eventra-candidate-refresh-batch-3e.md`。Task 5 的本地状态机已闭合，但 CLI/Watcher 入口和 pro-1 mutation contract 仍属于 Task 8；未验证前不可 live 执行。
 
 另定义 `stage_refresh_request(api: RefreshAPI, parent: str, request: RefreshRequest) -> RefreshExecutionResult`，仅用于显式获准的暂停登记：父任务保持 blocked，写入 version/merge_permission=hold/request_digest 与规范 request envelope，不创建 child、消费 grant 或更新 PR。新增持久键 `eventra.refresh.request` 保存 envelope；这是待授权意图，不是 reservation。写入前提必须验证 source/assignment/Stage1 状态及无其他运行；缺 grant 只允许此暂停登记，不允许执行刷新。Core 对完整等待授权意图返回 wait，对登记半途字段组合保持 fail-closed，不能回退旧 gate 路径。
 
@@ -285,7 +348,7 @@ def test_unadopted_refresh_cannot_open_gate(self):
 `create_child(parent,stage,title,project_id,assignee_id,description) -> str`。
 它们只封装已支持 Multica CLI，无隐式重试；每次外部写都由 executor 明确读回。
 
-- [ ] 定义严格 `MemoryRefreshAPI` 测试替身（仅在 test_refresh_executor）：字典保存 parent/child metadata、comments、run；`writes` 记录 `(operation,args)`；`fail_at: int | None` 和 `fail_after: bool` 控制第 N 次写前/写后抛 RuntimeError；写后失败保留真实效果；snapshot 返回深拷贝且读取未知 ID 拒绝。
+- [x] 定义严格 `MemoryRefreshAPI` 测试替身（仅在 test_refresh_executor）：字典保存 parent/child metadata、comments、run；`writes` 记录 `(operation,args)`；`fail_at: int | None` 和 `fail_after: bool` 控制第 N 次写前/写后抛 RuntimeError；写后失败保留真实效果；snapshot 返回深拷贝且读取未知 ID 拒绝。
 
 ```python
 def mutate(self, operation, args, apply):
@@ -298,23 +361,33 @@ def mutate(self, operation, args, apply):
         raise RuntimeError("injected after effect")
 ```
 
-- [ ] 首测 `test_duplicate_create_ack_loss_recovers_same_child`：create 成功后抛错，第二次执行必须找到原 child 且 create 总数=1；旧 source evidence JSON 与原值完全相等。Run `python3 -B -m unittest tools.multica.tests.test_refresh_executor -v` 记录 RED。
-- [ ] 执行本机锁用 `fcntl.flock(LOCK_EX|LOCK_NB)`，锁文件放 Git common-dir 的刷新专用目录，key 为 workspace+parent 的摘要；锁覆盖整个外部写序列，不依赖未合并 runtime_guard。不同 action 同 parent 也互斥。锁描述符随进程退出释放；不可由清理文件伪造 stale 解锁。
-- [ ] 先测试暂停登记和缺 grant 时的唤醒：Core/Watcher 不能创建普通 gate 或恢复普通 Lead 动作。暂停登记各写入前缀只能由相同 request 恢复；不同 digest 不可覆盖。request/grant 评论 UUID 后续由实际读回绑定，不能预先猜测。
-- [ ] 先校验精确 request/grant 与单一 Lead，再写并读回 reserved；初始化 feature/request/grant/hold 字段仅允许已知写入前缀。无活动 child 前提只用于首次入口，恢复时改为检查恰好一个当前 child/允许的 run，而非拒绝自身已创建的 child。
-- [ ] child 必须 `--status backlog --stage 2` 并赋 Engineer/Frontend Project；写 kind=refresh、attempt=0、target=repository:frontend、role=frontend_engineer、creation_action、source SHA、managed PR 与 request digest。每个字段读回；未知额外 phase/refresh 字段阻断。完整初始化后写父 next_stage=3/last_action 和 in_progress，最后才启动 child。
-- [ ] 恢复时不能使用“仅标题相同”的 child。按 parent/stage/project/assignee/request/action/body digest/初始化字段前缀比对；重复或未知活跃 run 阻断。写入步骤维护上次已读回 authority projection；状态预期变化之外的 metadata、assignment、PR 或 evidence 漂移均终止。
-- [ ] 增加循环故障注入，覆盖每一写入前后；写后读回失败时保持 reservation，第二次只补合法前缀。测试不得改原 implementation metadata/evidence，不能提前登记 consumption。
-- [ ] Run GREEN；Commit：`feat(multica): initialize refresh stages with durable recovery`。
+- [x] 首测 `test_duplicate_create_ack_loss_recovers_same_child`：create 成功后抛错，第二次执行必须找到原 child 且 create 总数=1；旧 source evidence JSON 与原值完全相等。Run `python3 -B -m unittest tools.multica.tests.test_refresh_executor -v` 记录 RED。
+- [x] 执行本机锁用 `fcntl.flock(LOCK_EX|LOCK_NB)`，锁文件放 Git common-dir 的刷新专用目录，key 为 workspace+parent 的摘要；锁覆盖整个外部写序列，不依赖未合并 runtime_guard。不同 action 同 parent 也互斥。锁描述符随进程退出释放；不可由清理文件伪造 stale 解锁。
+- [x] 先测试暂停登记和缺 grant 时的唤醒：Core/Watcher 不能创建普通 gate 或恢复普通 Lead 动作。暂停登记各写入前缀只能由相同 request 恢复；不同 digest 不可覆盖。request/grant 评论 UUID 后续由实际读回绑定，不能预先猜测。
+- [x] 先校验精确 request/grant 与单一 Lead，再写并读回 reserved；初始化 feature/request/grant/hold 字段仅允许已知写入前缀。无活动 child 前提只用于首次入口，恢复时改为检查恰好一个当前 child/允许的 run，而非拒绝自身已创建的 child。
+- [x] child 必须 `--status backlog --stage 2` 并赋 Engineer/Frontend Project；写 kind=refresh、attempt=0、target=repository:frontend、role=frontend_engineer、creation_action、source SHA、managed PR 与 request digest。每个字段读回；未知额外 phase/refresh 字段阻断。完整初始化后写父 next_stage=3/last_action 和 in_progress，最后才启动 child。
+- [x] 恢复时不能使用“仅标题相同”的 child。按 parent/stage/project/assignee/request/action/body digest/初始化字段前缀比对；重复或未知活跃 run 阻断。写入步骤维护上次已读回 authority projection；状态预期变化之外的 metadata、assignment、PR 或 evidence 漂移均终止。
+- [x] 增加循环故障注入，覆盖每一写入前后；写后读回失败时保持 reservation，第二次只补合法前缀。测试不得改原 implementation metadata/evidence，不能提前登记 consumption。
+- [x] Run GREEN；Commit：`feat(multica): initialize refresh stages with durable recovery`。
 
 ## Task 6: Engineer 准备与专用完成证据
+
+**执行状态（2026-09-05）：本地准备完成协议已闭合。** `finish_refresh` 只接受
+精确 Stage 2 refresh child 的 prepared PASS 或严格 FAIL/BLOCKED outcome；PASS
+重新核验固定检查、显式 Context Receipt、远端 staging ref、双父顺序与完整树，
+仅完成 child 而不更新 managed PR/父候选。FAIL/BLOCKED 保留 source 并进入
+planner block，不消费 repair。PASS 五笔、非 PASS 四笔写入的 before/after 中断均
+可恢复；相同不可变终态重放不依赖后续 staging 可用性。Frontend Engineer 契约
+已冻结未来操作顺序，但在 Task 8 提供 parser-backed CLI、guarded worktree handoff
+和 expected-tree verifier 前明确禁止执行。证据见
+`2026-09-05-eventra-candidate-refresh-batch-3f.md`；本批次仍未接 CLI、未触碰 live。
 
 **Files:** Modify `candidate_refresh.py`, `refresh_executor.py`, `workflow.py`, `tests/test_refresh_executor.py`, `instructions/frontend_engineer.md`。
 
 **Interfaces:** `finish_refresh(api: RefreshAPI, git: RefreshGit, child: str, evidence_uuid: str, result: str) -> RefreshExecutionResult`，result=pass/fail/blocked。
 失败封套 `eventra-candidate-refresh-outcome-v1` 固定 schema_version/request_digest/child_id/source_sha/prerequisite_sha/result/commands/reason，不允许 target 或 PASS；作者和 comment 身份检查与 prepared 相同。
 
-- [ ] 新测：准备 PASS 在原 PR head 仍为 source、staging ref 为 target 时允许完成；若误用现有 finish-phase 或提交普通 QA PASS 必须失败。
+- [x] 新测：准备 PASS 在原 PR head 仍为 source、staging ref 为 target 时允许完成；若误用现有 finish-phase 或提交普通 QA PASS 必须失败。
 
 ```python
 def test_prepared_pass_does_not_publish_managed_pr(self):
@@ -326,20 +399,22 @@ def test_prepared_pass_does_not_publish_managed_pr(self):
     self.assertNotIn("eventra.refresh.adoption", self.api.parent_metadata)
 ```
 
-- [ ] Run `python3 -B -m unittest tools.multica.tests.test_refresh_executor -v` RED。
-- [ ] 指令给出真实操作顺序：专属命名 integration worktree 基于 source；禁用不受信任配置；`git merge --no-ff --no-commit PREREQUISITE`；先确认无冲突与 expected tree、再 commit（两父顺序如设计）；任何手改内容拒绝。commit 后 exact SHA 上重跑必需检查，读取知识与生成 receipt，再推唯一 staging ref。
-- [ ] 必需检查名固定 python/local_contract/footer/hydration/dashboard/lint/build/knowledge；argv 对应 Task9 的真实命令，knowledge/context 的显式 repo 路径允许 task-owned roots。测试数量记录实际值不硬编码 496。Context Receipt 必须 task_id=child、candidate frontend=target，material verified_ids 由 agent 实际核验，解析器不能自动填入。
-- [ ] prepared 正文只证明准备和测试。`finish_refresh` 重新验证 request、child assignment、grant、reservation、staging SHA/Git tree、evidence 内容；PASS 只改当前 refresh 的完成字段并 done，不改 parent candidate/PR。FAIL/BLOCKED 保留 source SHA 和原 PR，合法结果写 done/non-PASS，父任务后续阻断，不强造 target。
-- [ ] 普通 phase 完成的旧终态冲突保护保持；refresh 同一 immutable evidence 重放为 noop，换证据/换 SHA 终态重放拒绝。登记前 source 漂移、暂存不存在、错作者、缺命令、被改评论全部拒绝且 writes=0。
-- [ ] Run GREEN；Commit：`feat(multica): record refresh preparation without publishing the candidate`。
+- [x] Run `python3 -B -m unittest tools.multica.tests.test_refresh_executor -v` RED。
+- [x] 指令给出真实操作顺序：专属命名 integration worktree 基于 source；禁用不受信任配置；`git merge --no-ff --no-commit PREREQUISITE`；先确认无冲突与 expected tree、再 commit（两父顺序如设计）；任何手改内容拒绝。commit 后 exact SHA 上重跑必需检查，读取知识与生成 receipt，再推唯一 staging ref。
+- [x] 必需检查名固定 python/local_contract/footer/hydration/dashboard/lint/build/knowledge；argv 对应 Task9 的真实命令，knowledge/context 的显式 repo 路径允许 task-owned roots。测试数量记录实际值不硬编码 496。Context Receipt 必须 task_id=child、candidate frontend=target，material verified_ids 由 agent 实际核验，解析器不能自动填入。
+- [x] prepared 正文只证明准备和测试。`finish_refresh` 重新验证 request、child assignment、grant、reservation、staging SHA/Git tree、evidence 内容；PASS 只改当前 refresh 的完成字段并 done，不改 parent candidate/PR。FAIL/BLOCKED 保留 source SHA 和原 PR，合法结果写 done/non-PASS，父任务后续阻断，不强造 target。
+- [x] 普通 phase 完成的旧终态冲突保护保持；refresh 同一 immutable evidence 重放为 noop，换证据/换 SHA 终态重放拒绝。登记前 source 漂移、暂存不存在、错作者、缺命令、被改评论全部拒绝且 writes=0。
+- [x] Run GREEN；Commit：`feat(multica): record refresh preparation without publishing the candidate`。
 
 ## Task 7: 登记、发布与采纳恢复
+
+**执行状态（2026-09-05）：本地实现、回归与提交完成。** 受控候选先登记再发布，发布与采纳的每个写边界均可精确恢复；最终删除边界的并发漂移回归与独立复核已通过。实测执行细节见同目录 `2026-09-05-eventra-candidate-refresh-batch-3g.md`。
 
 **Files:** Modify `refresh_executor.py`, `candidate_refresh.py`, `tests/test_refresh_executor.py`, `tests/test_refresh_git.py`。
 
 **Interfaces:** 复用 `execute_refresh(...)`，增加 child_dispatched 后的分支；`register_candidate(api, request, prepared) -> None` 和 `adopt_candidate(api, request, prepared) -> None` 是模块内函数，不对 agent 暴露绕过前置校验的 CLI。
 
-- [ ] 首测 publication ACK 丢失后再次执行，只读回相同 target、采纳一次、child 总数仍=1；第二个测试在 adoption 半写时重启必须只补齐凭证而不再次 push。
+- [x] 首测 publication ACK 丢失后再次执行，只读回相同 target、采纳一次、child 总数仍=1；第二个测试在 adoption 半写时重启必须只补齐凭证而不再次 push。
 
 ```python
 def test_publish_ack_loss_does_not_duplicate_delivery(self):
@@ -357,12 +432,12 @@ def test_publish_ack_loss_does_not_duplicate_delivery(self):
 
 测试替身本任务增加 managed_push_effects 与发布后抛错开关；`execute_until_interruption()` 调用 execute_refresh 并容许预期 RuntimeError；`execute_again()` 使用完全相同 request/grant/action。
 
-- [ ] Run executor 模块 RED。
-- [ ] 先重新验证 source历史、current PR/base、prepared身份与 full Git tree；把 prepared 全部字段写 reservation state=candidate_registered 并读回后才可 publish。未登记的任何 head=target 也按 drift 拒绝，不自动追认。
-- [ ] 推送前再次检查 source/登记target、base tip 和 grant/证据；正常快进，随后读 GitHub PR 身份及 head。source 不变代表未发生可恢复；target 精确相同代表效果已发生；其他 SHA 冲突。不得只根据 git exit0 判定业务发布成功。
-- [ ] 状态 published 后持久化 adoption、父 frontend SHA=target、merge_state=not_ready、consumed、hold，逐个读回；最后 state=adopted 后删除 reservation。初始化 last_action 和 next_stage=3 保留，planner 以 adoption 解释旧实现不再是最新候选。
-- [ ] 每个边界的故障注入都比较原 child/evidence 深拷贝与最终状态；同时验证跨 parent/grant复用、不同 prepared、父候选半写非法组合、base 漂移、评论被编辑、重复 child 等情况绝不继续。完成后重放返回 adopted/noop，不再次消费。
-- [ ] Run executor + Git 模块 GREEN；Commit：`feat(multica): publish and adopt refresh candidates idempotently`。
+- [x] Run executor 模块 RED。
+- [x] 先重新验证 source历史、current PR/base、prepared身份与 full Git tree；把 prepared 全部字段写 reservation state=candidate_registered 并读回后才可 publish。未登记的任何 head=target 也按 drift 拒绝，不自动追认。
+- [x] 推送前再次检查 source/登记target、base tip 和 grant/证据；正常快进，随后读 GitHub PR 身份及 head。source 不变代表未发生可恢复；target 精确相同代表效果已发生；其他 SHA 冲突。不得只根据 git exit0 判定业务发布成功。
+- [x] 状态 published 后持久化 adoption、父 frontend SHA=target、merge_state=not_ready、consumed、hold，逐个读回；最后 state=adopted 后删除 reservation。初始化 last_action 和 next_stage=3 保留，planner 以 adoption 解释旧实现不再是最新候选。
+- [x] 每个边界的故障注入都比较原 child/evidence 深拷贝与最终状态；同时验证跨 parent/grant复用、不同 prepared、父候选半写非法组合、base 漂移、评论被编辑、重复 child 等情况绝不继续。完成后重放返回 adopted/noop，不再次消费。
+- [x] Run executor + Git 模块 GREEN；Commit：`feat(multica): publish and adopt refresh candidates idempotently`。
 
 ## Task 8: CLI、Watcher 互斥与精确工作区 handoff
 
