@@ -7388,6 +7388,7 @@ class FakeRepairRunner:
         self.corrupt_created_title = False
         self.suppress_status_run = False
         self.create_two_active_runs = False
+        self.complete_smoke_immediately_after_status = False
         self._add_done_child(1, "implementation", 0, result="pass", pr=True)
         if attempt >= 1:
             self._add_done_child(3, "repair", 1, result="pass", pr=True)
@@ -7748,6 +7749,10 @@ class FakeRepairRunner:
                         duplicate_run = copy.deepcopy(runs[-1])
                         duplicate_run["id"] += "-duplicate"
                         runs.append(duplicate_run)
+                if self.complete_smoke_immediately_after_status:
+                    child["status"] = "blocked"
+                    runs[-1]["status"] = "failed"
+                    runs[-1]["completed_at"] = "2026-08-25T09:00:01Z"
             if self.authority_drift_after_status is not None:
                 kind = self.authority_drift_after_status
                 self.authority_drift_after_status = None
@@ -8042,6 +8047,27 @@ class SmokeExecutionTests(unittest.TestCase):
         self.assertEqual(replay.mutation_count, 0)
         self.assertEqual(len([child for child in runner.children if child["stage"] == 3]), 1)
 
+    def test_fast_smoke_agent_completion_cannot_strand_reservation(self):
+        runner, github, decision = self._planned()
+        runner.complete_smoke_immediately_after_status = True
+
+        result = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(result.next_action, "smoke", result.reason)
+        self.assertNotIn(
+            workflow_module.SMOKE_RESERVATION_KEY,
+            runner.metadata["PRO-65"],
+        )
+        self.assertEqual(
+            runner.metadata["PRO-65"]["eventra.workflow.last_action"],
+            decision.action_key,
+        )
+
     def test_smoke_reservation_recovers_every_metadata_prefix_without_duplicate(self):
         for persisted_key_count in range(9):
             with self.subTest(persisted_key_count=persisted_key_count):
@@ -8190,16 +8216,10 @@ class SmokeExecutionTests(unittest.TestCase):
             1,
         )
 
-    def test_smoke_promotion_rechecks_complete_parent_authority_before_parent_writes(self):
+    def test_smoke_promotion_is_the_final_mutation_after_parent_commit(self):
         for drift in ("project", "squad", "lead", "members"):
             with self.subTest(drift=drift):
                 runner, github, decision = self._planned()
-                original_next_stage = runner.metadata["PRO-65"][
-                    "eventra.workflow.next_stage"
-                ]
-                original_last_action = runner.metadata["PRO-65"][
-                    "eventra.workflow.last_action"
-                ]
                 runner.authority_drift_after_status = drift
 
                 result = execute_parent_smoke(
@@ -8214,19 +8234,19 @@ class SmokeExecutionTests(unittest.TestCase):
                     for index, call in enumerate(runner.mutation_calls)
                     if call[:2] == ("issue", "status")
                 )
-                self.assertEqual(result.next_action, "block", result.reason)
+                self.assertEqual(result.next_action, "smoke", result.reason)
                 self.assertEqual(runner.mutation_calls[status_index + 1 :], [])
-                self.assertIn(
+                self.assertNotIn(
                     workflow_module.SMOKE_RESERVATION_KEY,
                     runner.metadata["PRO-65"],
                 )
                 self.assertEqual(
                     runner.metadata["PRO-65"]["eventra.workflow.next_stage"],
-                    original_next_stage,
+                    "4",
                 )
                 self.assertEqual(
                     runner.metadata["PRO-65"]["eventra.workflow.last_action"],
-                    original_last_action,
+                    decision.action_key,
                 )
 
     def test_smoke_parent_metadata_mutations_have_authority_gates(self):

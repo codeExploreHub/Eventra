@@ -5561,6 +5561,97 @@ def _require_stable_smoke_reservation_authority(
     return first
 
 
+def _start_committed_smoke_child(
+    runner: MulticaRunner,
+    github: GitHubRunner,
+    parent_key: str,
+    reservation: dict[str, object],
+    effects: list[int],
+) -> SmokeExecutionResult:
+    """Start a smoke child only after its parent assignment is committed."""
+
+    snapshot = load_parent_snapshot(runner, github, parent_key)
+    current = tuple(
+        item for item in snapshot.children if item.stage == snapshot.next_stage - 1
+    )
+    if (
+        snapshot.last_action != reservation["action_key"]
+        or _smoke_assignment_problem(snapshot, current) is not None
+    ):
+        raise RuntimeError("smoke executor convergence verification failed")
+    child_key = current[0].issue_key
+    detail = parse_issue_detail(
+        runner.run(["issue", "get", child_key, "--output", "json"]),
+        child_key,
+    )
+    runs = parse_issue_runs(
+        runner.run(["issue", "runs", child_key, "--output", "json"]),
+        str(detail["id"]),
+    )
+    active = [item for item in runs if item["status"] in ACTIVE_RUN_STATUSES]
+    if detail["status"] == "backlog":
+        if runs:
+            raise RuntimeError("backlog smoke child unexpectedly has agent runs")
+        before_ids = {item["id"] for item in runs}
+        try:
+            runner.run(["issue", "status", child_key, "todo", "--output", "json"])
+        except RuntimeError:
+            pass
+        after_detail = parse_issue_detail(
+            runner.run(["issue", "get", child_key, "--output", "json"]),
+            child_key,
+        )
+        after_runs = parse_issue_runs(
+            runner.run(["issue", "runs", child_key, "--output", "json"]),
+            str(after_detail["id"]),
+        )
+        new_runs = [item for item in after_runs if item["id"] not in before_ids]
+        if after_detail["status"] != "backlog" or new_runs:
+            effects[0] += 1
+        active_after = [
+            item for item in after_runs if item["status"] in ACTIVE_RUN_STATUSES
+        ]
+        terminal_after = after_detail["status"] in {
+            "done",
+            "blocked",
+            "cancelled",
+        }
+        if not new_runs or (
+            not terminal_after
+            and (
+                after_detail["status"] not in {"todo", "in_progress", "in_review"}
+                or len(active_after) != 1
+            )
+        ):
+            raise RuntimeError("smoke child promotion effect was not observed")
+        if terminal_after and active_after:
+            raise RuntimeError("terminal smoke child unexpectedly has an active run")
+        return SmokeExecutionResult(
+            parent_key,
+            "smoke",
+            "exact merged smoke child was committed and promoted",
+            str(reservation["action_key"]),
+            effects[0],
+            child_key,
+        )
+    if detail["status"] in {"todo", "in_progress", "in_review"}:
+        if len(active) != 1:
+            raise RuntimeError("active smoke child must have exactly one active run")
+    elif detail["status"] in {"done", "blocked", "cancelled"}:
+        if active or not runs:
+            raise RuntimeError("terminal smoke child run state conflicts")
+    else:
+        raise RuntimeError("committed smoke child status conflicts")
+    return SmokeExecutionResult(
+        parent_key,
+        "noop",
+        "exact merged smoke action is already committed",
+        str(reservation["action_key"]),
+        effects[0],
+        child_key,
+    )
+
+
 def _resume_smoke_reservation(
     runner: MulticaRunner,
     github: GitHubRunner,
@@ -5622,7 +5713,7 @@ def _resume_smoke_reservation(
         )
         if len(after[4]) != index + 1:
             raise RuntimeError("smoke metadata prefix reconciliation failed")
-    initialized = _require_stable_smoke_reservation_authority(
+    _require_stable_smoke_reservation_authority(
         runner, github, parent_key, reservation
     )
     if reservation["mode"] == "retry":
@@ -5632,36 +5723,6 @@ def _resume_smoke_reservation(
             expected="blocked",
             desired="in_progress",
         )
-        initialized = _require_stable_smoke_reservation_authority(
-            runner, github, parent_key, reservation
-        )
-    detail = parse_issue_detail(initialized[3], child_key)
-    if detail["status"] == "backlog":
-        before_runs = initialized[5]
-        before_ids = {item["id"] for item in before_runs}
-        try:
-            runner.run(["issue", "status", child_key, "todo", "--output", "json"])
-        except RuntimeError:
-            pass
-        after_detail = parse_issue_detail(
-            runner.run(["issue", "get", child_key, "--output", "json"]),
-            child_key,
-        )
-        after_runs = parse_issue_runs(
-            runner.run(["issue", "runs", child_key, "--output", "json"]),
-            str(after_detail["id"]),
-        )
-        if after_detail["status"] != "backlog" or any(
-            item["id"] not in before_ids for item in after_runs
-        ):
-            effects[0] += 1
-        if (
-            after_detail["status"] not in {"todo", "in_progress", "in_review"}
-            or len(
-                [item for item in after_runs if item["status"] in ACTIVE_RUN_STATUSES]
-            ) != 1
-        ):
-            raise RuntimeError("smoke child promotion effect was not observed")
         _require_stable_smoke_reservation_authority(
             runner, github, parent_key, reservation
         )
@@ -5693,22 +5754,12 @@ def _resume_smoke_reservation(
         reservation_key=SMOKE_RESERVATION_KEY,
         reservation_value=None,
     )
-    final = load_parent_snapshot(runner, github, parent_key)
-    current = tuple(
-        item for item in final.children if item.stage == final.next_stage - 1
-    )
-    if (
-        final.last_action != reservation["action_key"]
-        or _smoke_assignment_problem(final, current) is not None
-    ):
-        raise RuntimeError("smoke executor convergence verification failed")
-    return SmokeExecutionResult(
+    return _start_committed_smoke_child(
+        runner,
+        github,
         parent_key,
-        "smoke",
-        "exact merged smoke child was committed and promoted",
-        str(reservation["action_key"]),
-        effects[0],
-        child_key,
+        reservation,
+        effects,
     )
 
 
