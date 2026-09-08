@@ -64,8 +64,16 @@ a branch, verify `git rev-parse FETCH_HEAD` equals `candidate_sha`, then run
 cleanliness again before testing. Run the workflow helper only from the exact
 `control_tool_sha` checkout. Never reset, clean, stash, overwrite, fetch into,
 or switch the runtime workspace.
-In the ordinary gate template, `FULL_SHA` is this bound `candidate_sha`, so the
-equivalent literal command is `git switch --detach FULL_SHA`.
+Never switch, detach, reset, clean, or stash the Multica-managed task worktree.
+
+For an initial or retry Smoke, inspect the Multica-managed task worktree and
+apply the same allowed runtime exclusions, but never switch, detach, reset,
+clean, or stash it. Fetch the handed-off PR ref without moving its branch,
+verify `git rev-parse FETCH_HEAD` equals the candidate SHA, then create an owned
+directory outside it with `git worktree add --detach TEMP_DIR FULL_SHA`.
+Verify the temporary worktree's exact HEAD and cleanliness before testing.
+Stop only processes started by this run, then remove only that owned temporary
+worktree.
 
 For an initial or retry Smoke, perform a fresh fetch of every handed-off PR ref
 and require `FETCH_HEAD` to equal each unchanged candidate SHA. A retry action
@@ -75,6 +83,27 @@ run the same repository-standard health/OpenAPI Smoke, retain a new immutable
 Context Receipt and evidence comment, and clean up only owned processes and
 temporary worktrees. The retry does not weaken provenance and authorizes no
 deployment.
+
+## Scope-aware Smoke routes
+
+Select exactly one route from the parent classification and exact candidate SHA
+map; do not invent a missing repository dependency.
+
+- **Frontend-only Smoke:** fetch and verify only the frontend PR ref, create one
+  external detached temporary worktree at that SHA, run the focused frontend
+  regressions and `npm run test:local-contract`, then start `npm run dev:local`.
+  Wait for and probe port `3000`. Port `8080` and a backend service handoff are
+  not prerequisites for this route; do not run the cross-stack
+  `npm run smoke:local` command.
+- **Backend-only Smoke:** fetch and verify only the backend PR ref, create one
+  external detached temporary worktree at that SHA, run
+  `scripts/test-local.sh`, start `scripts/run-local.sh`, wait for port `8080`,
+  and run `scripts/smoke-local.sh`. Port `3000` is not a prerequisite.
+- **Cross-stack Smoke:** fetch and verify both PR refs, create one external
+  detached temporary worktree per exact SHA, start the exact backend on port
+  `8080`, record its readiness handoff, then start the exact frontend and run
+  the full `npm run smoke:local` path against that backend. Both SHAs and both
+  service observations belong in the evidence.
 
 If the tested SHA predates the automation helper, keep this worktree at the
 exact tested SHA and run `tools.multica.workflow` only from the Delivery Lead's
@@ -152,7 +181,12 @@ even when only one repository is responsible.
 
 ### Smoke completion
 
+Use only the SHA flags in the assigned candidate map. Frontend-only and
+backend-only Smoke each supply one SHA; Cross-stack Smoke supplies both.
+
 ```text
+python3 -B -m tools.multica.workflow finish-phase PRO-N --kind smoke --result pass|fail|blocked --attempt N --frontend-sha FULL_SHA --evidence-comment COMMENT_UUID
+python3 -B -m tools.multica.workflow finish-phase PRO-N --kind smoke --result pass|fail|blocked --attempt N --backend-sha FULL_SHA --evidence-comment COMMENT_UUID
 python3 -B -m tools.multica.workflow finish-phase PRO-N --kind smoke --result pass|fail|blocked --attempt N --frontend-sha FULL_SHA --backend-sha FULL_SHA --evidence-comment COMMENT_UUID
 ```
 

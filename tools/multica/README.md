@@ -196,6 +196,16 @@ keeps one pull request per repository, and records exact reviewed and tested
 commit SHAs. A partial two-repository merge stops immediately and requires
 human escalation; it does not trigger rollback or deployment.
 
+Post-merge Smoke follows the parent classification. Frontend-only uses only the
+exact frontend SHA, focused regressions, `npm run test:local-contract`, and a
+port 3000 readiness probe. Backend-only uses only the exact backend SHA,
+`scripts/test-local.sh`, a port 8080 readiness probe, and
+`scripts/smoke-local.sh`. Cross-stack uses both exact SHAs, starts the backend
+first, and runs the full frontend-to-backend `npm run smoke:local`. Integration
+QA materializes each candidate with `git worktree add --detach TEMP_DIR
+FULL_SHA` outside the Multica-managed task worktree; it never switches,
+detaches, resets, cleans, or stashes that managed worktree.
+
 Every execution role retrieves indexed knowledge before acting. Run the
 read-only context command from the authoritative Eventra control repository,
 supplying one `--sha REPOSITORY=FULL_SHA` per affected repository and one or
@@ -357,12 +367,16 @@ The smoke executor revalidates the completed Gate, managed merged PRs, exact
 merged candidate SHA map, and provisioned Integration QA assignment. It writes
 `eventra.workflow.smoke_reservation`, creates one backlog child, persists and
 rereads `eventra.phase.creation_action`, `eventra.phase.target=suite:smoke`,
-`eventra.phase.role=integration_qa`, and the complete SHA map, then promotes and
-starts Integration QA. It commits the exact parent action and clears the
-reservation only after verifying the complete effect. Retry resumes a missing
+`eventra.phase.role=integration_qa`, and the complete SHA map. It commits the
+parent action and clears the reservation before starting Integration QA,
+verifies the exact committed assignment, and makes child promotion its final
+mutation. Retry resumes a missing
 create, canonical metadata prefix, promotion, or lost acknowledgement without
 duplicating the child. Conflicting identity, metadata, Gate evidence, assignment,
-or merged PR state blocks without overwrite. This recovery uses the same single
+or merged PR state blocks without overwrite. When an older execution already
+committed the exact parent action but stranded its reservation, replay validates
+the unique assigned child and authoritative run evidence, clears only that
+reservation, and neither recreates nor reruns the child. This recovery uses the same single
 serialized Delivery Lead and is not generic CAS or transaction safety.
 
 ### One-time infrastructure-blocked Smoke retry
@@ -393,14 +407,16 @@ python3 -B -m tools.multica.workflow execute-parent-smoke PRO-116 --expected-act
 The executor reserves the exact source Smoke/evidence, unchanged candidate
 SHAs, merged PRs, original PASS Gate, member authorization, prior parent status,
 Stage, and action. It creates one backlog retry child, initializes all canonical
-metadata, changes only `blocked -> in_progress` with no parent run, starts one
-Integration QA run, records
-`eventra.workflow.smoke_retry_authorization_consumed`, and clears the reservation
-last. Replaying the same key resumes or no-ops; another key, child, run, comment,
+metadata, changes only `blocked -> in_progress` with no parent run, records
+`eventra.workflow.smoke_retry_authorization_consumed`, commits the parent action,
+and clears the reservation before starting Integration QA. Replaying the same
+key resumes or no-ops; another key, child, run, comment,
 SHA, PR head, assignment, or status fails closed.
 
 The retry must still perform a fresh PR-ref fetch and exact `FETCH_HEAD`
-verification in a clean detached worktree. PASS permits normal
+verification in an external clean detached temporary worktree; it never moves
+the Multica-managed task worktree branch. It uses the same frontend-only,
+backend-only, or cross-stack route as the original classification. PASS permits normal
 `complete_parent`; BLOCKED or FAIL leaves the parent blocked. No second retry,
 manual child, result rewrite, deployment, or production mutation is permitted.
 

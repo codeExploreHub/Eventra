@@ -37,6 +37,13 @@ must never appear in Issues, logs, commands, files, or commits. Automatic merge
 is allowed only after all quality gates pass. Local merged smoke checks may run
 automatically; production deployment is always human-triggered.
 
+Backend-only post-merge Smoke uses an owned external detached temporary
+worktree at the exact backend SHA, runs the backend tests, starts the backend,
+waits for port 8080, and runs the backend health/API Smoke. It does not require
+a frontend process or port 3000. Cross-stack Smoke additionally requires the
+exact frontend SHA and the existing readiness handoff. Integration QA never
+switches or detaches the Multica-managed task worktree.
+
 Backend children use workflow contract version `2` and the ordered Stage of
 their frontend-Project parent. Finish implementation, repair, review, QA, and
 smoke through `tools.multica.workflow finish-phase`; a `pass|fail|blocked`

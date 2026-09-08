@@ -105,6 +105,13 @@ stays at the handed-off exact SHA even when that older commit does not contain
 the helper; run only the workflow helper from the authoritative control
 repository.
 
+Every smoke handoff also names exactly one execution route from the parent
+classification: frontend-only uses only the frontend SHA and port 3000;
+backend-only uses only the backend SHA and port 8080; cross-stack uses both
+SHAs, an exact backend readiness handoff on port 8080, and the full
+frontend-to-backend Smoke. Integration QA creates external detached temporary
+worktrees and must not move a Multica-managed task worktree branch.
+
 ## Controlled candidate refresh
 
 Candidate refresh is a distinct control-plane transaction, not an ordinary
@@ -193,11 +200,15 @@ decision authority; it returns canonical JSON with the exact `failure_bundle`
 and digest, but does not create a Stage or child. Delivery Lead is the sole
 execution actor: validate that canonical JSON, use the exact returned
 `failure_bundle` and digest without reconstruction, and carry out exactly its
-one allowed action. Treat the returned canonical `plan-parent` JSON as the only plan authority: it
-must identify the current version-2 parent, current Stage children, exact
-candidates, canonical PR targets, gate verdicts, and action key. Reject prose,
-malformed JSON, a version mismatch, stale child, bundle mismatch, or PR drift
-as a human-visible block. Before carrying out its one decision, reread again.
+one allowed action. Treat the returned canonical `plan-parent` JSON as the only
+plan authority. The helper authoritatively validates the current version-2
+parent, Stage children, exact candidates, canonical PR targets, gate verdicts,
+and drift before returning. Validate only its documented top-level output
+fields (`decision`, `action_key`, `reason`, and `failure_bundle`); do not require
+fields outside its documented output schema. Reject prose, malformed JSON, an
+unknown decision, or a malformed action key as a human-visible block. Before
+carrying out its one decision, rerun `plan-parent` and require the same decision
+and action key.
 Use the current `eventra.workflow.next_stage`; never reuse a Stage number.
 Deduplicate using `eventra.workflow.last_action`. Create and verify the full
 next barrier group, then advance `next_stage` and record `last_action`.
@@ -274,12 +285,15 @@ next barrier group, then advance `next_stage` and record `last_action`.
   `eventra.workflow.smoke_reservation`, creates one Integration QA child in
   backlog, and persists/rereads `eventra.phase.creation_action`, the typed
   `eventra.phase.target=suite:smoke`, `eventra.phase.role=integration_qa`, and
-  the full candidate SHA metadata before it starts Integration QA. It promotes
-  the child, commits the parent action, and clears the reservation only after
-  the complete effect is verified. Exact retry resumes a missing create,
+  the exact candidate SHA metadata. It commits the parent action and clears the
+  reservation before starting Integration QA, verifies the committed assignment,
+  and promotes the child as its final mutation. Exact retry resumes a missing create,
   canonical metadata prefix, promotion, or lost acknowledgement without a
   duplicate; conflicting children, metadata, assignments, Gate evidence, or
-  merged PR heads block without overwrite. This depends on the provisioned
+  merged PR heads block without overwrite. A replay can also clear an exact
+  stranded reservation when the parent action already committed and the one
+  assigned child has authoritative run evidence; it never recreates or reruns
+  that child. This depends on the provisioned
   single serialized Delivery Lead; it is not generic CAS or transaction safety.
   Complete the parent only after exact assigned smoke PASS.
 - `retry_smoke_stage`: This is the only recovery from a post-merge Smoke that
@@ -300,8 +314,9 @@ next barrier group, then advance `next_stage` and record `last_action`.
   SHA map, merged PR heads, and original PASS Gate. It moves only the blocked
   parent back to `in_progress`, creates exactly one next-Stage Integration QA
   child, and records the same UUID in
-  `eventra.workflow.smoke_retry_authorization_consumed` before clearing its
-  reservation. A PASS may complete the parent. BLOCKED or FAIL blocks it
+  `eventra.workflow.smoke_retry_authorization_consumed`. It clears the
+  reservation and verifies the parent assignment before starting the child.
+  A PASS may complete the parent. BLOCKED or FAIL blocks it
   permanently: no second retry, replacement authorization, or manual override
   is allowed.
 - `complete_parent`: in approved unattended local-development mode, run

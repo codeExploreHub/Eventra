@@ -9621,10 +9621,12 @@ class FakeRepairRunner:
         self.authority_drift_after_status = None
         self.authority_drift_after_parent_metadata_key = None
         self.authority_drift_after_parent_delete_key = None
+        self.hard_interrupt_after_parent_delete_key = None
         self.authority_drift_after_child_metadata_write = None
         self.corrupt_created_title = False
         self.suppress_status_run = False
         self.create_two_active_runs = False
+        self.complete_smoke_immediately_after_status = False
         self._add_done_child(1, "implementation", 0, result="pass", pr=True)
         if attempt >= 1:
             self._add_done_child(3, "repair", 1, result="pass", pr=True)
@@ -9943,6 +9945,10 @@ class FakeRepairRunner:
             if key == self.authority_drift_after_parent_delete_key:
                 self.authority_drift_after_parent_delete_key = None
                 self._apply_authority_drift("members")
+            if key == self.hard_interrupt_after_parent_delete_key:
+                raise KeyboardInterrupt(
+                    "injected hard interruption after parent metadata delete"
+                )
             self._maybe_lose_ack(f"delete:{identifier}:{key}")
             return {"ok": True}
         if call[:2] == ("issue", "status"):
@@ -9985,6 +9991,10 @@ class FakeRepairRunner:
                         duplicate_run = copy.deepcopy(runs[-1])
                         duplicate_run["id"] += "-duplicate"
                         runs.append(duplicate_run)
+                if self.complete_smoke_immediately_after_status:
+                    child["status"] = "blocked"
+                    runs[-1]["status"] = "failed"
+                    runs[-1]["completed_at"] = "2026-08-25T09:00:01Z"
             if self.authority_drift_after_status is not None:
                 kind = self.authority_drift_after_status
                 self.authority_drift_after_status = None
@@ -10445,6 +10455,169 @@ class SmokeExecutionTests(unittest.TestCase):
         self.assertEqual(replay.mutation_count, 0)
         self.assertEqual(len([child for child in runner.children if child["stage"] == 3]), 1)
 
+    def test_fast_smoke_agent_completion_cannot_strand_reservation(self):
+        runner, github, decision = self._planned()
+        runner.complete_smoke_immediately_after_status = True
+
+        result = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(result.next_action, "smoke", result.reason)
+        self.assertNotIn(
+            workflow_module.SMOKE_RESERVATION_KEY,
+            runner.metadata["PRO-65"],
+        )
+        self.assertEqual(
+            runner.metadata["PRO-65"]["eventra.workflow.last_action"],
+            decision.action_key,
+        )
+
+    def test_committed_terminal_smoke_reconciles_a_stranded_reservation(self):
+        runner, github, decision = self._planned()
+        snapshot = load_parent_snapshot(runner, github, "PRO-65")
+        reservation = workflow_module._build_smoke_reservation(snapshot, decision)
+        completed = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+        child_key = completed.child_identifier
+        child = next(
+            item for item in runner.children if item["identifier"] == child_key
+        )
+        child["status"] = "blocked"
+        runner.runs[child_key][0]["status"] = "failed"
+        runner.runs[child_key][0]["completed_at"] = "2026-08-25T09:00:01Z"
+        runner.metadata["PRO-65"][workflow_module.SMOKE_RESERVATION_KEY] = (
+            workflow_module._canonical_json(reservation)
+        )
+        before = runner.committed_mutations
+
+        reconciled = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(reconciled.next_action, "noop", reconciled.reason)
+        self.assertEqual(reconciled.child_identifier, child_key)
+        self.assertEqual(reconciled.mutation_count, 1)
+        self.assertEqual(runner.committed_mutations, before + 1)
+        self.assertNotIn(
+            workflow_module.SMOKE_RESERVATION_KEY,
+            runner.metadata["PRO-65"],
+        )
+        self.assertEqual(
+            len([item for item in runner.children if item["stage"] == 3]),
+            1,
+        )
+
+    def test_replay_starts_committed_backlog_child_after_reservation_clear_crash(self):
+        runner, github, decision = self._planned()
+        runner.hard_interrupt_after_parent_delete_key = (
+            workflow_module.SMOKE_RESERVATION_KEY
+        )
+
+        with self.assertRaisesRegex(
+            KeyboardInterrupt,
+            "after parent metadata delete",
+        ):
+            execute_parent_smoke(
+                runner,
+                github,
+                "PRO-65",
+                expected_action_key=decision.action_key,
+            )
+
+        child = next(item for item in runner.children if item["stage"] == 3)
+        self.assertEqual(child["status"], "backlog")
+        self.assertEqual(runner.runs[child["identifier"]], [])
+        self.assertNotIn(
+            workflow_module.SMOKE_RESERVATION_KEY,
+            runner.metadata["PRO-65"],
+        )
+        runner.hard_interrupt_after_parent_delete_key = None
+
+        replay = execute_parent_smoke(
+            runner,
+            github,
+            "PRO-65",
+            expected_action_key=decision.action_key,
+        )
+
+        self.assertEqual(replay.next_action, "smoke", replay.reason)
+        self.assertEqual(child["status"], "todo")
+        self.assertEqual(len(runner.runs[child["identifier"]]), 1)
+        self.assertEqual(
+            len([item for item in runner.children if item["stage"] == 3]),
+            1,
+        )
+
+    def test_conflicting_committed_smoke_reservation_is_retained_without_mutation(self):
+        for conflict in ("candidate", "duplicate", "missing-run"):
+            with self.subTest(conflict=conflict):
+                runner, github, decision = self._planned()
+                snapshot = load_parent_snapshot(runner, github, "PRO-65")
+                reservation = workflow_module._build_smoke_reservation(
+                    snapshot,
+                    decision,
+                )
+                completed = execute_parent_smoke(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+                child_key = completed.child_identifier
+                child = next(
+                    item
+                    for item in runner.children
+                    if item["identifier"] == child_key
+                )
+                child["status"] = "blocked"
+                runner.runs[child_key][0]["status"] = "failed"
+                runner.runs[child_key][0]["completed_at"] = (
+                    "2026-08-25T09:00:01Z"
+                )
+                runner.metadata["PRO-65"][workflow_module.SMOKE_RESERVATION_KEY] = (
+                    workflow_module._canonical_json(reservation)
+                )
+                if conflict == "candidate":
+                    runner.metadata[child_key]["eventra.phase.sha.backend"] = "c" * 40
+                elif conflict == "duplicate":
+                    duplicate = copy.deepcopy(child)
+                    duplicate["id"] = "01a00000-0000-7000-8000-000000000099"
+                    duplicate["identifier"] = "PRO-99"
+                    runner.children.append(duplicate)
+                    runner.metadata["PRO-99"] = copy.deepcopy(
+                        runner.metadata[child_key]
+                    )
+                    runner.runs["PRO-99"] = copy.deepcopy(runner.runs[child_key])
+                else:
+                    runner.runs[child_key] = []
+                before = runner.committed_mutations
+
+                result = execute_parent_smoke(
+                    runner,
+                    github,
+                    "PRO-65",
+                    expected_action_key=decision.action_key,
+                )
+
+                self.assertEqual(result.next_action, "block", result.reason)
+                self.assertEqual(result.mutation_count, 0)
+                self.assertEqual(runner.committed_mutations, before)
+                self.assertIn(
+                    workflow_module.SMOKE_RESERVATION_KEY,
+                    runner.metadata["PRO-65"],
+                )
+
     def test_smoke_reservation_recovers_every_metadata_prefix_without_duplicate(self):
         for persisted_key_count in range(9):
             with self.subTest(persisted_key_count=persisted_key_count):
@@ -10593,16 +10766,10 @@ class SmokeExecutionTests(unittest.TestCase):
             1,
         )
 
-    def test_smoke_promotion_rechecks_complete_parent_authority_before_parent_writes(self):
+    def test_smoke_promotion_is_the_final_mutation_after_parent_commit(self):
         for drift in ("project", "squad", "lead", "members"):
             with self.subTest(drift=drift):
                 runner, github, decision = self._planned()
-                original_next_stage = runner.metadata["PRO-65"][
-                    "eventra.workflow.next_stage"
-                ]
-                original_last_action = runner.metadata["PRO-65"][
-                    "eventra.workflow.last_action"
-                ]
                 runner.authority_drift_after_status = drift
 
                 result = execute_parent_smoke(
@@ -10617,19 +10784,19 @@ class SmokeExecutionTests(unittest.TestCase):
                     for index, call in enumerate(runner.mutation_calls)
                     if call[:2] == ("issue", "status")
                 )
-                self.assertEqual(result.next_action, "block", result.reason)
+                self.assertEqual(result.next_action, "smoke", result.reason)
                 self.assertEqual(runner.mutation_calls[status_index + 1 :], [])
-                self.assertIn(
+                self.assertNotIn(
                     workflow_module.SMOKE_RESERVATION_KEY,
                     runner.metadata["PRO-65"],
                 )
                 self.assertEqual(
                     runner.metadata["PRO-65"]["eventra.workflow.next_stage"],
-                    original_next_stage,
+                    "4",
                 )
                 self.assertEqual(
                     runner.metadata["PRO-65"]["eventra.workflow.last_action"],
-                    original_last_action,
+                    decision.action_key,
                 )
 
     def test_smoke_parent_metadata_mutations_have_authority_gates(self):
