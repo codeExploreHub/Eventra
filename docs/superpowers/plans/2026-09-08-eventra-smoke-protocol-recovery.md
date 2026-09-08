@@ -162,42 +162,13 @@ git commit -m "fix(multica): reconcile committed smoke reservations"
 - Modify: `tools/multica/instructions/integration_qa.md`
 - Modify: `tools/multica/instructions/eventra_project.md`
 - Modify: `tools/multica/instructions/delivery_lead.md`
-- Modify: `tools/multica/tests/test_provision.py`
 - Modify: `tools/multica/README.md`
 
 **Interfaces:**
 - Consumes: parent `classification`, exact candidate SHA map, merged PR refs, existing repository commands.
 - Produces: explicit frontend-only, backend-only, and cross-stack smoke routes.
 
-- [ ] **Step 1: Write failing instruction-contract tests**
-
-Add assertions that rendered Integration QA instructions contain all of:
-
-```python
-required = (
-    "frontend-only",
-    "backend-only",
-    "cross-stack",
-    "do not switch or detach the Multica-managed task worktree",
-    "temporary detached verification worktree",
-    "port 3000",
-    "port 8080 is not a prerequisite",
-)
-```
-
-Also assert the Delivery Lead contract states that the parent classification is included in every smoke handoff.
-
-- [ ] **Step 2: Run the focused provision test and verify RED**
-
-Run:
-
-```bash
-python3 -B -m unittest tools.multica.tests.test_provision
-```
-
-Expected: FAIL because the current instructions require detaching the managed worktree and do not define frontend-only smoke.
-
-- [ ] **Step 3: Update the three instruction sources and README**
+- [ ] **Step 1: Update the three instruction sources and README**
 
 Specify these exact routes:
 
@@ -214,14 +185,18 @@ frontend dev:local -> npm run smoke:local
 
 Require QA to leave the Multica-managed task worktree HEAD/branch unchanged and clean up only its temporary worktree and owned processes.
 
-- [ ] **Step 4: Run instruction/provision tests and verify GREEN**
+- [ ] **Step 2: Validate the rendered configuration behavior**
 
-Run `test_provision` and then the complete `tools/multica/tests` suite.
+Run `test_provision`, then run a live provision dry-run and inspect its structured
+plan. The dry-run must identify only the intended instruction updates and must
+not propose Project/resource deletion, production action, or secret changes.
+The definitive behavior test is Task 5's real frontend-only retry: it must run
+without port 8080 and leave the Multica-managed branch unchanged.
 
-- [ ] **Step 5: Commit Task 3**
+- [ ] **Step 3: Commit Task 3**
 
 ```bash
-git add tools/multica/instructions/integration_qa.md tools/multica/instructions/eventra_project.md tools/multica/instructions/delivery_lead.md tools/multica/tests/test_provision.py tools/multica/README.md
+git add tools/multica/instructions/integration_qa.md tools/multica/instructions/eventra_project.md tools/multica/instructions/delivery_lead.md tools/multica/README.md
 git commit -m "fix(multica): make smoke verification scope aware"
 ```
 
