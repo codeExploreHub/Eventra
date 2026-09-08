@@ -152,11 +152,15 @@ decision authority; it returns canonical JSON with the exact `failure_bundle`
 and digest, but does not create a Stage or child. Delivery Lead is the sole
 execution actor: validate that canonical JSON, use the exact returned
 `failure_bundle` and digest without reconstruction, and carry out exactly its
-one allowed action. Treat the returned canonical `plan-parent` JSON as the only plan authority: it
-must identify the current version-2 parent, current Stage children, exact
-candidates, canonical PR targets, gate verdicts, and action key. Reject prose,
-malformed JSON, a version mismatch, stale child, bundle mismatch, or PR drift
-as a human-visible block. Before carrying out its one decision, reread again.
+one allowed action. Treat the returned canonical `plan-parent` JSON as the only
+plan authority. The helper authoritatively validates the current version-2
+parent, Stage children, exact candidates, canonical PR targets, gate verdicts,
+and drift before returning. Validate only its documented top-level output
+fields (`decision`, `action_key`, `reason`, and `failure_bundle`); do not require
+fields outside its documented output schema. Reject prose, malformed JSON, an
+unknown decision, or a malformed action key as a human-visible block. Before
+carrying out its one decision, rerun `plan-parent` and require the same decision
+and action key.
 Use the current `eventra.workflow.next_stage`; never reuse a Stage number.
 Deduplicate using `eventra.workflow.last_action`. Create and verify the full
 next barrier group, then advance `next_stage` and record `last_action`.

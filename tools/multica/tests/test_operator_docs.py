@@ -239,6 +239,15 @@ class OperatorDocsTests(unittest.TestCase):
             )
             self.assertNotIn("Lead creates one immutable FailureBundle", rendered)
 
+        self.assertIn(
+            "do not require fields outside its documented output schema",
+            lead,
+        )
+        self.assertNotIn(
+            "must identify the current version-2 parent, current Stage children",
+            lead,
+        )
+
         for engineer in (frontend, backend):
             self.assertIn(
                 "address every assigned failure-partition reference", engineer
