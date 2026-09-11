@@ -10073,6 +10073,27 @@ class FakeRepairRunner:
 
 
 class SmokeExecutionTests(unittest.TestCase):
+    @staticmethod
+    def execution_handoff():
+        return {
+            "control_tool_workspace": "/tmp/eventra-control",
+            "control_tool_sha": "c" * 40,
+            "repositories": {"backend": {
+                "runtime_workspace": "/tmp/eventra-runtime",
+                "inspection_workspace": "/tmp/eventra-inspection",
+                "candidate_sha": FakeRepairRunner.BACKEND_SHA,
+                "merged_sha": "d" * 40,
+                "pr_url": FakeRepairRunner.BACKEND_PR,
+            }},
+        }
+
+    def execute_smoke(self, runner, github, parent_key, **kwargs):
+        # Existing mutation/fault tests now supply the complete caller input.
+        # Round-three legacy reservation fixtures deliberately remain unchanged.
+        if isinstance(runner, FakeRepairRunner):
+            kwargs.setdefault("execution_handoff", self.execution_handoff())
+        return execute_parent_smoke(runner, github, parent_key, **kwargs)
+
     def test_new_smoke_reservation_keeps_refresh_reader_for_resume(self):
         runner, github, decision = self._planned()
         reader = object()
@@ -10082,7 +10103,7 @@ class SmokeExecutionTests(unittest.TestCase):
             "_resume_smoke_reservation",
             wraps=workflow_module._resume_smoke_reservation,
         ) as resume:
-            result = execute_parent_smoke(
+            result = self.execute_smoke(
                 runner,
                 github,
                 "PRO-65",
@@ -10104,7 +10125,7 @@ class SmokeExecutionTests(unittest.TestCase):
         })
         before = runner.committed_mutations
 
-        result = execute_parent_smoke(
+        result = self.execute_smoke(
             runner, github, "PRO-65", expected_action_key=decision.action_key)
 
         self.assertEqual(result.next_action, "block")
@@ -10117,7 +10138,7 @@ class SmokeExecutionTests(unittest.TestCase):
         runner, github, decision = self._planned()
         runner.hard_interrupt_after_create = True
         with self.assertRaises(KeyboardInterrupt):
-            execute_parent_smoke(runner, github, "PRO-65", expected_action_key=decision.action_key)
+            self.execute_smoke(runner, github, "PRO-65", expected_action_key=decision.action_key)
         runner.hard_interrupt_after_create = False
         _, data = refresh_snapshot_fixture(state="intent")
         runner.metadata["PRO-65"].update({
@@ -10125,7 +10146,7 @@ class SmokeExecutionTests(unittest.TestCase):
             if key.startswith("eventra.refresh.")
         })
         before = runner.committed_mutations
-        result = execute_parent_smoke(runner, github, "PRO-65", expected_action_key=decision.action_key)
+        result = self.execute_smoke(runner, github, "PRO-65", expected_action_key=decision.action_key)
         self.assertEqual(result.next_action, "block")
         self.assertIn("configured authoritative reader", result.reason)
         self.assertEqual(runner.committed_mutations, before)
@@ -10168,7 +10189,7 @@ class SmokeExecutionTests(unittest.TestCase):
 
     def _retry_planned(self):
         runner, github, initial_decision = self._planned()
-        initial = execute_parent_smoke(
+        initial = self.execute_smoke(
             runner,
             github,
             "PRO-65",
@@ -10309,7 +10330,7 @@ class SmokeExecutionTests(unittest.TestCase):
                 )
                 corrupt(runner, comment)
 
-                result = execute_parent_smoke(
+                result = self.execute_smoke(
                     runner,
                     github,
                     runner.snapshot.identifier,
@@ -10328,7 +10349,7 @@ class SmokeExecutionTests(unittest.TestCase):
         runner, github, decision, _ = self._round_three_smoke_reserved()
         runner.evidence_drift_after_first_read.add(runner.snapshot.identifier)
 
-        result = execute_parent_smoke(
+        result = self.execute_smoke(
             runner,
             github,
             runner.snapshot.identifier,
@@ -10345,7 +10366,7 @@ class SmokeExecutionTests(unittest.TestCase):
     def test_retry_smoke_executor_creates_one_source_bound_child(self):
         runner, github, decision, source_key = self._retry_planned()
 
-        result = execute_parent_smoke(
+        result = self.execute_smoke(
             runner,
             github,
             "PRO-65",
@@ -10388,6 +10409,7 @@ class SmokeExecutionTests(unittest.TestCase):
                     "parent": "PRO-65",
                     "source_evidence_comment_uuid": SMOKE_EVIDENCE_UUID,
                     "source_smoke": source_key,
+                    "execution_handoff": self.execution_handoff(),
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -10414,13 +10436,13 @@ class SmokeExecutionTests(unittest.TestCase):
                 runner, github, decision, _ = self._retry_planned()
                 runner.lost_ack_once.add(lost_ack)
 
-                first = execute_parent_smoke(
+                first = self.execute_smoke(
                     runner,
                     github,
                     "PRO-65",
                     expected_action_key=decision.action_key,
                 )
-                second = execute_parent_smoke(
+                second = self.execute_smoke(
                     runner,
                     github,
                     "PRO-65",
@@ -10471,7 +10493,7 @@ class SmokeExecutionTests(unittest.TestCase):
     def test_exact_smoke_action_creates_one_provenance_bound_child_and_replays(self):
         runner, github, decision = self._planned()
 
-        result = execute_parent_smoke(
+        result = self.execute_smoke(
             runner,
             github,
             "PRO-65",
@@ -10511,7 +10533,7 @@ class SmokeExecutionTests(unittest.TestCase):
             runner.metadata["PRO-65"],
         )
 
-        replay = execute_parent_smoke(
+        replay = self.execute_smoke(
             runner,
             github,
             "PRO-65",
@@ -10525,7 +10547,7 @@ class SmokeExecutionTests(unittest.TestCase):
         runner, github, decision = self._planned()
         runner.complete_smoke_immediately_after_status = True
 
-        result = execute_parent_smoke(
+        result = self.execute_smoke(
             runner,
             github,
             "PRO-65",
@@ -10545,8 +10567,9 @@ class SmokeExecutionTests(unittest.TestCase):
     def test_committed_terminal_smoke_reconciles_a_stranded_reservation(self):
         runner, github, decision = self._planned()
         snapshot = load_parent_snapshot(runner, github, "PRO-65")
-        reservation = workflow_module._build_smoke_reservation(snapshot, decision)
-        completed = execute_parent_smoke(
+        reservation = workflow_module._build_smoke_reservation(
+            snapshot, decision, self.execution_handoff())
+        completed = self.execute_smoke(
             runner,
             github,
             "PRO-65",
@@ -10564,7 +10587,7 @@ class SmokeExecutionTests(unittest.TestCase):
         )
         before = runner.committed_mutations
 
-        reconciled = execute_parent_smoke(
+        reconciled = self.execute_smoke(
             runner,
             github,
             "PRO-65",
@@ -10594,7 +10617,7 @@ class SmokeExecutionTests(unittest.TestCase):
             KeyboardInterrupt,
             "after parent metadata delete",
         ):
-            execute_parent_smoke(
+            self.execute_smoke(
                 runner,
                 github,
                 "PRO-65",
@@ -10610,7 +10633,7 @@ class SmokeExecutionTests(unittest.TestCase):
         )
         runner.hard_interrupt_after_parent_delete_key = None
 
-        replay = execute_parent_smoke(
+        replay = self.execute_smoke(
             runner,
             github,
             "PRO-65",
@@ -10633,8 +10656,9 @@ class SmokeExecutionTests(unittest.TestCase):
                 reservation = workflow_module._build_smoke_reservation(
                     snapshot,
                     decision,
+                    self.execution_handoff(),
                 )
-                completed = execute_parent_smoke(
+                completed = self.execute_smoke(
                     runner,
                     github,
                     "PRO-65",
@@ -10669,7 +10693,7 @@ class SmokeExecutionTests(unittest.TestCase):
                     runner.runs[child_key] = []
                 before = runner.committed_mutations
 
-                result = execute_parent_smoke(
+                result = self.execute_smoke(
                     runner,
                     github,
                     "PRO-65",
@@ -10699,7 +10723,7 @@ class SmokeExecutionTests(unittest.TestCase):
                     KeyboardInterrupt,
                     "injected hard interruption",
                 ):
-                    execute_parent_smoke(
+                    self.execute_smoke(
                         runner,
                         github,
                         "PRO-65",
@@ -10709,7 +10733,7 @@ class SmokeExecutionTests(unittest.TestCase):
                 runner.hard_interrupt_after_create = False
                 runner.hard_interrupt_after_child_metadata_writes = None
                 before = runner.committed_mutations
-                retry = execute_parent_smoke(
+                retry = self.execute_smoke(
                     runner,
                     github,
                     "PRO-65",
@@ -10745,13 +10769,13 @@ class SmokeExecutionTests(unittest.TestCase):
                 runner, github, decision = self._planned()
                 runner.lost_ack_once.add(lost_ack)
 
-                first = execute_parent_smoke(
+                first = self.execute_smoke(
                     runner,
                     github,
                     "PRO-65",
                     expected_action_key=decision.action_key,
                 )
-                second = execute_parent_smoke(
+                second = self.execute_smoke(
                     runner,
                     github,
                     "PRO-65",
@@ -10771,7 +10795,7 @@ class SmokeExecutionTests(unittest.TestCase):
                 runner, github, decision = self._planned()
                 runner.hard_interrupt_after_create = True
                 with self.assertRaises(KeyboardInterrupt):
-                    execute_parent_smoke(
+                    self.execute_smoke(
                         runner,
                         github,
                         "PRO-65",
@@ -10792,7 +10816,7 @@ class SmokeExecutionTests(unittest.TestCase):
                     runner.runs["PRO-99"] = []
                 before = runner.committed_mutations
 
-                retry = execute_parent_smoke(
+                retry = self.execute_smoke(
                     runner,
                     github,
                     "PRO-65",
@@ -10807,7 +10831,7 @@ class SmokeExecutionTests(unittest.TestCase):
         runner, github, decision = self._planned()
         runner.fail_once_create = True
 
-        interrupted = execute_parent_smoke(
+        interrupted = self.execute_smoke(
             runner,
             github,
             "PRO-65",
@@ -10816,7 +10840,7 @@ class SmokeExecutionTests(unittest.TestCase):
         replanned = decide_parent_action(
             load_parent_snapshot(runner, github, "PRO-65")
         )
-        retry = execute_parent_smoke(
+        retry = self.execute_smoke(
             runner,
             github,
             "PRO-65",
@@ -10838,7 +10862,7 @@ class SmokeExecutionTests(unittest.TestCase):
                 runner, github, decision = self._planned()
                 runner.authority_drift_after_status = drift
 
-                result = execute_parent_smoke(
+                result = self.execute_smoke(
                     runner,
                     github,
                     "PRO-65",
@@ -10879,7 +10903,7 @@ class SmokeExecutionTests(unittest.TestCase):
                 else:
                     runner.authority_drift_after_parent_delete_key = key
 
-                result = execute_parent_smoke(
+                result = self.execute_smoke(
                     runner,
                     github,
                     "PRO-65",

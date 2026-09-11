@@ -37,7 +37,8 @@ A pilot candidate uses one immutable evidence thread across two Agent runs.
 The Agent first posts normal evidence and retains that evidence UUID and
 canonical URL. Because the runtime cannot reply under a comment created during
 the same run, post one bounded candidate-publication handoff as a reply in that
-evidence thread and trigger the same Agent again. The Agent then posts exactly
+evidence thread. Use the comment-triggered run of the same Agent; do not also
+call rerun (see Single-trigger recovery below). The Agent then posts exactly
 one candidate block as its reply in the same thread. Validate the complete
 ancestor chain, bind the summary to the original evidence UUID, require the
 candidate author to match the evidence author, and reject a missing root,
@@ -88,6 +89,24 @@ each affected repository. Ask a focused clarification question before assigning
 work when scope, ownership, acceptance criteria, or merge authority is unclear.
 
 ## Evidence and handoffs
+
+### Single-trigger recovery
+
+Treat a handoff comment as the single wake-up when comments auto-trigger the
+assigned Agent. Record its returned comment UUID, then inspect the original
+Issue's runs. Reuse the queued/dispatched/running task; do not add `issue rerun`
+after posting the comment, even if the task has not appeared yet. A slow or
+lost acknowledgement is not proof that no task was scheduled: reread comments
+and runs instead of reposting or rerunning. If comment triggering is known to
+be disabled, choose direct rerun as the single wake-up only after confirming
+the exact Issue is idle and no trigger is pending. A completed comment-triggered
+run is also consumed; do not repeat it simply because there is no active run.
+Watcher retains its existing serialized recovery checks. This instruction is
+not a platform-wide atomic deduplication guarantee; do not start a concurrent
+operator recovery. Never cancel an ambiguous duplicate without identifying
+the exact queued task and obtaining any required authority.
+
+### Execution evidence
 
 Require each handoff to include the child Issue identifier, repository, branch,
 exact commit SHA, changed paths, commands with exit codes, test results, and
@@ -287,13 +306,23 @@ next barrier group, then advance `next_stage` and record `last_action`.
   preceding plan:
 
   ```text
-  python3 -B -m tools.multica.workflow execute-parent-smoke PRO-M --expected-action-key ACTION_KEY
+  python3 -B -m tools.multica.workflow execute-parent-smoke PRO-M --expected-action-key ACTION_KEY --handoff-file /absolute/path/smoke-handoff.json
   ```
 
+  Before the call, prepare the complete manifest described in
+  `tools/multica/smoke-handoff.md`: absolute control checkout + exact tool SHA,
+  and each affected repository's source runtime path, dedicated external
+  inspection path, candidate SHA, freshly verified merge commit SHA, and exact
+  PR URL. Read paths from the configured Projects and current execution context;
+  never guess a future dynamic runtime branch/path or substitute runtime HEAD.
+  Establish the safe local route/inputs using the existing parent acceptance
+  criteria and committed local scripts; never put credentials in the manifest.
+
   The executor freshly revalidates the completed Gate, merged managed PRs and
-  exact merged candidate SHA map, writes
+  unchanged candidate SHA map, validates the complete handoff, writes
   `eventra.workflow.smoke_reservation`, creates one Integration QA child in
-  backlog, and persists/rereads `eventra.phase.creation_action`, the typed
+  backlog with that handoff already in its description, and persists/rereads
+  `eventra.phase.creation_action`, the typed
   `eventra.phase.target=suite:smoke`, `eventra.phase.role=integration_qa`, and
   the exact candidate SHA metadata. It commits the parent action and clears the
   reservation before starting Integration QA, verifies the committed assignment,
@@ -306,6 +335,11 @@ next barrier group, then advance `next_stage` and record `last_action`.
   that child. This depends on the provisioned
   single serialized Delivery Lead; it is not generic CAS or transaction safety.
   Complete the parent only after exact assigned smoke PASS.
+  Missing/invalid handoff blocks before any new reservation or child write.
+  Exact interrupted replay can omit `--handoff-file` to reuse its frozen
+  reservation. Legacy reservations keep their original description; do not
+  rewrite historical children to migrate them. The manifest is execution input,
+  not proof of local Git state: QA verifies the paths and SHAs before testing.
 - `retry_smoke_stage`: This is the only recovery from a post-merge Smoke that
   finished `done + blocked` solely because external infrastructure prevented
   mandatory provenance verification. A member posts exactly one immutable root
@@ -318,7 +352,8 @@ next barrier group, then advance `next_stage` and record `last_action`.
   Store only its server-returned UUID in
   `eventra.workflow.smoke_retry_authorization_comment`. Rerun `plan-parent` and
   proceed only when it returns `retry_smoke_stage` with an exact action key.
-  Invoke the existing `execute-parent-smoke --expected-action-key ACTION_KEY`;
+  Invoke `execute-parent-smoke --expected-action-key ACTION_KEY --handoff-file FILE`
+  with the complete current execution handoff for this new retry action;
   do not create smoke children manually or reconstruct the key. The executor
   binds the retry to the source Smoke, its evidence UUID, unchanged candidate
   SHA map, merged PR heads, and original PASS Gate. It moves only the blocked
