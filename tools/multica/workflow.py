@@ -20,6 +20,7 @@ from typing import Literal, Sequence
 from .blueprint import build_multi_repo_blueprint
 from . import candidate_refresh as refresh
 from . import refresh_executor
+from . import smoke_handoff
 from .candidate_purity import validate_candidate
 from .refresh_git import RefreshGit
 from .contracts import (
@@ -5706,7 +5707,8 @@ def _decode_smoke_reservation(value: str) -> dict[str, object]:
         or value != _canonical_json(decoded)
         or decoded.get("mode") not in {"initial", "retry"}
         or set(decoded)
-        != (base_keys if decoded.get("mode") == "initial" else base_keys | retry_keys)
+        != ((base_keys if decoded.get("mode") == "initial" else base_keys | retry_keys)
+            | ({"execution_handoff"} if "execution_handoff" in decoded else set()))
     ):
         raise RuntimeError("malformed smoke reservation")
     candidates = decoded["candidate_shas"]
@@ -5752,6 +5754,8 @@ def _decode_smoke_reservation(value: str) -> dict[str, object]:
         or set(expected_prs) != set(candidates)
     ):
         raise RuntimeError("malformed smoke reservation")
+    if "execution_handoff" in decoded:
+        smoke_handoff.validate(decoded["execution_handoff"], candidates, pull_requests)
     action_snapshot = ParentSnapshot(
         identifier=decoded["parent_identifier"],
         classification={
@@ -5827,6 +5831,7 @@ def _decode_smoke_reservation(value: str) -> dict[str, object]:
 def _build_smoke_reservation(
     snapshot: ParentSnapshot,
     decision: ParentDecision,
+    execution_handoff: dict[str, object] | None = None,
 ) -> dict[str, object]:
     if (
         decision.kind not in {"create_smoke_stage", "retry_smoke_stage"}
@@ -5910,6 +5915,8 @@ def _build_smoke_reservation(
                 "source_smoke_stage": source_smoke.stage,
             }
         )
+    if execution_handoff is not None:
+        reservation["execution_handoff"] = execution_handoff
     return _decode_smoke_reservation(_canonical_json(reservation))
 
 
@@ -5923,6 +5930,8 @@ def _smoke_child_description(reservation: dict[str, object]) -> str:
         "candidate_shas": reservation["candidate_shas"],
         "parent": reservation["parent_identifier"],
     }
+    if "execution_handoff" in reservation:
+        description["execution_handoff"] = reservation["execution_handoff"]
     if reservation["mode"] == "retry":
         description.update(
             {
@@ -6616,6 +6625,7 @@ def execute_parent_smoke(
     *,
     expected_action_key: str,
     refresh_api=None,
+    execution_handoff: dict[str, object] | None = None,
 ) -> SmokeExecutionResult:
     effects = [0]
     try:
@@ -6635,6 +6645,9 @@ def execute_parent_smoke(
             reservation = _decode_smoke_reservation(reservation_text)
             if reservation["action_key"] != expected_action_key:
                 raise RuntimeError("smoke reservation conflicts with expected action")
+            if (execution_handoff is not None
+                    and execution_handoff != reservation.get("execution_handoff")):
+                raise RuntimeError("smoke handoff conflicts with frozen reservation")
             committed_hint = (
                 raw_parent_metadata.get("eventra.workflow.last_action")
                 == expected_action_key
@@ -6673,6 +6686,14 @@ def execute_parent_smoke(
             )
             if _smoke_assignment_problem(snapshot, current) is not None:
                 raise RuntimeError("recorded smoke assignment is conflicting")
+            if execution_handoff is not None:
+                child_key = current[0].issue_key
+                detail = runner.run(["issue", "get", child_key, "--output", "json"])
+                parse_issue_detail(detail, child_key)
+                description = json.loads(detail["description"])
+                if (not isinstance(description, dict)
+                        or execution_handoff != description.get("execution_handoff")):
+                    raise RuntimeError("smoke handoff conflicts with frozen child")
             return _start_committed_smoke_child(
                 runner,
                 github,
@@ -6697,7 +6718,10 @@ def execute_parent_smoke(
         reservation = _build_smoke_reservation(
             fresh_snapshot,
             fresh_decision,
+            execution_handoff,
         )
+        smoke_handoff.validate(
+            execution_handoff, reservation["candidate_shas"], reservation["pull_requests"])
         encoded = _canonical_json(reservation)
         effects[0] += _metadata_set_observed(
             runner,
@@ -8627,6 +8651,8 @@ def build_workflow_parser() -> argparse.ArgumentParser:
     execute_smoke = subparsers.add_parser("execute-parent-smoke")
     execute_smoke.add_argument("parent")
     execute_smoke.add_argument("--expected-action-key", required=True)
+    execute_smoke.add_argument(
+        "--handoff-file", help="Complete JSON execution handoff; required for a new Smoke action")
     finish_parent_parser = subparsers.add_parser("finish-parent")
     finish_parent_parser.add_argument("parent")
     watch = subparsers.add_parser("watch")
@@ -8936,6 +8962,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 github,
                 args.parent,
                 expected_action_key=args.expected_action_key,
+                execution_handoff=smoke_handoff.read_file(args.handoff_file),
                 refresh_api=_configured_refresh_api(
                     runner, github, mutation=True),
             )

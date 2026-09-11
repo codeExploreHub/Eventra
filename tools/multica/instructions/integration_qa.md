@@ -14,7 +14,8 @@ ambiguous.
 At QA start, read each target repository `AGENTS.md`, verify the applicable
 indexes, and run `python3 -B -m tools.multica.knowledge context` from the
 authoritative Eventra control repository with the QA Issue, repository, task
-type `qa`, exact candidate SHA set, and tested paths. Attach each canonical
+type `qa`, exact tested SHA set (candidate for Gate, merge commit for new
+post-merge Smoke), and tested paths. Attach each canonical
 output as a Context Receipt. Check selected claims against current code, tests,
 runtime behavior, and authoritative contracts; record conflicts rather than
 following stale prose.
@@ -23,8 +24,9 @@ Only a novel, verified, reusable QA lesson qualifies as a candidate. Render it
 only after posting normal evidence and retaining its server-assigned root UUID
 and canonical URL. Candidate publication uses a separate follow-up run because
 the runtime cannot reply under a comment created during the same run. End the
-root with `candidate pending`; after Delivery Lead or the operator posts a
-bounded publication handoff in that thread and triggers you again, put the
+root with `candidate pending`. When the bounded publication handoff from
+Delivery Lead or the operator wakes you through its single comment-triggered
+run (not an additional rerun), put the
 original root identity in the candidate input, run `python3 -B -m
 tools.multica.knowledge candidate --input FILE`, and post the single
 `eventra-knowledge-candidate-v1` block as your one reply in the same thread.
@@ -66,23 +68,35 @@ cleanliness again before testing. Run the workflow helper only from the exact
 or switch the runtime workspace.
 Never switch, detach, reset, clean, or stash the Multica-managed task worktree.
 
-For an initial or retry Smoke, inspect the Multica-managed task worktree and
-apply the same allowed runtime exclusions, but never switch, detach, reset,
-clean, or stash it. Fetch the handed-off PR ref without moving its branch,
-verify `git rev-parse FETCH_HEAD` equals the candidate SHA, then create an owned
-directory outside it with `git worktree add --detach TEMP_DIR FULL_SHA`.
-Verify the temporary worktree's exact HEAD and cleanliness before testing.
-Stop only processes started by this run, then remove only that owned temporary
-worktree.
+For a new initial or retry Smoke, consume `execution_handoff` directly from the
+child description; do not wait for a second comment. Its schema and safe fetch
+procedure are in `tools/multica/smoke-handoff.md` at the handed-off control
+checkout. Require its repository set and candidate SHAs to match phase metadata.
+Verify control checkout HEAD equals `control_tool_sha`. The declared
+`runtime_workspace` identifies the source workspace, not a requirement to move
+your current dynamic runtime there. Never switch, detach, reset, clean, or stash
+either the source or your actual Multica-managed runtime workspace.
 
-For an initial or retry Smoke, perform a fresh fetch of every handed-off PR ref
-and require `FETCH_HEAD` to equal each unchanged candidate SHA. A retry action
-must name its source Smoke and source evidence UUID; verify both against the
-child handoff before testing. Use a clean detached worktree at the exact SHA,
-run the same repository-standard health/OpenAPI Smoke, retain a new immutable
-Context Receipt and evidence comment, and clean up only owned processes and
-temporary worktrees. The retry does not weaken provenance and authorizes no
-deployment.
+Freshly verify each exact PR is MERGED, its head equals `candidate_sha`, and
+its merge commit equals `merged_sha`. Perform a fresh fetch of its PR head into the dedicated
+inspection repository without updating a branch and verify `FETCH_HEAD` equals
+unchanged candidate SHA (`candidate_sha`); fetch the immutable merge commit
+and verify it as well. Run
+post-merge Smoke at `merged_sha`, not the old PR head or today's moving master.
+The commits may differ (including with squash/rebase); do not require candidate
+ancestry or silently transfer Gate PASS to unrelated code. Inspect the merge
+result and stop if it is inconsistent with the reviewed change. Use the named
+external inspection worktree only; require a clean detached worktree and prove
+its ownership/cleanliness before any
+checkout, and stop rather than overwrite an existing unrelated directory.
+
+Keep candidate SHAs as workflow identity in `finish-phase`; explicitly record
+both candidate and actual tested merge SHAs in evidence. For the Context
+Receipt, use the actual tested merge SHAs. A retry still binds the original
+source Smoke and evidence UUID. Legacy children without `execution_handoff`
+retain their explicit approved handoff; do not infer missing paths or rewrite
+their description. Stop only owned processes and remove only worktrees created
+by this run. Smoke authorizes no deployment, push, PR mutation, or merge.
 
 ## Scope-aware Smoke routes
 
@@ -90,17 +104,17 @@ Select exactly one route from the parent classification and exact candidate SHA
 map; do not invent a missing repository dependency.
 
 - **Frontend-only Smoke:** fetch and verify only the frontend PR ref, create one
-  external detached temporary worktree at that SHA, run the focused frontend
+  external detached temporary worktree at the verified merge SHA, run the focused frontend
   regressions and `npm run test:local-contract`, then start `npm run dev:local`.
   Wait for and probe port `3000`. Port `8080` and a backend service handoff are
   not prerequisites for this route; do not run the cross-stack
   `npm run smoke:local` command.
 - **Backend-only Smoke:** fetch and verify only the backend PR ref, create one
-  external detached temporary worktree at that SHA, run
+  external detached temporary worktree at the verified merge SHA, run
   `scripts/test-local.sh`, start `scripts/run-local.sh`, wait for port `8080`,
   and run `scripts/smoke-local.sh`. Port `3000` is not a prerequisite.
 - **Cross-stack Smoke:** fetch and verify both PR refs, create one external
-  detached temporary worktree per exact SHA, start the exact backend on port
+  detached temporary worktree per verified merge SHA, start the exact backend on port
   `8080`, record its readiness handoff, then start the exact frontend and run
   the full `npm run smoke:local` path against that backend. Both SHAs and both
   service observations belong in the evidence.
@@ -120,7 +134,8 @@ Core/plan-parent is the canonical FailureBundle producer after gate fan-in.
 Delivery Lead uses its exact returned bundle and digest without reconstruction
 to dispatch repair. A passing result applies only to the tested SHA set.
 
-Reread every candidate SHA and test only that immutable set. Post commands,
+Reread every candidate SHA; Gate tests use that immutable set, while post-merge
+Smoke uses its separately verified merge SHA set as described above. Post commands,
 exits, observations, and safe artifacts on the exact QA or integration-suite
 child Issue before calling `finish-phase`; retain the comment UUID. The comment
 must be authored by this assigned Agent. Workflow logic validates only its
@@ -183,6 +198,9 @@ even when only one repository is responsible.
 
 Use only the SHA flags in the assigned candidate map. Frontend-only and
 backend-only Smoke each supply one SHA; Cross-stack Smoke supplies both.
+These flags retain the candidate identity; the evidence separately names the
+actual tested merge commit(s). Never replace phase candidate metadata with a
+merge commit SHA.
 
 ```text
 python3 -B -m tools.multica.workflow finish-phase PRO-N --kind smoke --result pass|fail|blocked --attempt N --frontend-sha FULL_SHA --evidence-comment COMMENT_UUID

@@ -375,11 +375,18 @@ After an exact Gate PASS and verified automatic merge, Delivery Lead must not
 create a smoke child manually. It executes only the exact Core action:
 
 ```text
-python3 -B -m tools.multica.workflow execute-parent-smoke PRO-M --expected-action-key ACTION_KEY
+python3 -B -m tools.multica.workflow execute-parent-smoke PRO-M --expected-action-key ACTION_KEY --handoff-file /absolute/path/smoke-handoff.json
 ```
 
-The smoke executor revalidates the completed Gate, managed merged PRs, exact
-merged candidate SHA map, and provisioned Integration QA assignment. It writes
+New actions require the complete non-secret [Smoke execution handoff](smoke-handoff.md).
+It is frozen in the existing reservation and original child description before
+the first run; replay uses the stored input. That runbook also defines the
+single-trigger rule: a comment-triggered task must not be followed by an extra
+rerun. These changes add no stage or scheduled task and require a coordinated
+helper + Lead/QA instruction rollout before they take effect live.
+
+The smoke executor revalidates the completed Gate, managed merged PRs, the
+unchanged candidate SHA map, and provisioned Integration QA assignment. It writes
 `eventra.workflow.smoke_reservation`, creates one backlog child, persists and
 rereads `eventra.phase.creation_action`, `eventra.phase.target=suite:smoke`,
 `eventra.phase.role=integration_qa`, and the complete SHA map. It commits the

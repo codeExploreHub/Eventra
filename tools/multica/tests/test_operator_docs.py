@@ -679,7 +679,7 @@ class OperatorDocsTests(unittest.TestCase):
             self.assertIn("eventra.phase.creation_action", rendered)
             self.assertIn("eventra.phase.target", rendered)
             self.assertIn("eventra.phase.role", rendered)
-            self.assertIn("exact merged candidate SHA map", rendered)
+            self.assertIn("unchanged candidate SHA map", rendered)
             self.assertIn("single serialized Delivery Lead", rendered)
             self.assertIn("not generic CAS or transaction safety", rendered)
             self.assertIn("before starting Integration QA", rendered)
@@ -783,7 +783,7 @@ class OperatorDocsTests(unittest.TestCase):
 
         qa_normalized = " ".join(qa.split())
         for fragment in (
-            "git worktree add --detach TEMP_DIR FULL_SHA",
+            "consume `execution_handoff` directly",
             "Never switch, detach, reset, clean, or stash the Multica-managed task worktree",
             "Frontend-only Smoke",
             "Backend-only Smoke",
